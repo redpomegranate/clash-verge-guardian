@@ -675,7 +675,16 @@ public class ClashGuardian : Form
 
     [STAThread]
     static void Main() {
-        Application.EnableVisualStyles();
-        Application.Run(new ClashGuardian());
+        // 单实例检测：防止开机自启时启动多个实例
+        bool createdNew;
+        using (Mutex mutex = new Mutex(true, "ClashGuardianSingleInstance", out createdNew)) {
+            if (!createdNew) {
+                // 已有实例在运行，直接退出
+                return;
+            }
+            
+            Application.EnableVisualStyles();
+            Application.Run(new ClashGuardian());
+        }
     }
 }

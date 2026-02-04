@@ -1,0 +1,9 @@
+﻿{
+  "clashApi": "http://127.0.0.1:9097",
+  "clashSecret": "set-your-secret",
+  "proxyPort": 7897,
+  "normalInterval": 10000,
+  "memoryThreshold": 150,
+  "highDelayThreshold": 3000,
+  "blacklistMinutes": 20
+}
