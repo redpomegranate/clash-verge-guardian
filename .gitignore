@@ -1,0 +1,13 @@
+# 编译文件
+*.exe
+
+# 日志文件
+*.log
+guardian.log
+
+# CSV 监控数据
+*.csv
+
+# Windows 临时文件
+Thumbs.db
+Desktop.ini
