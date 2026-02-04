@@ -1,15 +1,24 @@
-# Clash Guardian Pro - Clash Verge 智能守护进程
+# Clash Guardian Pro - 多内核智能守护进程
 
-一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash Verge 代理客户端的稳定运行。
+一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
+
+**支持多种客户端和内核：**
+- Clash Verge / Clash Verge Rev (verge-mihomo)
+- Mihomo Party (mihomo)
+- Clash Nyanpasu (clash-rs / mihomo)
+- Clash for Windows (clash / clash-win64)
+- 原版 Clash Meta (clash-meta)
 
 ## ✨ 功能特性
 
 ### 🔍 智能监控
-- **进程监控** - 实时检测 mihomo 核心进程状态
+- **多内核支持** - 自动检测并适配不同 Clash 客户端和内核
+- **进程监控** - 实时检测内核进程状态（自动识别进程名）
 - **内存监控** - 监控内存占用，防止内存泄漏
 - **延迟测量** - 不只测通断，还测量实际延迟
 - **多目标测试** - 同时测试 Google、Cloudflare，避免误判
 - **TCP 连接统计** - 监控 TIME_WAIT、ESTABLISHED、CLOSE_WAIT 连接数
+- **API 自动发现** - 自动尝试常用端口（9097, 9090, 7890, 9898）
 
 ### ⚡ 自适应检测
 - **正常状态**：10 秒检测间隔（省资源）
@@ -39,7 +48,7 @@
 
 - Windows 10/11
 - .NET Framework 4.5+
-- Clash Verge 已安装（默认路径：`%LocalAppData%\Programs\clash-verge\`）
+- 任一支持的 Clash 客户端已安装
 
 ## ⚙️ 配置
 
@@ -55,7 +64,9 @@
   "normalInterval": 10000,
   "memoryThreshold": 150,
   "highDelayThreshold": 3000,
-  "blacklistMinutes": 20
+  "blacklistMinutes": 20,
+  "coreProcessNames": ["verge-mihomo", "mihomo", "clash-meta", "clash-rs", "clash", "clash-win64"],
+  "clientProcessNames": ["Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows"]
 }
 ```
 
@@ -68,8 +79,22 @@
 | `memoryThreshold` | 内存阈值(MB) | `150` |
 | `highDelayThreshold` | 高延迟阈值(ms) | `3000` |
 | `blacklistMinutes` | 黑名单时长(分钟) | `20` |
+| `coreProcessNames` | 内核进程名列表（按优先级） | 见上方示例 |
+| `clientProcessNames` | 客户端进程名列表 | 见上方示例 |
 
-**重要**：请将 `clashSecret` 修改为你的 Clash Verge 中设置的 API 密钥。
+**重要**：请将 `clashSecret` 修改为你的 Clash 客户端中设置的 API 密钥。
+
+### 多内核自动检测
+
+程序启动时会按顺序扫描 `coreProcessNames` 列表，找到第一个正在运行的进程作为监控目标。如果你使用的是非标准的客户端或内核，只需在配置文件中添加对应的进程名即可。
+
+**支持的客户端安装路径**（自动扫描）：
+- `%LocalAppData%\Programs\clash-verge\`
+- `%LocalAppData%\Programs\Clash Nyanpasu\`
+- `%LocalAppData%\mihomo-party\`
+- `%LocalAppData%\Programs\Clash for Windows\`
+- `C:\Program Files\Clash Verge\`
+- `C:\Program Files\mihomo-party\`
 
 ### 触发条件
 

@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **功能**：Clash Verge 代理客户端的智能守护进程
+- **功能**：多 Clash 客户端的智能守护进程（支持 Clash Verge、Mihomo Party、Clash Nyanpasu 等）
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
 - **GitHub**：https://github.com/redpomegranate/clash-verge-guardian
@@ -91,9 +91,19 @@ private const int TCP_CHECK_INTERVAL = 5;             // TCP 统计检测间隔
   "normalInterval": 10000,
   "memoryThreshold": 150,
   "highDelayThreshold": 3000,
-  "blacklistMinutes": 20
+  "blacklistMinutes": 20,
+  "coreProcessNames": ["verge-mihomo", "mihomo", "clash-meta", "clash-rs", "clash", "clash-win64"],
+  "clientProcessNames": ["Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows"]
 }
 ```
+
+### 多内核支持
+
+程序自动检测运行中的内核进程，支持的内核列表可在 config.json 中自定义：
+- `coreProcessNames` - 内核进程名（按优先级排序）
+- `clientProcessNames` - 客户端进程名
+
+**自动检测机制**：启动时按顺序扫描内核列表，找到第一个运行中的进程作为监控目标。
 
 ## 🔧 开发流程
 
@@ -237,6 +247,7 @@ Get-Process | Where-Object {$_.ProcessName -like "*ClashGuardian*"} | Stop-Proce
 | 2026-02-04 | 优化重启逻辑：内存高但网络正常不重启 |
 | 2026-02-04 | 升级 Pro 版：自适应间隔、延迟测量、节点黑名单、多目标测试 |
 | 2026-02-04 | 代码重构：配置常量、按钮工厂、性能优化、配置文件支持、开机自启 |
+| 2026-02-04 | **多内核支持**：支持 Clash Verge、Mihomo Party、Clash Nyanpasu、CFW 等多客户端 |
 
 ## 🎯 后续优化方向
 
@@ -245,4 +256,4 @@ Get-Process | Where-Object {$_.ProcessName -like "*ClashGuardian*"} | Stop-Proce
 - [ ] 支持自定义测试 URL
 - [ ] 添加流量统计
 - [ ] 支持订阅自动更新
-- [ ] Mini 模式（更小的悬浮窗）
+- [x] ~~多内核支持~~ ✅

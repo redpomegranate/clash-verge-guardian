@@ -26,6 +26,29 @@ public class ClashGuardian : Form
     private const int LOG_RETENTION_DAYS = 7;             // 日志保留天数
     private const int COOLDOWN_COUNT = 5;                 // 重启后冷却次数
 
+    // ==================== 多内核/多客户端支持 ====================
+    // 默认支持的内核进程名（按优先级排序）
+    private static readonly string[] DEFAULT_CORE_NAMES = new string[] {
+        "verge-mihomo",     // Clash Verge Rev
+        "mihomo",           // Mihomo Party / 独立 mihomo
+        "clash-meta",       // Clash Meta
+        "clash-rs",         // Clash Nyanpasu (Rust)
+        "clash",            // 原版 Clash
+        "clash-win64"       // Clash for Windows
+    };
+    
+    // 默认支持的客户端进程名
+    private static readonly string[] DEFAULT_CLIENT_NAMES = new string[] {
+        "Clash Verge",      // Clash Verge Rev (带空格)
+        "clash-verge",      // Clash Verge Rev
+        "Clash Nyanpasu",   // Clash Nyanpasu
+        "mihomo-party",     // Mihomo Party
+        "Clash for Windows" // CFW
+    };
+    
+    // 默认 API 端口列表
+    private static readonly int[] DEFAULT_API_PORTS = new int[] { 9097, 9090, 7890, 9898 };
+
     // ==================== UI 颜色常量 ====================
     private static readonly Color COLOR_OK = Color.FromArgb(34, 139, 34);
     private static readonly Color COLOR_WARNING = Color.FromArgb(255, 140, 0);
@@ -47,6 +70,15 @@ public class ClashGuardian : Form
     private int memoryWarning;
     private int highDelayThreshold;
     private int blacklistMinutes;
+    
+    // 多内核支持配置
+    private string[] coreProcessNames;
+    private string[] clientProcessNames;
+    private string[] clientPaths;
+    
+    // 当前检测到的进程信息
+    private string detectedCoreName = "";
+    private string detectedClientPath = "";
 
     // ==================== UI 组件 ====================
     private NotifyIcon trayIcon;
@@ -65,9 +97,12 @@ public class ClashGuardian : Form
     private Dictionary<string, DateTime> nodeBlacklist = new Dictionary<string, DateTime>();
     private int lastDelay = 0;
     private int[] lastTcpStats = new int[] { 0, 0, 0 };  // TCP 统计缓存
+    private volatile bool isChecking = false;  // 后台检测锁，防止重复执行
 
     public ClashGuardian()
     { 
+        Stopwatch initSw = Stopwatch.StartNew();
+        
         baseDir = AppDomain.CurrentDomain.BaseDirectory;
         logFile = Path.Combine(baseDir, "guardian.log");
         dataFile = Path.Combine(baseDir, "monitor_" + DateTime.Now.ToString("yyyyMMdd") + ".csv");
@@ -75,24 +110,36 @@ public class ClashGuardian : Form
         startTime = DateTime.Now;
         lastStableTime = DateTime.Now;
 
-        // 加载配置
+        // 加载配置（含进程探测）
         LoadConfig();
+        LogPerf("LoadConfig", initSw.ElapsedMilliseconds);
+        
+        initSw.Restart();
         CleanOldLogs();
 
         if (!File.Exists(dataFile))
             File.WriteAllText(dataFile, "Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event\n");
 
         InitializeUI();
+        LogPerf("InitializeUI", initSw.ElapsedMilliseconds);
+        
+        initSw.Restart();
         InitializeTrayIcon();
 
         timer = new System.Windows.Forms.Timer();
-        timer.Interval = normalInterval;
+        // 延迟首次检测：500ms 后开始，让界面先显示
+        timer.Interval = 500;
         timer.Tick += CheckStatus;
         timer.Start();
 
-        Log("守护启动 Pro");
-        GetCurrentNode();
-        CheckStatus(null, null);
+        // 启动日志：显示检测信息
+        string coreInfo = string.IsNullOrEmpty(detectedCoreName) ? "未检测到" : detectedCoreName;
+        Log("守护启动 Pro | 内核: " + coreInfo);
+        LogPerf("TotalInit", initSw.ElapsedMilliseconds);
+        
+        // 移除同步检测，改为定时器触发
+        // GetCurrentNode();      // 移到 CheckStatus 中
+        // CheckStatus(null, null);  // 由定时器延迟触发
     }
 
     // ==================== 配置管理 ====================
@@ -107,6 +154,11 @@ public class ClashGuardian : Form
         memoryWarning = DEFAULT_MEMORY_WARNING;
         highDelayThreshold = DEFAULT_HIGH_DELAY;
         blacklistMinutes = DEFAULT_BLACKLIST_MINUTES;
+        
+        // 多内核默认配置
+        coreProcessNames = DEFAULT_CORE_NAMES;
+        clientProcessNames = DEFAULT_CLIENT_NAMES;
+        clientPaths = GetDefaultClientPaths();
 
         // 尝试读取配置文件
         if (File.Exists(configFile)) {
@@ -119,14 +171,116 @@ public class ClashGuardian : Form
                 memoryThreshold = int.Parse(GetJsonValue(json, "memoryThreshold", memoryThreshold.ToString()));
                 highDelayThreshold = int.Parse(GetJsonValue(json, "highDelayThreshold", highDelayThreshold.ToString()));
                 blacklistMinutes = int.Parse(GetJsonValue(json, "blacklistMinutes", blacklistMinutes.ToString()));
+                
+                // 加载自定义进程名配置
+                string customCores = GetJsonArray(json, "coreProcessNames");
+                if (!string.IsNullOrEmpty(customCores)) coreProcessNames = customCores.Split(',');
+                
+                string customClients = GetJsonArray(json, "clientProcessNames");
+                if (!string.IsNullOrEmpty(customClients)) clientProcessNames = customClients.Split(',');
             } catch { }
         } else {
-            // 创建示例配置文件
             SaveDefaultConfig();
         }
+        
+        // 启动时自动探测
+        DetectRunningCore();
+        if (string.IsNullOrEmpty(detectedCoreName)) {
+            // 未检测到运行中的内核，在后台线程尝试自动发现 API（避免阻塞 UI）
+            ThreadPool.QueueUserWorkItem(_ => AutoDiscoverApi());
+        }
+    }
+    
+    // 获取默认客户端路径列表
+    string[] GetDefaultClientPaths() {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return new string[] {
+            Path.Combine(localAppData, @"Programs\clash-verge\Clash Verge.exe"),
+            Path.Combine(localAppData, @"Programs\clash-verge\clash-verge.exe"),
+            Path.Combine(localAppData, @"Programs\Clash Nyanpasu\Clash Nyanpasu.exe"),
+            Path.Combine(localAppData, @"mihomo-party\mihomo-party.exe"),
+            Path.Combine(localAppData, @"Programs\Clash for Windows\Clash for Windows.exe"),
+            @"C:\Program Files\Clash Verge\Clash Verge.exe",
+            @"C:\Program Files\mihomo-party\mihomo-party.exe"
+        };
+    }
+    
+    // 自动探测运行中的内核进程
+    void DetectRunningCore() {
+        foreach (string coreName in coreProcessNames) {
+            try {
+                Process[] procs = Process.GetProcessesByName(coreName);
+                if (procs.Length > 0) {
+                    detectedCoreName = coreName;
+                    // 同时找到对应的客户端
+                    DetectRunningClient();
+                    return;
+                }
+            } catch { }
+        }
+    }
+    
+    // 探测运行中的客户端
+    void DetectRunningClient() {
+        foreach (string clientName in clientProcessNames) {
+            try {
+                Process[] procs = Process.GetProcessesByName(clientName);
+                if (procs.Length > 0) {
+                    try {
+                        detectedClientPath = procs[0].MainModule.FileName;
+                    } catch { }
+                    return;
+                }
+            } catch { }
+        }
+        // 如果没找到运行中的客户端，从默认路径中查找存在的
+        foreach (string path in clientPaths) {
+            if (File.Exists(path)) {
+                detectedClientPath = path;
+                return;
+            }
+        }
+    }
+    
+    // 自动发现 API 端口（后台线程执行）
+    void AutoDiscoverApi() {
+        Stopwatch sw = Stopwatch.StartNew();
+        foreach (int port in DEFAULT_API_PORTS) {
+            try {
+                string testApi = "http://127.0.0.1:" + port;
+                HttpWebRequest req = WebRequest.Create(testApi + "/version") as HttpWebRequest;
+                req.Headers.Add("Authorization", "Bearer " + clashSecret);
+                req.Timeout = 500;  // 降低超时：本地 API 不需要太长
+                using (HttpWebResponse resp = req.GetResponse() as HttpWebResponse) {
+                    if (resp.StatusCode == HttpStatusCode.OK) {
+                        clashApi = testApi;
+                        LogPerf("AutoDiscoverApi(found:" + port + ")", sw.ElapsedMilliseconds);
+                        return;
+                    }
+                }
+            } catch { }
+        }
+        LogPerf("AutoDiscoverApi(notfound)", sw.ElapsedMilliseconds);
+    }
+    
+    // 解析 JSON 数组（简易实现）
+    string GetJsonArray(string json, string key) {
+        string search = "\"" + key + "\":";
+        int idx = json.IndexOf(search);
+        if (idx < 0) return "";
+        idx = json.IndexOf('[', idx);
+        if (idx < 0) return "";
+        int end = json.IndexOf(']', idx);
+        if (end < 0) return "";
+        string arr = json.Substring(idx + 1, end - idx - 1);
+        // 移除引号和空格
+        return arr.Replace("\"", "").Replace(" ", "").Replace("\n", "").Replace("\r", "");
     }
 
     void SaveDefaultConfig() {
+        string coreNames = string.Join("\", \"", DEFAULT_CORE_NAMES);
+        string clientNames = string.Join("\", \"", DEFAULT_CLIENT_NAMES);
+        
         string config = "{\n" +
             "  \"clashApi\": \"" + clashApi + "\",\n" +
             "  \"clashSecret\": \"" + clashSecret + "\",\n" +
@@ -134,7 +288,9 @@ public class ClashGuardian : Form
             "  \"normalInterval\": " + normalInterval + ",\n" +
             "  \"memoryThreshold\": " + memoryThreshold + ",\n" +
             "  \"highDelayThreshold\": " + highDelayThreshold + ",\n" +
-            "  \"blacklistMinutes\": " + blacklistMinutes + "\n" +
+            "  \"blacklistMinutes\": " + blacklistMinutes + ",\n" +
+            "  \"coreProcessNames\": [\"" + coreNames + "\"],\n" +
+            "  \"clientProcessNames\": [\"" + clientNames + "\"]\n" +
             "}";
         try { File.WriteAllText(configFile, config, Encoding.UTF8); } catch { }
     }
@@ -339,7 +495,15 @@ public class ClashGuardian : Form
     void Log(string msg) {
         string line = "[" + DateTime.Now.ToString("MM-dd HH:mm:ss") + "] " + msg;
         try { File.AppendAllText(logFile, line + "\n"); } catch { }
-        logLabel.Text = "最近事件:  " + msg;
+        if (logLabel != null) logLabel.Text = "最近事件:  " + msg;
+    }
+    
+    // 性能日志：记录超过阈值的操作耗时
+    void LogPerf(string operation, long elapsedMs) {
+        if (elapsedMs > 100) {  // 只记录超过 100ms 的操作
+            string line = "[" + DateTime.Now.ToString("MM-dd HH:mm:ss") + "] [PERF] " + operation + ": " + elapsedMs + "ms";
+            try { File.AppendAllText(logFile, line + "\n"); } catch { }
+        }
     }
 
     void LogData(bool proxyOK, int delay, double mem, int handles, int tw, int est, int cw, string node, string evt) {
@@ -493,7 +657,7 @@ public class ClashGuardian : Form
                 Stopwatch sw = Stopwatch.StartNew();
                 HttpWebRequest req = WebRequest.Create(url) as HttpWebRequest;
                 req.Proxy = new WebProxy("127.0.0.1", proxyPort);
-                req.Timeout = 5000;
+                req.Timeout = 3000;  // 降低超时：3 秒足够判断代理状态
                 using (WebResponse resp = req.GetResponse()) {
                     sw.Stop();
                     int delay = (int)sw.ElapsedMilliseconds;
@@ -530,18 +694,44 @@ public class ClashGuardian : Form
         return new int[] { tw, est, cw };
     }
 
-    // 优化：使用 GetProcessesByName 替代遍历所有进程
+    // 多内核支持：遍历内核进程名列表检测
     bool GetMihomoStats(out double mem, out int handles) {
         mem = 0;
         handles = 0;
-        try {
-            Process[] procs = Process.GetProcessesByName("verge-mihomo");
-            if (procs.Length > 0) {
-                mem = procs[0].WorkingSet64 / 1024.0 / 1024.0;
-                handles = procs[0].HandleCount;
-                return true;
-            }
-        } catch { }
+        
+        // 优先使用已检测到的内核名
+        if (!string.IsNullOrEmpty(detectedCoreName)) {
+            try {
+                Process[] procs = Process.GetProcessesByName(detectedCoreName);
+                if (procs.Length > 0) {
+                    mem = procs[0].WorkingSet64 / 1024.0 / 1024.0;
+                    handles = procs[0].HandleCount;
+                    return true;
+                }
+            } catch { }
+        }
+        
+        // 未找到，重新扫描所有支持的内核
+        foreach (string coreName in coreProcessNames) {
+            try {
+                Process[] procs = Process.GetProcessesByName(coreName);
+                if (procs.Length > 0) {
+                    mem = procs[0].WorkingSet64 / 1024.0 / 1024.0;
+                    handles = procs[0].HandleCount;
+                    // 更新检测到的内核名
+                    if (detectedCoreName != coreName) {
+                        detectedCoreName = coreName;
+                        Log("检测到内核: " + coreName);
+                    }
+                    return true;
+                }
+            } catch { }
+        }
+        
+        // 都没找到，清空检测结果
+        if (!string.IsNullOrEmpty(detectedCoreName)) {
+            detectedCoreName = "";
+        }
         return false;
     }
 
@@ -551,16 +741,51 @@ public class ClashGuardian : Form
         totalRestarts++;
         consecutiveOK = 0;
 
+        // 终止所有已知的客户端和内核进程
         try {
-            foreach (Process p in Process.GetProcessesByName("clash-verge")) { p.Kill(); p.WaitForExit(3000); }
-            foreach (Process p in Process.GetProcessesByName("verge-mihomo")) { p.Kill(); p.WaitForExit(3000); }
+            // 终止客户端
+            foreach (string clientName in clientProcessNames) {
+                foreach (Process p in Process.GetProcessesByName(clientName)) {
+                    try { p.Kill(); p.WaitForExit(3000); } catch { }
+                }
+            }
+            // 终止内核
+            foreach (string coreName in coreProcessNames) {
+                foreach (Process p in Process.GetProcessesByName(coreName)) {
+                    try { p.Kill(); p.WaitForExit(3000); } catch { }
+                }
+            }
         } catch { }
 
         Thread.Sleep(2000);
-        string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\clash-verge\clash-verge.exe");
-        if (File.Exists(exe)) {
-            Process.Start(exe);
-            Log("已恢复");
+        
+        // 启动客户端：优先使用检测到的路径
+        bool started = false;
+        if (!string.IsNullOrEmpty(detectedClientPath) && File.Exists(detectedClientPath)) {
+            try {
+                Process.Start(detectedClientPath);
+                Log("已恢复: " + Path.GetFileName(detectedClientPath));
+                started = true;
+            } catch { }
+        }
+        
+        // 如果检测路径失败，尝试默认路径列表
+        if (!started) {
+            foreach (string path in clientPaths) {
+                if (File.Exists(path)) {
+                    try {
+                        Process.Start(path);
+                        detectedClientPath = path;  // 记住成功的路径
+                        Log("已恢复: " + Path.GetFileName(path));
+                        started = true;
+                        break;
+                    } catch { }
+                }
+            }
+        }
+        
+        if (!started) {
+            Log("警告: 未找到客户端程序");
         }
 
         failCount = 0;
@@ -578,8 +803,16 @@ public class ClashGuardian : Form
         }
     }
 
-    // ==================== 主检测循环 ====================
+    // ==================== 主检测循环（后台线程模式） ====================
+    
+    // Timer.Tick 触发：启动后台检测任务
     void CheckStatus(object s, EventArgs e) {
+        // 首次检测后恢复正常间隔
+        if (totalChecks == 0 && timer.Interval == 500) {
+            timer.Interval = normalInterval;
+        }
+        
+        // 冷却期处理（UI 线程）
         if (cooldownCount > 0) {
             cooldownCount--;
             if (cooldownCount == 0) {
@@ -589,34 +822,74 @@ public class ClashGuardian : Form
             }
             return;
         }
-
-        totalChecks++;
-
-        // 优化：使用 GetProcessesByName
-        double mem;
-        int handles;
-        bool running = GetMihomoStats(out mem, out handles);
-
-        bool proxyOK;
-        int delay = TestProxyWithDelay(out proxyOK);
-
-        // 优化：降低 netstat 调用频率
-        int[] tcp;
-        if (totalChecks % TCP_CHECK_INTERVAL == 0) {
-            tcp = GetTcpStats();
-            lastTcpStats = tcp;
-        } else {
-            tcp = lastTcpStats;
+        
+        // 防止重复执行：如果上一次检测还没完成，跳过本次
+        if (isChecking) return;
+        isChecking = true;
+        
+        // 在后台线程执行耗时操作
+        ThreadPool.QueueUserWorkItem(_ => DoCheckInBackground());
+    }
+    
+    // 后台线程：执行所有耗时操作
+    void DoCheckInBackground() {
+        try {
+            Stopwatch perfSw = Stopwatch.StartNew();
+            
+            // 首次获取节点信息
+            if (totalChecks == 0) {
+                GetCurrentNode();
+            }
+            
+            totalChecks++;
+            
+            // 获取进程状态（耗时操作）
+            double mem;
+            int handles;
+            bool running = GetMihomoStats(out mem, out handles);
+            LogPerf("GetMihomoStats", perfSw.ElapsedMilliseconds);
+            
+            // 测试代理连通性（耗时操作：网络请求）
+            perfSw.Restart();
+            bool proxyOK;
+            int delay = TestProxyWithDelay(out proxyOK);
+            LogPerf("TestProxy", perfSw.ElapsedMilliseconds);
+            
+            // TCP 统计（耗时操作：netstat 命令）
+            int[] tcp;
+            if (totalChecks % TCP_CHECK_INTERVAL == 0) {
+                perfSw.Restart();
+                tcp = GetTcpStats();
+                lastTcpStats = tcp;
+                LogPerf("GetTcpStats", perfSw.ElapsedMilliseconds);
+            } else {
+                tcp = lastTcpStats;
+            }
+            
+            // 定期更新节点信息和触发延迟测试
+            if (totalChecks % NODE_UPDATE_INTERVAL == 0) GetCurrentNode();
+            if (totalChecks % DELAY_TEST_INTERVAL == 0) TriggerDelayTest();
+            
+            // 切回 UI 线程更新界面
+            this.BeginInvoke((Action)(() => UpdateUI(running, mem, handles, proxyOK, delay, tcp)));
         }
+        catch (Exception ex) {
+            // 记录异常但不崩溃
+            try { LogPerf("CheckError: " + ex.Message, 0); } catch { }
+        }
+        finally {
+            isChecking = false;
+        }
+    }
+    
+    // UI 线程：更新界面和执行决策
+    void UpdateUI(bool running, double mem, int handles, bool proxyOK, int delay, int[] tcp) {
         int tw = tcp[0], est = tcp[1], cw = tcp[2];
-
-        // 定期更新节点信息和触发延迟测试
-        if (totalChecks % NODE_UPDATE_INTERVAL == 0) GetCurrentNode();
-        if (totalChecks % DELAY_TEST_INTERVAL == 0) TriggerDelayTest();
-
+        
         // 更新界面
         string delayStr = delay > 0 ? delay + "ms" : "--";
-        memLabel.Text = "内  存:  " + mem.ToString("F1") + " MB" + (mem > memoryWarning ? " !" : "") + "  |  句柄: " + handles + "  |  TW: " + tw;
+        string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
+        memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB" + (mem > memoryWarning ? "!" : "") + "  |  句柄: " + handles;
         string nodeShort = currentNode.Length > 15 ? currentNode.Substring(0, 15) + ".." : currentNode;
         proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
         proxyLabel.ForeColor = !proxyOK ? COLOR_ERROR : (delay > highDelayThreshold ? COLOR_WARNING : COLOR_OK);
@@ -627,8 +900,11 @@ public class ClashGuardian : Form
         double stableRate = totalChecks > 0 ? (double)(totalChecks - totalFails) / totalChecks * 100 : 100;
         stableLabel.Text = "稳定性:  连续 " + FormatTimeSpan(stableTime) + "  |  运行 " + FormatTimeSpan(runTime) + "  |  成功率 " + stableRate.ToString("F1") + "%";
 
-        trayIcon.Text = "Clash守护 | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
+        // 托盘显示
+        string coreDisplay = string.IsNullOrEmpty(detectedCoreName) ? "?" : detectedCoreName;
+        trayIcon.Text = coreDisplay + " | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
 
+        // 决策逻辑
         bool needRestart = false, needSwitch = false;
         string reason = "", evt = "";
         bool hasIssue = false;
@@ -665,8 +941,17 @@ public class ClashGuardian : Form
         AdjustInterval(hasIssue);
         LogData(proxyOK, delay, mem, handles, tw, est, cw, currentNode, evt);
 
-        if (needSwitch) { if (SwitchToBestNode()) failCount = 0; }
-        if (needRestart) RestartClash(reason);
+        // 执行操作（在后台线程执行，避免阻塞 UI）
+        if (needSwitch) {
+            ThreadPool.QueueUserWorkItem(_ => {
+                if (SwitchToBestNode()) {
+                    this.BeginInvoke((Action)(() => { failCount = 0; }));
+                }
+            });
+        }
+        if (needRestart) {
+            ThreadPool.QueueUserWorkItem(_ => RestartClash(reason));
+        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e) {

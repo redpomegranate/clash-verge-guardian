@@ -5,5 +5,7 @@
   "normalInterval": 10000,
   "memoryThreshold": 150,
   "highDelayThreshold": 3000,
-  "blacklistMinutes": 20
+  "blacklistMinutes": 20,
+  "coreProcessNames": ["verge-mihomo", "mihomo", "clash-meta", "clash-rs", "clash", "clash-win64"],
+  "clientProcessNames": ["Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows"]
 }
