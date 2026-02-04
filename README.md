@@ -17,7 +17,7 @@
 - **连续稳定 3 次后**：自动恢复正常间隔
 
 ### 🧠 智能决策
-- **节点黑名单** - 失败节点 5 分钟内不再使用
+- **节点黑名单** - 失败节点 20 分钟内不再使用
 - **延迟优化** - 延迟 > 3000ms 自动切换节点
 - **综合判断** - 内存高但网络正常时不重启
 - **定期测速** - 每 6-7 分钟触发全节点延迟测试
@@ -33,6 +33,7 @@
 - **监控日志** - 记录所有事件到 `guardian.log`
 - **详细数据** - 记录每次检测数据到按日期命名的 CSV 文件
 - **自动清理** - 自动清理 7 天前的日志文件
+- **智能写入** - 只在有事件时写入日志，减少 I/O
 
 ## 🖥️ 系统要求
 
@@ -42,16 +43,31 @@
 
 ## ⚙️ 配置
 
-在 `ClashGuardian.cs` 中可以修改以下配置：
+### 配置文件（推荐）
 
-```csharp
-private string clashApi = "http://127.0.0.1:9097";    // Clash API 地址
-private string clashSecret = "set-your-secret";       // API 密钥
-private int normalInterval = 10000;   // 正常检测间隔：10秒
-private int fastInterval = 3000;      // 异常时快速检测：3秒
-private int blacklistMinutes = 5;     // 节点黑名单时长（分钟）
-private int highDelayThreshold = 3000; // 高延迟阈值（毫秒）
+首次运行时会自动生成 `config.json` 配置文件：
+
+```json
+{
+  "clashApi": "http://127.0.0.1:9097",
+  "clashSecret": "set-your-secret",
+  "proxyPort": 7897,
+  "normalInterval": 10000,
+  "memoryThreshold": 150,
+  "highDelayThreshold": 3000,
+  "blacklistMinutes": 20
+}
 ```
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `clashApi` | Clash API 地址 | `http://127.0.0.1:9097` |
+| `clashSecret` | API 密钥 | `set-your-secret` |
+| `proxyPort` | 代理端口 | `7897` |
+| `normalInterval` | 正常检测间隔(ms) | `10000` |
+| `memoryThreshold` | 内存阈值(MB) | `150` |
+| `highDelayThreshold` | 高延迟阈值(ms) | `3000` |
+| `blacklistMinutes` | 黑名单时长(分钟) | `20` |
 
 **重要**：请将 `clashSecret` 修改为你的 Clash Verge 中设置的 API 密钥。
 
@@ -95,7 +111,7 @@ ClashGuardian.exe
 - `退出` - 完全退出程序
 - `测速` - 手动触发全节点延迟测试
 - `切换节点` - 手动切换到最佳节点
-- `清除黑名单` - 清空节点黑名单
+- `开机自启` - 切换开机自启状态
 
 ### 系统托盘
 
@@ -112,6 +128,7 @@ ClashGuardian.exe
 ```
 ├── ClashGuardian.cs       # 源代码
 ├── ClashGuardian.exe      # 可执行文件
+├── config.json            # 配置文件（自动生成）
 ├── guardian.log           # 事件日志
 ├── monitor_YYYYMMDD.csv   # 每日监控数据
 └── README.md              # 本文档
@@ -157,21 +174,35 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 - 港澳台节点（HK、TW、香港、台湾）
 - 系统内置节点（DIRECT、REJECT、GLOBAL）
 - 特殊分组（自动选择、故障转移、负载均衡）
-- **黑名单节点**（最近 5 分钟内失败的节点）
+- **黑名单节点**（最近 20 分钟内失败的节点）
 
 支持的代理协议：`ss`、`vmess`、`trojan`、`vless`、`hysteria`、`hysteria2`
 
-## 📝 开机自启（可选）
+## 📝 开机自启
 
+两种方式：
+
+### 方式 1：程序内置（推荐）
+点击界面上的 `开机自启` 按钮即可切换开机自启状态。
+
+### 方式 2：手动设置
 1. 按 `Win + R` 输入 `shell:startup` 打开启动文件夹
 2. 创建 `ClashGuardian.exe` 的快捷方式放入该文件夹
 
 ## ⚠️ 注意事项
 
 1. 确保 Clash Verge 的外部控制 API 已启用
-2. 确保 API 密钥配置正确
+2. 确保 API 密钥配置正确（修改 `config.json`）
 3. 程序需要管理员权限来终止和启动进程
-4. 代理测试使用 7897 端口，请确保与 Clash Verge 设置一致
+4. 代理测试端口需与 Clash Verge 设置一致
+
+## 🔄 性能优化
+
+本程序经过以下性能优化：
+- **进程查找优化** - 使用 `GetProcessesByName` 替代遍历所有进程
+- **TCP 统计缓存** - 每 5 次检测才执行一次 netstat（降低系统调用）
+- **智能日志** - 只在有事件时写入 CSV（减少 I/O）
+- **配置集中化** - 所有配置常量集中管理，便于维护
 
 ## 📄 License
 

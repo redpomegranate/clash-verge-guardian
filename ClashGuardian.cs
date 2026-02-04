@@ -7,81 +7,280 @@ using System.IO;
 using System.Threading;
 using System.Collections.Generic;
 using System.Text;
+using Microsoft.Win32;
 
 public class ClashGuardian : Form
 { 
+    // ==================== 配置常量 ====================
+    private const int DEFAULT_NORMAL_INTERVAL = 10000;    // 正常检测间隔：10秒
+    private const int DEFAULT_FAST_INTERVAL = 3000;       // 异常时快速检测：3秒
+    private const int DEFAULT_MEMORY_THRESHOLD = 150;     // 内存阈值 (MB)
+    private const int DEFAULT_MEMORY_WARNING = 70;        // 内存警告阈值 (MB)
+    private const int DEFAULT_HIGH_DELAY = 3000;          // 高延迟阈值 (ms)
+    private const int DEFAULT_BLACKLIST_MINUTES = 20;     // 黑名单时长（分钟）
+    private const int DEFAULT_PROXY_PORT = 7897;          // 代理端口
+    private const int DEFAULT_API_PORT = 9097;            // API 端口
+    private const int TCP_CHECK_INTERVAL = 5;             // TCP 统计检测间隔
+    private const int NODE_UPDATE_INTERVAL = 15;          // 节点信息更新间隔
+    private const int DELAY_TEST_INTERVAL = 40;           // 延迟测试间隔
+    private const int LOG_RETENTION_DAYS = 7;             // 日志保留天数
+    private const int COOLDOWN_COUNT = 5;                 // 重启后冷却次数
+
+    // ==================== UI 颜色常量 ====================
+    private static readonly Color COLOR_OK = Color.FromArgb(34, 139, 34);
+    private static readonly Color COLOR_WARNING = Color.FromArgb(255, 140, 0);
+    private static readonly Color COLOR_ERROR = Color.FromArgb(220, 53, 69);
+    private static readonly Color COLOR_TEXT = Color.FromArgb(60, 60, 60);
+    private static readonly Color COLOR_GRAY = Color.FromArgb(100, 100, 100);
+    private static readonly Color COLOR_CYAN = Color.FromArgb(0, 120, 140);
+    private static readonly Color COLOR_BTN_BG = Color.FromArgb(230, 230, 230);
+    private static readonly Color COLOR_BTN_FG = Color.FromArgb(33, 33, 33);
+    private static readonly Color COLOR_FORM_BG = Color.FromArgb(250, 250, 252);
+
+    // ==================== 运行时配置（可从配置文件加载） ====================
+    private string clashApi;
+    private string clashSecret;
+    private int proxyPort;
+    private int normalInterval;
+    private int fastInterval;
+    private int memoryThreshold;
+    private int memoryWarning;
+    private int highDelayThreshold;
+    private int blacklistMinutes;
+
+    // ==================== UI 组件 ====================
     private NotifyIcon trayIcon;
     private Label statusLabel, memLabel, proxyLabel, logLabel, checkLabel, stableLabel;
     private Button restartBtn, exitBtn, logBtn;
     private System.Windows.Forms.Timer timer;
-    private string logFile, dataFile, baseDir;
+
+    // ==================== 运行时状态 ====================
+    private string logFile, dataFile, configFile, baseDir;
     private int failCount = 0, totalChecks = 0, totalFails = 0, totalRestarts = 0, totalSwitches = 0;
-    private string clashApi = "http://127.0.0.1:9097";
-    private string clashSecret = "set-your-secret";
     private string currentNode = "";
     private int cooldownCount = 0;
-    
-    // 智能化新增
-    private int normalInterval = 10000;   // 正常检测间隔：10秒
-    private int fastInterval = 3000;      // 异常时快速检测：3秒
-    private DateTime lastStableTime;      // 上次稳定时间
-    private DateTime startTime;           // 启动时间
-    private int consecutiveOK = 0;        // 连续正常次数
-    private Dictionary<string, DateTime> nodeBlacklist = new Dictionary<string, DateTime>(); // 节点黑名单
-    private int blacklistMinutes = 5;     // 黑名单时长（分钟）
-    private int lastDelay = 0;            // 上次延迟
-    private int highDelayThreshold = 3000; // 高延迟阈值
-    private int delayTestInterval = 40;   // 每40次检测触发一次全节点延迟测试（约6-7分钟）
+    private DateTime lastStableTime;
+    private DateTime startTime;
+    private int consecutiveOK = 0;
+    private Dictionary<string, DateTime> nodeBlacklist = new Dictionary<string, DateTime>();
+    private int lastDelay = 0;
+    private int[] lastTcpStats = new int[] { 0, 0, 0 };  // TCP 统计缓存
 
     public ClashGuardian()
     { 
         baseDir = AppDomain.CurrentDomain.BaseDirectory;
         logFile = Path.Combine(baseDir, "guardian.log");
         dataFile = Path.Combine(baseDir, "monitor_" + DateTime.Now.ToString("yyyyMMdd") + ".csv");
+        configFile = Path.Combine(baseDir, "config.json");
         startTime = DateTime.Now;
         lastStableTime = DateTime.Now;
+
+        // 加载配置
+        LoadConfig();
         CleanOldLogs();
+
         if (!File.Exists(dataFile))
             File.WriteAllText(dataFile, "Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event\n");
 
-        this.Text = "Clash 守护服务 Pro";
-        this.Size = new Size(360, 310);
+        InitializeUI();
+        InitializeTrayIcon();
+
+        timer = new System.Windows.Forms.Timer();
+        timer.Interval = normalInterval;
+        timer.Tick += CheckStatus;
+        timer.Start();
+
+        Log("守护启动 Pro");
+        GetCurrentNode();
+        CheckStatus(null, null);
+    }
+
+    // ==================== 配置管理 ====================
+    void LoadConfig() {
+        // 设置默认值
+        clashApi = "http://127.0.0.1:" + DEFAULT_API_PORT;
+        clashSecret = "set-your-secret";
+        proxyPort = DEFAULT_PROXY_PORT;
+        normalInterval = DEFAULT_NORMAL_INTERVAL;
+        fastInterval = DEFAULT_FAST_INTERVAL;
+        memoryThreshold = DEFAULT_MEMORY_THRESHOLD;
+        memoryWarning = DEFAULT_MEMORY_WARNING;
+        highDelayThreshold = DEFAULT_HIGH_DELAY;
+        blacklistMinutes = DEFAULT_BLACKLIST_MINUTES;
+
+        // 尝试读取配置文件
+        if (File.Exists(configFile)) {
+            try {
+                string json = File.ReadAllText(configFile, Encoding.UTF8);
+                clashApi = GetJsonValue(json, "clashApi", clashApi);
+                clashSecret = GetJsonValue(json, "clashSecret", clashSecret);
+                proxyPort = int.Parse(GetJsonValue(json, "proxyPort", proxyPort.ToString()));
+                normalInterval = int.Parse(GetJsonValue(json, "normalInterval", normalInterval.ToString()));
+                memoryThreshold = int.Parse(GetJsonValue(json, "memoryThreshold", memoryThreshold.ToString()));
+                highDelayThreshold = int.Parse(GetJsonValue(json, "highDelayThreshold", highDelayThreshold.ToString()));
+                blacklistMinutes = int.Parse(GetJsonValue(json, "blacklistMinutes", blacklistMinutes.ToString()));
+            } catch { }
+        } else {
+            // 创建示例配置文件
+            SaveDefaultConfig();
+        }
+    }
+
+    void SaveDefaultConfig() {
+        string config = "{\n" +
+            "  \"clashApi\": \"" + clashApi + "\",\n" +
+            "  \"clashSecret\": \"" + clashSecret + "\",\n" +
+            "  \"proxyPort\": " + proxyPort + ",\n" +
+            "  \"normalInterval\": " + normalInterval + ",\n" +
+            "  \"memoryThreshold\": " + memoryThreshold + ",\n" +
+            "  \"highDelayThreshold\": " + highDelayThreshold + ",\n" +
+            "  \"blacklistMinutes\": " + blacklistMinutes + "\n" +
+            "}";
+        try { File.WriteAllText(configFile, config, Encoding.UTF8); } catch { }
+    }
+
+    string GetJsonValue(string json, string key, string defaultValue) {
+        string search = "\"" + key + "\":";
+        int idx = json.IndexOf(search);
+        if (idx < 0) return defaultValue;
+        idx += search.Length;
+        while (idx < json.Length && (json[idx] == ' ' || json[idx] == '"')) idx++;
+        int end = idx;
+        bool inQuote = idx > 0 && json[idx - 1] == '"';
+        if (inQuote) {
+            end = json.IndexOf('"', idx);
+        } else {
+            while (end < json.Length && json[end] != ',' && json[end] != '}' && json[end] != '\n') end++;
+        }
+        return json.Substring(idx, end - idx).Trim();
+    }
+
+    // ==================== UI 初始化 ====================
+    void InitializeUI() {
+        this.Text = "Clash Guardian Pro";
+        this.Size = new Size(400, 340);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedSingle;
         this.MaximizeBox = false;
         this.Icon = SystemIcons.Shield;
+        this.Font = new Font("Microsoft YaHei UI", 9);
+        this.BackColor = COLOR_FORM_BG;
 
-        statusLabel = new Label(); statusLabel.Text = "状态: 运行中"; statusLabel.Location = new Point(20, 15);
-        statusLabel.Size = new Size(300, 25); statusLabel.Font = new Font("Microsoft YaHei", 11, FontStyle.Bold);
-        statusLabel.ForeColor = Color.Green;
+        int padding = 16;
+        int labelHeight = 22;
+        int y = padding;
 
-        memLabel = new Label(); memLabel.Text = "内存: --"; memLabel.Location = new Point(20, 45); memLabel.Size = new Size(300, 18);
-        proxyLabel = new Label(); proxyLabel.Text = "代理: --"; proxyLabel.Location = new Point(20, 65); proxyLabel.Size = new Size(300, 18);
-        checkLabel = new Label(); checkLabel.Text = "检测: 0"; checkLabel.Location = new Point(20, 85); checkLabel.Size = new Size(300, 18); checkLabel.ForeColor = Color.Gray;
-        stableLabel = new Label(); stableLabel.Text = "稳定: --"; stableLabel.Location = new Point(20, 105); stableLabel.Size = new Size(300, 18); stableLabel.ForeColor = Color.DarkCyan;
-        logLabel = new Label(); logLabel.Text = "最近: 无"; logLabel.Location = new Point(20, 130); logLabel.Size = new Size(300, 40); logLabel.ForeColor = Color.DimGray;
+        // 状态标题
+        statusLabel = new Label();
+        statusLabel.Text = "● 状态: 运行中";
+        statusLabel.Location = new Point(padding, y);
+        statusLabel.Size = new Size(360, 28);
+        statusLabel.Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold);
+        statusLabel.ForeColor = COLOR_OK;
+        y += 36;
 
-        restartBtn = new Button(); restartBtn.Text = "立即重启"; restartBtn.Location = new Point(20, 180); restartBtn.Size = new Size(90, 28);
-        restartBtn.Click += delegate { RestartClash("手动"); };
-        logBtn = new Button(); logBtn.Text = "查看日志"; logBtn.Location = new Point(120, 180); logBtn.Size = new Size(90, 28);
-        logBtn.Click += delegate { Process.Start("notepad", dataFile); };
-        exitBtn = new Button(); exitBtn.Text = "退出"; exitBtn.Location = new Point(220, 180); exitBtn.Size = new Size(80, 28);
-        exitBtn.Click += delegate { trayIcon.Visible = false; Application.Exit(); };
+        // 分隔线
+        Label line1 = CreateSeparator(padding, y);
+        y += 12;
 
-        Button testBtn = new Button(); testBtn.Text = "测速"; testBtn.Location = new Point(20, 215); testBtn.Size = new Size(70, 26);
-        testBtn.Click += delegate { TriggerDelayTest(); Log("手动测速"); };
-        Button switchBtn = new Button(); switchBtn.Text = "切换节点"; switchBtn.Location = new Point(100, 215); switchBtn.Size = new Size(80, 26);
-        switchBtn.Click += delegate { if(SwitchToBestNode()) Log("手动切换"); };
-        Button clearBlBtn = new Button(); clearBlBtn.Text = "清除黑名单"; clearBlBtn.Location = new Point(190, 215); clearBlBtn.Size = new Size(90, 26);
-        clearBlBtn.Click += delegate { nodeBlacklist.Clear(); Log("黑名单已清除"); };
+        // 监控信息区
+        memLabel = CreateInfoLabel("内  存:  --", padding, y, COLOR_TEXT);
+        y += labelHeight + 4;
 
-        this.Controls.Add(statusLabel); this.Controls.Add(memLabel); this.Controls.Add(proxyLabel);
-        this.Controls.Add(checkLabel); this.Controls.Add(stableLabel); this.Controls.Add(logLabel);
-        this.Controls.Add(restartBtn); this.Controls.Add(logBtn); this.Controls.Add(exitBtn);
-        this.Controls.Add(testBtn); this.Controls.Add(switchBtn); this.Controls.Add(clearBlBtn);
+        proxyLabel = CreateInfoLabel("代  理:  --", padding, y, COLOR_TEXT);
+        y += labelHeight + 4;
 
-        trayIcon = new NotifyIcon(); trayIcon.Icon = SystemIcons.Shield; trayIcon.Text = "Clash 守护"; trayIcon.Visible = true;
+        checkLabel = CreateInfoLabel("统  计:  --", padding, y, COLOR_GRAY);
+        y += labelHeight + 4;
+
+        stableLabel = CreateInfoLabel("稳定性:  --", padding, y, COLOR_CYAN);
+        y += labelHeight + 8;
+
+        // 分隔线
+        Label line2 = CreateSeparator(padding, y);
+        y += 10;
+
+        // 日志区
+        logLabel = new Label();
+        logLabel.Text = "最近事件:  无";
+        logLabel.Location = new Point(padding, y);
+        logLabel.Size = new Size(360, 36);
+        logLabel.ForeColor = Color.FromArgb(80, 80, 80);
+        y += 44;
+
+        // 按钮区 - 第一行
+        int btnWidth = 110;
+        int btnHeight = 32;
+        int btnSpacing = 10;
+
+        restartBtn = CreateButton("立即重启", padding, y, btnWidth, btnHeight, () => RestartClash("手动"));
+        logBtn = CreateButton("查看日志", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, () => Process.Start("notepad", dataFile));
+        exitBtn = CreateButton("退出", padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight, () => { trayIcon.Visible = false; Application.Exit(); });
+        y += btnHeight + 8;
+
+        // 按钮区 - 第二行
+        Button testBtn = CreateButton("测速", padding, y, btnWidth, btnHeight, () => { TriggerDelayTest(); Log("手动测速"); });
+        Button switchBtn = CreateButton("切换节点", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, () => { if (SwitchToBestNode()) Log("手动切换"); });
+        Button autoStartBtn = CreateButton("开机自启", padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight, ToggleAutoStart);
+
+        // 添加控件
+        this.Controls.Add(statusLabel);
+        this.Controls.Add(line1);
+        this.Controls.Add(memLabel);
+        this.Controls.Add(proxyLabel);
+        this.Controls.Add(checkLabel);
+        this.Controls.Add(stableLabel);
+        this.Controls.Add(line2);
+        this.Controls.Add(logLabel);
+        this.Controls.Add(restartBtn);
+        this.Controls.Add(logBtn);
+        this.Controls.Add(exitBtn);
+        this.Controls.Add(testBtn);
+        this.Controls.Add(switchBtn);
+        this.Controls.Add(autoStartBtn);
+
+        this.Resize += delegate { if (this.WindowState == FormWindowState.Minimized) this.Hide(); };
+    }
+
+    // 按钮工厂方法
+    Button CreateButton(string text, int x, int y, int width, int height, Action onClick) {
+        Button btn = new Button();
+        btn.Text = text;
+        btn.Location = new Point(x, y);
+        btn.Size = new Size(width, height);
+        btn.FlatStyle = FlatStyle.Flat;
+        btn.BackColor = COLOR_BTN_BG;
+        btn.ForeColor = COLOR_BTN_FG;
+        btn.FlatAppearance.BorderSize = 0;
+        btn.Cursor = Cursors.Hand;
+        btn.Click += delegate { onClick(); };
+        return btn;
+    }
+
+    Label CreateInfoLabel(string text, int x, int y, Color color) {
+        Label lbl = new Label();
+        lbl.Text = text;
+        lbl.Location = new Point(x, y);
+        lbl.Size = new Size(360, 22);
+        lbl.ForeColor = color;
+        return lbl;
+    }
+
+    Label CreateSeparator(int x, int y) {
+        Label line = new Label();
+        line.BorderStyle = BorderStyle.Fixed3D;
+        line.Location = new Point(x, y);
+        line.Size = new Size(360, 2);
+        return line;
+    }
+
+    void InitializeTrayIcon() {
+        trayIcon = new NotifyIcon();
+        trayIcon.Icon = SystemIcons.Shield;
+        trayIcon.Text = "Clash 守护";
+        trayIcon.Visible = true;
         trayIcon.DoubleClick += delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); };
+
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add("显示窗口", null, delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); });
         menu.Items.Add("立即重启", null, delegate { RestartClash("手动"); });
@@ -91,55 +290,117 @@ public class ClashGuardian : Form
         menu.Items.Add("-");
         menu.Items.Add("退出", null, delegate { trayIcon.Visible = false; Application.Exit(); });
         trayIcon.ContextMenuStrip = menu;
-        this.Resize += delegate { if (this.WindowState == FormWindowState.Minimized) this.Hide(); };
-
-        timer = new System.Windows.Forms.Timer(); timer.Interval = normalInterval; timer.Tick += CheckStatus; timer.Start();
-        Log("守护启动 Pro"); GetCurrentNode(); CheckStatus(null, null);
     }
 
-    void CleanOldLogs() { 
-        try { 
-            DateTime cutoff = DateTime.Now.AddDays(-7);
-            foreach (string file in Directory.GetFiles(baseDir, "monitor_*.csv")) { 
-                FileInfo fi = new FileInfo(file); if (fi.LastWriteTime < cutoff) fi.Delete();
+    // ==================== 开机自启管理 ====================
+    void ToggleAutoStart() {
+        try {
+            string appPath = Application.ExecutablePath;
+            string keyName = "ClashGuardian";
+            RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true);
+            
+            if (rk.GetValue(keyName) != null) {
+                // 已启用，移除
+                rk.DeleteValue(keyName, false);
+                Log("已关闭开机自启");
+            } else {
+                // 未启用，添加
+                rk.SetValue(keyName, "\"" + appPath + "\"");
+                Log("已启用开机自启");
             }
-            FileInfo logFi = new FileInfo(logFile); if (logFi.Exists && logFi.Length > 1024 * 1024) logFi.Delete();
+            rk.Close();
+        } catch {
+            Log("自启设置失败");
+        }
+    }
+
+    bool IsAutoStartEnabled() {
+        try {
+            RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false);
+            bool enabled = rk.GetValue("ClashGuardian") != null;
+            rk.Close();
+            return enabled;
+        } catch { return false; }
+    }
+
+    // ==================== 日志管理 ====================
+    void CleanOldLogs() {
+        try {
+            DateTime cutoff = DateTime.Now.AddDays(-LOG_RETENTION_DAYS);
+            foreach (string file in Directory.GetFiles(baseDir, "monitor_*.csv")) {
+                FileInfo fi = new FileInfo(file);
+                if (fi.LastWriteTime < cutoff) fi.Delete();
+            }
+            FileInfo logFi = new FileInfo(logFile);
+            if (logFi.Exists && logFi.Length > 1024 * 1024) logFi.Delete();
         } catch { }
     }
 
-    void Log(string msg) { 
+    void Log(string msg) {
         string line = "[" + DateTime.Now.ToString("MM-dd HH:mm:ss") + "] " + msg;
         try { File.AppendAllText(logFile, line + "\n"); } catch { }
-        logLabel.Text = "最近: " + msg;
+        logLabel.Text = "最近事件:  " + msg;
     }
 
-    void LogData(bool proxyOK, int delay, double mem, int handles, int tw, int est, int cw, string node, string evt) { 
+    void LogData(bool proxyOK, int delay, double mem, int handles, int tw, int est, int cw, string node, string evt) {
+        // 优化：空事件不写入
+        if (string.IsNullOrEmpty(evt)) return;
         string line = string.Format("{0},{1},{2},{3:F1},{4},{5},{6},{7},{8},{9}",
             DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), proxyOK ? "OK" : "FAIL", delay, mem, handles, tw, est, cw, node, evt);
         try { File.AppendAllText(dataFile, line + "\n"); } catch { }
     }
 
-    string ApiGet(string path) { 
-        try { WebClient wc = new WebClient(); wc.Headers.Add("Authorization", "Bearer " + clashSecret);
-            wc.Encoding = Encoding.UTF8; return wc.DownloadString(clashApi + path); } catch { return null; }
+    // ==================== API 通信 ====================
+    string ApiGet(string path) {
+        try {
+            WebClient wc = new WebClient();
+            wc.Headers.Add("Authorization", "Bearer " + clashSecret);
+            wc.Encoding = Encoding.UTF8;
+            return wc.DownloadString(clashApi + path);
+        } catch { return null; }
     }
 
-    bool ApiPut(string path, string body) { 
-        try { WebClient wc = new WebClient(); wc.Headers.Add("Authorization", "Bearer " + clashSecret);
-            wc.Headers.Add("Content-Type", "application/json"); wc.Encoding = Encoding.UTF8;
-            wc.UploadString(clashApi + path, "PUT", body); return true; } catch { return false; }
+    bool ApiPut(string path, string body) {
+        try {
+            WebClient wc = new WebClient();
+            wc.Headers.Add("Authorization", "Bearer " + clashSecret);
+            wc.Headers.Add("Content-Type", "application/json");
+            wc.Encoding = Encoding.UTF8;
+            wc.UploadString(clashApi + path, "PUT", body);
+            return true;
+        } catch { return false; }
     }
 
-    void GetCurrentNode() { 
-        try { string json = ApiGet("/proxies/GLOBAL");
-            if (json != null && json.Contains("\"now\":")) { 
-                int start = json.IndexOf("\"now\":\"") + 7; int end = json.IndexOf("\"", start);
-                if (start > 6 && end > start) currentNode = json.Substring(start, end - start);
+    // ==================== 工具函数 ====================
+    string CleanString(string s) {
+        if (string.IsNullOrEmpty(s)) return "";
+        StringBuilder sb = new StringBuilder();
+        foreach (char c in s) {
+            if ((c >= 0x20 && c <= 0x7E) || (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3040 && c <= 0x30FF)) {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
+    }
+
+    string FormatTimeSpan(TimeSpan ts) {
+        if (ts.TotalHours >= 1) return string.Format("{0:F1}h", ts.TotalHours);
+        if (ts.TotalMinutes >= 1) return string.Format("{0:F0}m", ts.TotalMinutes);
+        return string.Format("{0:F0}s", ts.TotalSeconds);
+    }
+
+    // ==================== 节点管理 ====================
+    void GetCurrentNode() {
+        try {
+            string json = ApiGet("/proxies/GLOBAL");
+            if (json != null && json.Contains("\"now\":")) {
+                int start = json.IndexOf("\"now\":\"") + 7;
+                int end = json.IndexOf("\"", start);
+                if (start > 6 && end > start) currentNode = CleanString(json.Substring(start, end - start));
             }
         } catch { }
     }
 
-    // 触发全节点延迟测试
     void TriggerDelayTest() {
         try {
             HttpWebRequest req = WebRequest.Create(clashApi + "/group/GLOBAL/delay?url=http://www.gstatic.com/generate_204&timeout=5000") as HttpWebRequest;
@@ -150,7 +411,6 @@ public class ClashGuardian : Form
         } catch { }
     }
 
-    // 清理过期黑名单
     void CleanBlacklist() {
         List<string> toRemove = new List<string>();
         DateTime now = DateTime.Now;
@@ -160,22 +420,25 @@ public class ClashGuardian : Form
         foreach (string key in toRemove) nodeBlacklist.Remove(key);
     }
 
-    bool SwitchToBestNode() { 
+    bool SwitchToBestNode() {
         CleanBlacklist();
-        try { 
-            string json = ApiGet("/proxies"); if (json == null) return false;
-            List<string> candidates = new List<string>(); int idx = 0;
-            while ((idx = json.IndexOf("\"name\":\"", idx)) >= 0) { 
-                idx += 8; int end = json.IndexOf("\"", idx);
-                if (end > idx) { 
+        try {
+            string json = ApiGet("/proxies");
+            if (json == null) return false;
+
+            List<string> candidates = new List<string>();
+            int idx = 0;
+            while ((idx = json.IndexOf("\"name\":\"", idx)) >= 0) {
+                idx += 8;
+                int end = json.IndexOf("\"", idx);
+                if (end > idx) {
                     string name = json.Substring(idx, end - idx);
-                    // 跳过黑名单节点
                     if (nodeBlacklist.ContainsKey(name)) continue;
                     if (!name.Contains("HK") && !name.Contains("TW") && !name.Contains("香港") && !name.Contains("台湾") &&
                         !name.Equals("DIRECT") && !name.Equals("REJECT") && !name.Equals("GLOBAL") &&
-                        !name.Contains("自动") && !name.Contains("故障") && !name.Contains("负载")) { 
+                        !name.Contains("自动") && !name.Contains("故障") && !name.Contains("负载")) {
                         int typeIdx = json.IndexOf("\"type\":\"", end);
-                        if (typeIdx > 0 && typeIdx < end + 200) { 
+                        if (typeIdx > 0 && typeIdx < end + 200) {
                             int typeEnd = json.IndexOf("\"", typeIdx + 8);
                             string type = json.Substring(typeIdx + 8, typeEnd - typeIdx - 8);
                             if (type == "ss" || type == "vmess" || type == "trojan" || type == "vless" || type == "hysteria" || type == "hysteria2")
@@ -184,96 +447,129 @@ public class ClashGuardian : Form
                     }
                 }
             }
-            string bestNode = null; int bestDelay = 9999;
-            foreach (string node in candidates) { 
+
+            string bestNode = null;
+            int bestDelay = 9999;
+            foreach (string node in candidates) {
                 if (node == currentNode) continue;
-                int histIdx = json.IndexOf("\"" + node + "\""); if (histIdx < 0) continue;
+                int histIdx = json.IndexOf("\"" + node + "\"");
+                if (histIdx < 0) continue;
                 int delayIdx = json.IndexOf("\"delay\":", histIdx);
-                if (delayIdx > 0 && delayIdx < histIdx + 500) { 
+                if (delayIdx > 0 && delayIdx < histIdx + 500) {
                     int delayEnd = json.IndexOfAny(new char[] { ',', '}' }, delayIdx + 8);
                     string delayStr = json.Substring(delayIdx + 8, delayEnd - delayIdx - 8).Trim();
-                    int delay; if (int.TryParse(delayStr, out delay) && delay > 0 && delay < bestDelay) { bestDelay = delay; bestNode = node; }
+                    int delay;
+                    if (int.TryParse(delayStr, out delay) && delay > 0 && delay < bestDelay) {
+                        bestDelay = delay;
+                        bestNode = node;
+                    }
                 }
             }
-            if (bestNode != null && bestDelay < 2000) { 
-                // 把当前节点加入黑名单
+
+            if (bestNode != null && bestDelay < 2000) {
                 if (!string.IsNullOrEmpty(currentNode)) nodeBlacklist[currentNode] = DateTime.Now;
-                if (ApiPut("/proxies/GLOBAL", "{\"name\":\"" + bestNode + "\"}")) { 
-                    Log("切换: " + bestNode + " (" + bestDelay + "ms)"); 
-                    currentNode = bestNode; totalSwitches++; return true;
+                if (ApiPut("/proxies/GLOBAL", "{\"name\":\"" + bestNode + "\"}")) {
+                    Log("切换: " + bestNode + " (" + bestDelay + "ms)");
+                    currentNode = bestNode;
+                    totalSwitches++;
+                    return true;
                 }
             }
         } catch { }
         return false;
     }
 
-    // 多目标连通性测试 + 延迟测量
-    int TestProxyWithDelay(out bool success) { 
+    // ==================== 代理测试 ====================
+    int TestProxyWithDelay(out bool success) {
         string[] testUrls = new string[] {
             "http://www.gstatic.com/generate_204",
             "http://cp.cloudflare.com/generate_204"
         };
         int successCount = 0;
-        int totalDelay = 0;
         int minDelay = 9999;
-        
+
         foreach (string url in testUrls) {
-            try { 
+            try {
                 Stopwatch sw = Stopwatch.StartNew();
                 HttpWebRequest req = WebRequest.Create(url) as HttpWebRequest;
-                req.Proxy = new WebProxy("127.0.0.1", 7897); 
+                req.Proxy = new WebProxy("127.0.0.1", proxyPort);
                 req.Timeout = 5000;
-                using (WebResponse resp = req.GetResponse()) { 
+                using (WebResponse resp = req.GetResponse()) {
                     sw.Stop();
                     int delay = (int)sw.ElapsedMilliseconds;
                     successCount++;
-                    totalDelay += delay;
                     if (delay < minDelay) minDelay = delay;
                 }
             } catch { }
         }
-        
+
         success = successCount > 0;
-        if (successCount > 0) {
-            lastDelay = minDelay;
-            return minDelay;
-        }
-        lastDelay = 0;
-        return 0;
+        lastDelay = success ? minDelay : 0;
+        return success ? minDelay : 0;
     }
 
-    int[] GetTcpStats() { 
+    // ==================== 系统监控 ====================
+    int[] GetTcpStats() {
         int tw = 0, est = 0, cw = 0;
-        try { ProcessStartInfo psi = new ProcessStartInfo("netstat", "-an");
-            psi.RedirectStandardOutput = true; psi.UseShellExecute = false; psi.CreateNoWindow = true;
-            Process p = Process.Start(psi); string output = p.StandardOutput.ReadToEnd();
-            foreach (string line in output.Split('\n')) { 
-                if (line.Contains(":7897")) { 
-                    if (line.Contains("TIME_WAIT")) tw++; else if (line.Contains("ESTABLISHED")) est++; else if (line.Contains("CLOSE_WAIT")) cw++;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo("netstat", "-an");
+            psi.RedirectStandardOutput = true;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            Process p = Process.Start(psi);
+            string output = p.StandardOutput.ReadToEnd();
+            string portStr = ":" + proxyPort;
+            foreach (string line in output.Split('\n')) {
+                if (line.Contains(portStr)) {
+                    if (line.Contains("TIME_WAIT")) tw++;
+                    else if (line.Contains("ESTABLISHED")) est++;
+                    else if (line.Contains("CLOSE_WAIT")) cw++;
                 }
             }
         } catch { }
         return new int[] { tw, est, cw };
     }
 
-    void RestartClash(string reason) { 
-        Log("重启: " + reason); totalRestarts++;
+    // 优化：使用 GetProcessesByName 替代遍历所有进程
+    bool GetMihomoStats(out double mem, out int handles) {
+        mem = 0;
+        handles = 0;
+        try {
+            Process[] procs = Process.GetProcessesByName("verge-mihomo");
+            if (procs.Length > 0) {
+                mem = procs[0].WorkingSet64 / 1024.0 / 1024.0;
+                handles = procs[0].HandleCount;
+                return true;
+            }
+        } catch { }
+        return false;
+    }
+
+    // ==================== 重启管理 ====================
+    void RestartClash(string reason) {
+        Log("重启: " + reason);
+        totalRestarts++;
         consecutiveOK = 0;
-        try { 
+
+        try {
             foreach (Process p in Process.GetProcessesByName("clash-verge")) { p.Kill(); p.WaitForExit(3000); }
             foreach (Process p in Process.GetProcessesByName("verge-mihomo")) { p.Kill(); p.WaitForExit(3000); }
         } catch { }
+
         Thread.Sleep(2000);
         string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\clash-verge\clash-verge.exe");
-        if (File.Exists(exe)) { Process.Start(exe); Log("已恢复"); }
-        failCount = 0; 
-        cooldownCount = 5;
-        statusLabel.Text = "状态: 重启中..."; statusLabel.ForeColor = Color.Orange;
-        // 重启后恢复正常检测间隔
+        if (File.Exists(exe)) {
+            Process.Start(exe);
+            Log("已恢复");
+        }
+
+        failCount = 0;
+        cooldownCount = COOLDOWN_COUNT;
+        statusLabel.Text = "● 状态: 重启中...";
+        statusLabel.ForeColor = COLOR_WARNING;
         timer.Interval = normalInterval;
     }
 
-    // 调整检测间隔
     void AdjustInterval(bool hasIssue) {
         if (hasIssue && timer.Interval != fastInterval) {
             timer.Interval = fastInterval;
@@ -282,67 +578,74 @@ public class ClashGuardian : Form
         }
     }
 
-    // 格式化时间间隔
-    string FormatTimeSpan(TimeSpan ts) {
-        if (ts.TotalHours >= 1) return string.Format("{0:F1}h", ts.TotalHours);
-        if (ts.TotalMinutes >= 1) return string.Format("{0:F0}m", ts.TotalMinutes);
-        return string.Format("{0:F0}s", ts.TotalSeconds);
-    }
-
-    void CheckStatus(object s, EventArgs e) { 
+    // ==================== 主检测循环 ====================
+    void CheckStatus(object s, EventArgs e) {
         if (cooldownCount > 0) {
             cooldownCount--;
-            if (cooldownCount == 0) { 
-                statusLabel.Text = "状态: 运行中"; statusLabel.ForeColor = Color.Green;
+            if (cooldownCount == 0) {
+                statusLabel.Text = "● 状态: 运行中";
+                statusLabel.ForeColor = COLOR_OK;
                 lastStableTime = DateTime.Now;
             }
             return;
         }
-        
-        totalChecks++; double mem = 0; int handles = 0; bool running = false;
-        foreach (Process p in Process.GetProcesses()) { 
-            if (p.ProcessName.Contains("mihomo")) { mem = p.WorkingSet64 / 1024.0 / 1024.0; handles = p.HandleCount; running = true; break; }
-        }
-        
+
+        totalChecks++;
+
+        // 优化：使用 GetProcessesByName
+        double mem;
+        int handles;
+        bool running = GetMihomoStats(out mem, out handles);
+
         bool proxyOK;
         int delay = TestProxyWithDelay(out proxyOK);
-        int[] tcp = GetTcpStats(); int tw = tcp[0], est = tcp[1], cw = tcp[2];
-        
+
+        // 优化：降低 netstat 调用频率
+        int[] tcp;
+        if (totalChecks % TCP_CHECK_INTERVAL == 0) {
+            tcp = GetTcpStats();
+            lastTcpStats = tcp;
+        } else {
+            tcp = lastTcpStats;
+        }
+        int tw = tcp[0], est = tcp[1], cw = tcp[2];
+
         // 定期更新节点信息和触发延迟测试
-        if (totalChecks % 15 == 0) GetCurrentNode();
-        if (totalChecks % delayTestInterval == 0) TriggerDelayTest();
-        
+        if (totalChecks % NODE_UPDATE_INTERVAL == 0) GetCurrentNode();
+        if (totalChecks % DELAY_TEST_INTERVAL == 0) TriggerDelayTest();
+
         // 更新界面
         string delayStr = delay > 0 ? delay + "ms" : "--";
-        memLabel.Text = "内存: " + mem.ToString("F1") + "MB" + (mem > 70 ? " !" : "") + " | 句柄: " + handles + " | TW: " + tw;
-        string nodeShort = currentNode.Length > 12 ? currentNode.Substring(0, 12) + ".." : currentNode;
-        proxyLabel.Text = "代理: " + (proxyOK ? "正常" : "异常") + " " + delayStr + " | " + nodeShort;
-        proxyLabel.ForeColor = !proxyOK ? Color.Red : (delay > highDelayThreshold ? Color.Orange : Color.Green);
-        checkLabel.Text = "检测: " + totalChecks + " | 重启: " + totalRestarts + " | 换节点: " + totalSwitches + " | 黑名单: " + nodeBlacklist.Count;
-        
+        memLabel.Text = "内  存:  " + mem.ToString("F1") + " MB" + (mem > memoryWarning ? " !" : "") + "  |  句柄: " + handles + "  |  TW: " + tw;
+        string nodeShort = currentNode.Length > 15 ? currentNode.Substring(0, 15) + ".." : currentNode;
+        proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
+        proxyLabel.ForeColor = !proxyOK ? COLOR_ERROR : (delay > highDelayThreshold ? COLOR_WARNING : COLOR_OK);
+        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + nodeBlacklist.Count;
+
         TimeSpan stableTime = DateTime.Now - lastStableTime;
         TimeSpan runTime = DateTime.Now - startTime;
         double stableRate = totalChecks > 0 ? (double)(totalChecks - totalFails) / totalChecks * 100 : 100;
-        stableLabel.Text = "稳定: " + FormatTimeSpan(stableTime) + " | 运行: " + FormatTimeSpan(runTime) + " | 成功率: " + stableRate.ToString("F1") + "%";
-        
+        stableLabel.Text = "稳定性:  连续 " + FormatTimeSpan(stableTime) + "  |  运行 " + FormatTimeSpan(runTime) + "  |  成功率 " + stableRate.ToString("F1") + "%";
+
         trayIcon.Text = "Clash守护 | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
-        
-        bool needRestart = false, needSwitch = false; string reason = "", evt = "";
+
+        bool needRestart = false, needSwitch = false;
+        string reason = "", evt = "";
         bool hasIssue = false;
-        
-        if (!running) { 
+
+        if (!running) {
             needRestart = true; reason = "进程不存在"; evt = "ProcessDown"; hasIssue = true;
         }
-        else if (mem > 150) { 
+        else if (mem > memoryThreshold) {
             needRestart = true; reason = "内存过高" + mem.ToString("F0") + "MB"; evt = "CriticalMemory"; hasIssue = true;
         }
-        else if (mem > 70 && !proxyOK) { 
+        else if (mem > memoryWarning && !proxyOK) {
             needRestart = true; reason = "内存高+无响应"; evt = "HighMemoryNoProxy"; hasIssue = true;
         }
-        else if (cw > 20 && !proxyOK) { 
+        else if (cw > 20 && !proxyOK) {
             needRestart = true; reason = "连接泄漏+无响应"; evt = "CloseWaitLeak"; hasIssue = true;
         }
-        else if (!proxyOK) { 
+        else if (!proxyOK) {
             failCount++; totalFails++; evt = "ProxyFail"; hasIssue = true;
             consecutiveOK = 0;
             lastStableTime = DateTime.Now;
@@ -350,27 +653,29 @@ public class ClashGuardian : Form
             else if (failCount >= 4) { needRestart = true; reason = "连续无响应"; evt = "ProxyTimeout"; }
         }
         else if (delay > highDelayThreshold) {
-            // 延迟过高，尝试切换节点
             failCount++; evt = "HighDelay"; hasIssue = true;
             if (failCount >= 2) { needSwitch = true; reason = "延迟过高" + delay + "ms"; evt = "HighDelaySwitch"; failCount = 0; }
         }
-        else { 
-            failCount = 0; 
+        else {
+            failCount = 0;
             consecutiveOK++;
-            if (mem > 70) evt = "HighMemoryOK"; 
+            if (mem > memoryWarning) evt = "HighMemoryOK";
         }
-        
-        // 调整检测间隔
+
         AdjustInterval(hasIssue);
-        
         LogData(proxyOK, delay, mem, handles, tw, est, cw, currentNode, evt);
+
         if (needSwitch) { if (SwitchToBestNode()) failCount = 0; }
         if (needRestart) RestartClash(reason);
     }
 
-    protected override void OnFormClosing(FormClosingEventArgs e) { 
+    protected override void OnFormClosing(FormClosingEventArgs e) {
         if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; this.Hide(); }
     }
 
-    [STAThread] static void Main() { Application.EnableVisualStyles(); Application.Run(new ClashGuardian()); }
+    [STAThread]
+    static void Main() {
+        Application.EnableVisualStyles();
+        Application.Run(new ClashGuardian());
+    }
 }
