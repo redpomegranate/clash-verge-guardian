@@ -210,12 +210,22 @@ public class ClashGuardian : Form
         trayIcon.Text = "Clash守护 | " + mem.ToString("F0") + "MB | " + (proxyOK ? "OK" : "!");
         bool needRestart = false, needSwitch = false; string reason = "", evt = "";
         if (!running) { needRestart = true; reason = "进程不存在"; evt = "ProcessDown"; }
-        else if (mem > 70) { needRestart = true; reason = "内存" + mem.ToString("F0") + "MB"; evt = "HighMemory"; }
-        else if (cw > 20) { needRestart = true; reason = "连接泄漏"; evt = "CloseWaitLeak"; }
+        else if (mem > 150) { 
+            // 内存极高（>150MB），无条件重启
+            needRestart = true; reason = "内存过高" + mem.ToString("F0") + "MB"; evt = "CriticalMemory"; 
+        }
+        else if (mem > 70 && !proxyOK) { 
+            // 内存较高（>70MB）且代理无响应，重启
+            needRestart = true; reason = "内存高+无响应"; evt = "HighMemoryNoProxy"; 
+        }
+        else if (cw > 20 && !proxyOK) { 
+            // 连接泄漏且代理无响应，重启
+            needRestart = true; reason = "连接泄漏+无响应"; evt = "CloseWaitLeak"; 
+        }
         else if (!proxyOK) { failCount++; totalFails++; evt = "ProxyFail";
             if (failCount == 2) { needSwitch = true; reason = "节点无响应"; evt = "NodeSwitch"; }
             else if (failCount >= 4) { needRestart = true; reason = "连续无响应"; evt = "ProxyTimeout"; }
-        } else { failCount = 0; }
+        } else { failCount = 0; if (mem > 70) evt = "HighMemoryOK"; }
         LogData(proxyOK, mem, handles, tw, est, cw, currentNode, evt);
         if (needSwitch) { if (SwitchToBestNode()) failCount = 0; }
         if (needRestart) RestartClash(reason);
