@@ -25,6 +25,16 @@ public class ClashGuardian : Form
     private const int DELAY_TEST_INTERVAL = 72;           // 延迟测试间隔（~6min）
     private const int LOG_RETENTION_DAYS = 7;             // 日志保留天数
     private const int COOLDOWN_COUNT = 5;                 // 重启后冷却次数
+    private const int MAX_NODE_NAME_LENGTH = 50;           // 节点名最大长度
+    private const int MAX_NODE_DISPLAY_LENGTH = 15;        // 节点名显示截断长度
+    private const int MAX_ACCEPTABLE_DELAY = 2000;         // 最大可接受延迟 (ms)
+    private const int CLOSE_WAIT_THRESHOLD = 20;           // CloseWait 连接泄漏阈值
+    private const int CONSECUTIVE_OK_THRESHOLD = 3;        // 恢复正常间隔所需连续成功次数
+    private const int MAX_RECURSE_DEPTH = 5;               // 代理组递归解析最大深度
+    private const int MIN_UPDATE_FILE_SIZE = 10240;        // 更新文件最小有效大小 (bytes)
+    private const int UPDATE_CHECK_TIMEOUT = 15000;        // 更新检查/进程退出等待超时 (ms)
+    private const int PROCESS_KILL_TIMEOUT = 3000;         // 终止进程等待超时 (ms)
+    private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
     
     // ==================== 自动更新配置 ====================
     private const string APP_VERSION = "0.0.4";
@@ -107,6 +117,7 @@ public class ClashGuardian : Form
     private DateTime startTime;
     private int consecutiveOK = 0;
     private Dictionary<string, DateTime> nodeBlacklist = new Dictionary<string, DateTime>();
+    private readonly object blacklistLock = new object();  // nodeBlacklist 线程安全锁
     private int lastDelay = 0;
     private int[] lastTcpStats = new int[] { 0, 0, 0 };  // TCP 统计缓存
     private volatile bool isChecking = false;  // 后台检测锁，防止重复执行
@@ -171,7 +182,7 @@ public class ClashGuardian : Form
                 memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB  |  句柄: " + handles;
                 
                 string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : currentNode;
-                string nodeShort = nodeDisplay.Length > 15 ? nodeDisplay.Substring(0, 15) + ".." : nodeDisplay;
+                string nodeShort = nodeDisplay.Length > MAX_NODE_DISPLAY_LENGTH ? nodeDisplay.Substring(0, MAX_NODE_DISPLAY_LENGTH) + ".." : nodeDisplay;
                 proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
                 proxyLabel.ForeColor = proxyOK ? COLOR_OK : COLOR_ERROR;
                 
@@ -191,7 +202,7 @@ public class ClashGuardian : Form
             CheckForUpdate(true);
 
             totalChecks = 1;
-        } catch { }
+        } catch (Exception ex) { Log("首次检测异常: " + ex.Message); }
     }
 
     // ==================== 配置管理 ====================
@@ -231,7 +242,7 @@ public class ClashGuardian : Form
                 
                 string customClients = GetJsonArray(json, "clientProcessNames");
                 if (!string.IsNullOrEmpty(customClients)) clientProcessNames = customClients.Split(',');
-            } catch { }
+            } catch (Exception ex) { Log("配置加载异常: " + ex.Message); }
         } else {
             // 后台保存默认配置（不阻塞）
             ThreadPool.QueueUserWorkItem(_ => SaveDefaultConfig());
@@ -265,7 +276,7 @@ public class ClashGuardian : Form
                     DetectRunningClient();
                     return;
                 }
-            } catch { }
+            } catch { /* 进程探测：未找到属正常情况 */ }
         }
     }
     
@@ -277,11 +288,11 @@ public class ClashGuardian : Form
                 if (procs.Length > 0) {
                     try {
                         detectedClientPath = procs[0].MainModule.FileName;
-                    } catch { }
+                    } catch { /* 32/64位进程访问限制可忽略 */ }
                     foreach (var p in procs) p.Dispose();
                     return;
                 }
-            } catch { }
+            } catch { /* 客户端探测：未找到属正常情况 */ }
         }
         // 如果没找到运行中的客户端，从默认路径中查找存在的
         foreach (string path in clientPaths) {
@@ -308,7 +319,7 @@ public class ClashGuardian : Form
                         return;
                     }
                 }
-            } catch { }
+            } catch { /* 端口探测：连接失败属正常情况 */ }
         }
         LogPerf("AutoDiscoverApi(notfound)", sw.ElapsedMilliseconds);
     }
@@ -342,7 +353,7 @@ public class ClashGuardian : Form
             "  \"coreProcessNames\": [\"" + coreNames + "\"],\n" +
             "  \"clientProcessNames\": [\"" + clientNames + "\"]\n" +
             "}";
-        try { File.WriteAllText(configFile, config, Encoding.UTF8); } catch { }
+        try { File.WriteAllText(configFile, config, Encoding.UTF8); } catch (Exception ex) { Log("保存配置失败: " + ex.Message); }
     }
 
     string GetJsonValue(string json, string key, string defaultValue) {
@@ -436,7 +447,7 @@ public class ClashGuardian : Form
                 this.BeginInvoke((Action)(() => {
                     string ds = d > 0 ? d + "ms" : "--";
                     string nd = string.IsNullOrEmpty(currentNode) ? "--" : SafeNodeName(currentNode);
-                    string ns = nd.Length > 15 ? nd.Substring(0, 15) + ".." : nd;
+                    string ns = nd.Length > MAX_NODE_DISPLAY_LENGTH ? nd.Substring(0, MAX_NODE_DISPLAY_LENGTH) + ".." : nd;
                     proxyLabel.Text = "代  理:  " + (ok ? "OK" : "X") + " " + ds + " | " + ns;
                     proxyLabel.ForeColor = ok ? COLOR_OK : COLOR_ERROR;
                     Log("测速: " + ds);
@@ -558,13 +569,13 @@ public class ClashGuardian : Form
                 if (fi.LastWriteTime < cutoff) fi.Delete();
             }
             FileInfo logFi = new FileInfo(logFile);
-            if (logFi.Exists && logFi.Length > 1024 * 1024) logFi.Delete();
-        } catch { }
+            if (logFi.Exists && logFi.Length > MAX_LOG_SIZE) logFi.Delete();
+        } catch { /* 日志清理失败不影响主流程 */ }
     }
 
     void Log(string msg) {
         string line = "[" + DateTime.Now.ToString("MM-dd HH:mm:ss") + "] " + msg;
-        try { File.AppendAllText(logFile, line + "\n"); } catch { }
+        try { File.AppendAllText(logFile, line + "\n"); } catch { /* 日志写入失败不能递归记录 */ }
         if (logLabel != null) logLabel.Text = "最近事件:  " + msg;
     }
     
@@ -585,7 +596,7 @@ public class ClashGuardian : Form
         
         if (shouldLog) {
             string line = "[" + DateTime.Now.ToString("MM-dd HH:mm:ss") + "] [PERF] " + operation + ": " + elapsedMs + "ms";
-            try { File.AppendAllText(logFile, line + "\n"); } catch { }
+            try { File.AppendAllText(logFile, line + "\n"); } catch { /* 性能日志写入失败不能递归记录 */ }
         }
     }
 
@@ -594,7 +605,7 @@ public class ClashGuardian : Form
         if (string.IsNullOrEmpty(evt)) return;
         string line = string.Format("{0},{1},{2},{3:F1},{4},{5},{6},{7},{8},{9}",
             DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), proxyOK ? "OK" : "FAIL", delay, mem, handles, tw, est, cw, node, evt);
-        try { File.AppendAllText(dataFile, line + "\n"); } catch { }
+        try { File.AppendAllText(dataFile, line + "\n"); } catch { /* 数据日志写入失败不能递归记录 */ }
     }
 
     // ==================== API 通信（统一使用 HttpWebRequest） ====================
@@ -608,7 +619,7 @@ public class ClashGuardian : Form
             using (StreamReader reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) {
                 return reader.ReadToEnd();
             }
-        } catch { return null; }
+        } catch { return null; /* API 超时/不可达属正常探测场景 */ }
     }
 
     bool ApiPut(string path, string body) {
@@ -654,11 +665,13 @@ public class ClashGuardian : Form
     // 刷新节点和统计显示（UI 线程调用）
     void RefreshNodeDisplay() {
         string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "获取中..." : currentNode;
-        string nodeShort = nodeDisplay.Length > 15 ? nodeDisplay.Substring(0, 15) + ".." : nodeDisplay;
+        string nodeShort = nodeDisplay.Length > MAX_NODE_DISPLAY_LENGTH ? nodeDisplay.Substring(0, MAX_NODE_DISPLAY_LENGTH) + ".." : nodeDisplay;
         string delayStr = lastDelay > 0 ? lastDelay + "ms" : "--";
         proxyLabel.Text = "代  理:  OK " + delayStr + " | " + nodeShort;
         proxyLabel.ForeColor = COLOR_OK;
-        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + nodeBlacklist.Count;
+        int blCount;
+        lock (blacklistLock) { blCount = nodeBlacklist.Count; }
+        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + blCount;
     }
 
     // ==================== 自动更新 ====================
@@ -671,8 +684,8 @@ public class ClashGuardian : Form
                 string url = string.Format(UPDATE_API, GITHUB_REPO);
                 HttpWebRequest req = WebRequest.Create(url) as HttpWebRequest;
                 req.UserAgent = "ClashGuardian/" + APP_VERSION;
-                req.Timeout = 15000;
-                req.ReadWriteTimeout = 15000;
+                req.Timeout = UPDATE_CHECK_TIMEOUT;
+                req.ReadWriteTimeout = UPDATE_CHECK_TIMEOUT;
 
                 string json;
                 using (HttpWebResponse resp = req.GetResponse() as HttpWebResponse)
@@ -766,8 +779,8 @@ public class ClashGuardian : Form
             string oldExePath = exePath + ".old";
 
             // 清理上次残留
-            try { if (File.Exists(newExePath)) File.Delete(newExePath); } catch { }
-            try { if (File.Exists(oldExePath)) File.Delete(oldExePath); } catch { }
+            try { if (File.Exists(newExePath)) File.Delete(newExePath); } catch { /* 清理残留失败可忽略 */ }
+            try { if (File.Exists(oldExePath)) File.Delete(oldExePath); } catch { /* 清理残留失败可忽略 */ }
 
             // 下载新版本：优先通过本地代理，失败后直连
             bool downloaded = false;
@@ -780,7 +793,7 @@ public class ClashGuardian : Form
                     downloaded = true;
                 }
             } catch {
-                try { if (File.Exists(newExePath)) File.Delete(newExePath); } catch { }
+                try { if (File.Exists(newExePath)) File.Delete(newExePath); } catch { /* 清理部分下载 */ }
             }
             // 尝试 2：直连下载
             if (!downloaded) {
@@ -792,7 +805,7 @@ public class ClashGuardian : Form
                         downloaded = true;
                     }
                 } catch {
-                    try { if (File.Exists(newExePath)) File.Delete(newExePath); } catch { }
+                    try { if (File.Exists(newExePath)) File.Delete(newExePath); } catch { /* 清理部分下载 */ }
                 }
             }
 
@@ -802,7 +815,7 @@ public class ClashGuardian : Form
 
             // 基本校验：文件大小不应太小
             FileInfo fi = new FileInfo(newExePath);
-            if (fi.Length < 10240) {
+            if (fi.Length < MIN_UPDATE_FILE_SIZE) {
                 File.Delete(newExePath);
                 throw new Exception("下载文件大小异常（" + fi.Length + " bytes），可能下载失败");
             }
@@ -830,7 +843,7 @@ public class ClashGuardian : Form
                 if (!File.Exists(exePath) && File.Exists(oldExePath)) {
                     File.Move(oldExePath, exePath);
                 }
-            } catch { }
+            } catch (Exception rollbackEx) { Log("回滚失败: " + rollbackEx.Message); }
 
             this.BeginInvoke((Action)(() => {
                 logLabel.ForeColor = Color.FromArgb(80, 80, 80);
@@ -838,7 +851,7 @@ public class ClashGuardian : Form
             }));
 
             // 清理下载残留
-            try { File.Delete(Application.ExecutablePath + ".update"); } catch { }
+            try { File.Delete(Application.ExecutablePath + ".update"); } catch { /* 清理残留 */ }
         }
     }
 
@@ -877,13 +890,13 @@ public class ClashGuardian : Form
                     return;
                 }
             }
-        } catch { }
+        } catch (Exception ex) { Log("节点获取异常: " + ex.Message); }
     }
     
     // 递归解析，找到实际的节点（而非代理组）
     string ResolveActualNode(string json, string proxyName, int depth) {
         // 防止无限递归
-        if (depth > 5) return proxyName;
+        if (depth > MAX_RECURSE_DEPTH) return proxyName;
         
         // 获取该代理的信息
         string nowValue = FindProxyNow(json, proxyName);
@@ -1066,17 +1079,19 @@ public class ClashGuardian : Form
             req.Headers.Add("Authorization", "Bearer " + clashSecret);
             req.Timeout = 2000;
             // 异步发送，不等待全部节点测完（Clash 收到请求后会自行后台测速）
-            req.BeginGetResponse(ar => { try { req.EndGetResponse(ar).Close(); } catch { } }, null);
-        } catch { }
+            req.BeginGetResponse(ar => { try { req.EndGetResponse(ar).Close(); } catch { /* 测速异步回调异常可忽略 */ } }, null);
+        } catch { /* 测速请求发送失败不影响主流程 */ }
     }
 
     void CleanBlacklist() {
-        List<string> toRemove = new List<string>();
-        DateTime now = DateTime.Now;
-        foreach (var kv in nodeBlacklist) {
-            if ((now - kv.Value).TotalMinutes > blacklistMinutes) toRemove.Add(kv.Key);
+        lock (blacklistLock) {
+            List<string> toRemove = new List<string>();
+            DateTime now = DateTime.Now;
+            foreach (var kv in nodeBlacklist) {
+                if ((now - kv.Value).TotalMinutes > blacklistMinutes) toRemove.Add(kv.Key);
+            }
+            foreach (string key in toRemove) nodeBlacklist.Remove(key);
         }
-        foreach (string key in toRemove) nodeBlacklist.Remove(key);
     }
 
     // 从 Selector 组的 all 数组中提取节点名列表
@@ -1183,7 +1198,7 @@ public class ClashGuardian : Form
             string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
             
             foreach (string nodeName in allNodes) {
-                if (string.IsNullOrEmpty(nodeName) || nodeName.Length > 50) continue;
+                if (string.IsNullOrEmpty(nodeName) || nodeName.Length > MAX_NODE_NAME_LENGTH) continue;
                 
                 // 跳过策略组
                 bool skip = false;
@@ -1199,7 +1214,9 @@ public class ClashGuardian : Form
                 if (nodeName.Contains("HK") || nodeName.Contains("香港") || 
                     nodeName.Contains("TW") || nodeName.Contains("台湾") ||
                     nodeName.Contains("MO") || nodeName.Contains("澳门")) continue;
-                if (nodeBlacklist.ContainsKey(nodeName)) continue;
+                bool isBlacklisted;
+                lock (blacklistLock) { isBlacklisted = nodeBlacklist.ContainsKey(nodeName); }
+                if (isBlacklisted) continue;
                 
                 int delay = GetNodeDelay(json, nodeName);
                 if (delay > 0) {
@@ -1217,7 +1234,7 @@ public class ClashGuardian : Form
             
             // 选择延迟最低且不是当前节点的
             string bestNode = null;
-            int bestDelay = 9999;
+            int bestDelay = int.MaxValue;
             foreach (var kv in nodesWithDelay) {
                 if (kv.Key != currentNode) {
                     bestNode = kv.Key;
@@ -1226,8 +1243,10 @@ public class ClashGuardian : Form
                 }
             }
 
-            if (bestNode != null && bestDelay < 2000) {
-                if (!string.IsNullOrEmpty(currentNode)) nodeBlacklist[currentNode] = DateTime.Now;
+            if (bestNode != null && bestDelay < MAX_ACCEPTABLE_DELAY) {
+                if (!string.IsNullOrEmpty(currentNode)) {
+                    lock (blacklistLock) { nodeBlacklist[currentNode] = DateTime.Now; }
+                }
                 
                 string url = "/proxies/" + Uri.EscapeDataString(group);
                 if (ApiPut(url, "{\"name\":\"" + bestNode + "\"}")) {
@@ -1256,7 +1275,7 @@ public class ClashGuardian : Form
             : new string[] { "http://www.gstatic.com/generate_204", "http://cp.cloudflare.com/generate_204" };
         
         int successCount = 0;
-        int minDelay = 9999;
+        int minDelay = int.MaxValue;
         int timeout = fast ? PROXY_TEST_TIMEOUT : API_TIMEOUT_NORMAL;
 
         foreach (string url in testUrls) {
@@ -1272,7 +1291,7 @@ public class ClashGuardian : Form
                     if (delay < minDelay) minDelay = delay;
                     if (fast) break; // 快速模式只测一个
                 }
-            } catch { }
+            } catch { /* 代理测试超时属正常探测场景 */ }
         }
 
         success = successCount > 0;
@@ -1305,7 +1324,7 @@ public class ClashGuardian : Form
                     }
                 }
             }
-        } catch { }
+        } catch (Exception ex) { Log("TCP统计异常: " + ex.Message); }
         return new int[] { tw, est, cw };
     }
 
@@ -1324,7 +1343,7 @@ public class ClashGuardian : Form
                     foreach (var p in procs) p.Dispose();
                     return true;
                 }
-            } catch { }
+            } catch { /* 进程状态获取失败，尝试重新扫描 */ }
         }
         
         // 未找到，重新扫描所有支持的内核
@@ -1342,7 +1361,7 @@ public class ClashGuardian : Form
                     }
                     return true;
                 }
-            } catch { }
+            } catch { /* 进程探测：未找到属正常情况 */ }
         }
         
         // 都没找到，清空检测结果
@@ -1364,18 +1383,18 @@ public class ClashGuardian : Form
             // 终止客户端
             foreach (string clientName in clientProcessNames) {
                 foreach (Process p in Process.GetProcessesByName(clientName)) {
-                    try { p.Kill(); p.WaitForExit(3000); } catch { }
+                    try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); } catch { /* 进程可能已退出 */ }
                     finally { p.Dispose(); }
                 }
             }
             // 终止内核
             foreach (string coreName in coreProcessNames) {
                 foreach (Process p in Process.GetProcessesByName(coreName)) {
-                    try { p.Kill(); p.WaitForExit(3000); } catch { }
+                    try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); } catch { /* 进程可能已退出 */ }
                     finally { p.Dispose(); }
                 }
             }
-        } catch { }
+        } catch (Exception ex) { Log("终止进程异常: " + ex.Message); }
 
         Thread.Sleep(2000);
         
@@ -1386,7 +1405,7 @@ public class ClashGuardian : Form
                 Process.Start(detectedClientPath);
                 Log("已恢复: " + Path.GetFileName(detectedClientPath));
                 started = true;
-            } catch { }
+            } catch (Exception ex) { Log("启动客户端失败: " + ex.Message); }
         }
         
         // 如果检测路径失败，尝试默认路径列表
@@ -1399,7 +1418,7 @@ public class ClashGuardian : Form
                         Log("已恢复: " + Path.GetFileName(path));
                         started = true;
                         break;
-                    } catch { }
+                    } catch (Exception ex) { Log("启动客户端失败(" + Path.GetFileName(path) + "): " + ex.Message); }
                 }
             }
         }
@@ -1428,7 +1447,7 @@ public class ClashGuardian : Form
     void AdjustInterval(bool hasIssue) {
         if (hasIssue && timer.Interval != fastInterval) {
             timer.Interval = fastInterval;
-        } else if (!hasIssue && consecutiveOK >= 3 && timer.Interval != normalInterval) {
+        } else if (!hasIssue && consecutiveOK >= CONSECUTIVE_OK_THRESHOLD && timer.Interval != normalInterval) {
             timer.Interval = normalInterval;
         }
     }
@@ -1494,7 +1513,7 @@ public class ClashGuardian : Form
                     }
                 }
             }));
-        } catch { }
+        } catch (Exception ex) { Log("冷却检测异常: " + ex.Message); }
         finally {
             isChecking = false;
         }
@@ -1545,7 +1564,7 @@ public class ClashGuardian : Form
         }
         catch (Exception ex) {
             // 记录异常但不崩溃
-            try { LogPerf("CheckError: " + ex.Message, 0); } catch { }
+            try { LogPerf("CheckError: " + ex.Message, 0); } catch { /* 异常记录本身失败不能再递归 */ }
         }
         finally {
             isChecking = false;
@@ -1561,10 +1580,12 @@ public class ClashGuardian : Form
         string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
         memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB" + (mem > memoryWarning ? "!" : "") + "  |  句柄: " + handles;
         string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "获取中..." : currentNode;
-        string nodeShort = nodeDisplay.Length > 15 ? nodeDisplay.Substring(0, 15) + ".." : nodeDisplay;
+        string nodeShort = nodeDisplay.Length > MAX_NODE_DISPLAY_LENGTH ? nodeDisplay.Substring(0, MAX_NODE_DISPLAY_LENGTH) + ".." : nodeDisplay;
         proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
         proxyLabel.ForeColor = !proxyOK ? COLOR_ERROR : (delay > highDelayThreshold ? COLOR_WARNING : COLOR_OK);
-        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + nodeBlacklist.Count;
+        int blCount2;
+        lock (blacklistLock) { blCount2 = nodeBlacklist.Count; }
+        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + blCount2;
 
         TimeSpan stableTime = DateTime.Now - lastStableTime;
         TimeSpan runTime = DateTime.Now - startTime;
@@ -1575,10 +1596,36 @@ public class ClashGuardian : Form
         string coreDisplay = string.IsNullOrEmpty(detectedCoreName) ? "?" : detectedCoreName;
         trayIcon.Text = coreDisplay + " | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
 
-        // 决策逻辑
-        bool needRestart = false, needSwitch = false;
-        string reason = "", evt = "";
-        bool hasIssue = false;
+        // 决策逻辑（与 UI 更新分离）
+        bool needRestart, needSwitch, hasIssue;
+        string reason, evt;
+        EvaluateStatus(running, mem, proxyOK, delay, cw, out needRestart, out needSwitch, out reason, out evt, out hasIssue);
+
+        AdjustInterval(hasIssue);
+        LogData(proxyOK, delay, mem, handles, tw, est, cw, currentNode, evt);
+
+        // 执行操作（在后台线程执行，避免阻塞 UI）
+        if (needSwitch) {
+            ThreadPool.QueueUserWorkItem(_ => {
+                if (SwitchToBestNode()) {
+                    this.BeginInvoke((Action)(() => { 
+                        failCount = 0;
+                        RefreshNodeDisplay();
+                    }));
+                }
+            });
+        }
+        if (needRestart) {
+            ThreadPool.QueueUserWorkItem(_ => RestartClash(reason));
+        }
+    }
+
+    // ==================== 决策引擎（纯逻辑，不操作 UI） ====================
+    void EvaluateStatus(bool running, double mem, bool proxyOK, int delay, int cw,
+        out bool needRestart, out bool needSwitch, out string reason, out string evt, out bool hasIssue) {
+        needRestart = false; needSwitch = false;
+        reason = ""; evt = "";
+        hasIssue = false;
 
         if (!running) {
             needRestart = true; reason = "进程不存在"; evt = "ProcessDown"; hasIssue = true;
@@ -1589,7 +1636,7 @@ public class ClashGuardian : Form
         else if (mem > memoryWarning && !proxyOK) {
             needRestart = true; reason = "内存高+无响应"; evt = "HighMemoryNoProxy"; hasIssue = true;
         }
-        else if (cw > 20 && !proxyOK) {
+        else if (cw > CLOSE_WAIT_THRESHOLD && !proxyOK) {
             needRestart = true; reason = "连接泄漏+无响应"; evt = "CloseWaitLeak"; hasIssue = true;
         }
         else if (!proxyOK) {
@@ -1608,25 +1655,6 @@ public class ClashGuardian : Form
             consecutiveOK++;
             if (mem > memoryWarning) evt = "HighMemoryOK";
         }
-
-        AdjustInterval(hasIssue);
-        LogData(proxyOK, delay, mem, handles, tw, est, cw, currentNode, evt);
-
-        // 执行操作（在后台线程执行，避免阻塞 UI）
-        if (needSwitch) {
-            ThreadPool.QueueUserWorkItem(_ => {
-                if (SwitchToBestNode()) {
-                    // 切换成功后立即刷新 UI 显示
-                    this.BeginInvoke((Action)(() => { 
-                        failCount = 0;
-                        RefreshNodeDisplay();
-                    }));
-                }
-            });
-        }
-        if (needRestart) {
-            ThreadPool.QueueUserWorkItem(_ => RestartClash(reason));
-        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e) {
@@ -1639,14 +1667,14 @@ public class ClashGuardian : Form
         if (args.Length >= 2 && args[0] == "--wait-pid") {
             try {
                 int oldPid = int.Parse(args[1]);
-                try { Process.GetProcessById(oldPid).WaitForExit(15000); } catch { }
-            } catch { }
+                try { Process.GetProcessById(oldPid).WaitForExit(UPDATE_CHECK_TIMEOUT); } catch { /* 旧进程可能已退出 */ }
+            } catch { /* PID 解析失败可忽略 */ }
             // 等待文件句柄释放后清理旧版本
             Thread.Sleep(1000);
             try {
                 string oldFile = Application.ExecutablePath + ".old";
                 if (File.Exists(oldFile)) File.Delete(oldFile);
-            } catch { }
+            } catch { /* 清理旧版本失败不影响运行 */ }
         }
 
         // 单实例检测：防止开机自启时启动多个实例
