@@ -41,7 +41,7 @@ public partial class ClashGuardian : Form
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
     // 自动更新配置
-    private const string APP_VERSION = "0.0.5";
+    private const string APP_VERSION = "0.0.6";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
