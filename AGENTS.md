@@ -5,28 +5,32 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v0.0.3
+- **版本**：v0.0.5
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
+- **架构**：5 个 partial class 文件，按职责拆分
 
 ## 📁 项目结构
 
 ```
-F:\clash-verge-guardian-0.0.2\
-├── ClashGuardian.cs       # 主源代码（唯一源文件）
-├── ClashGuardian.exe      # 编译后的可执行文件
-├── config.json            # 配置文件（首次运行自动生成）
-├── guardian.log           # 运行日志（仅异常）
-├── monitor_YYYYMMDD.csv   # 每日监控数据
-├── README.md              # 项目说明文档
-└── AGENTS.md              # 本文件
+clash-verge-guardian-0.0.3\
+├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、入口点（~396行）
+├── ClashGuardian.UI.cs        # UI：窗口初始化、按钮事件、托盘图标、开机自启（~202行）
+├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
+├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~403行）
+├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
+├── config.json                # 配置文件（首次运行自动生成）
+├── guardian.log               # 运行日志（仅异常）
+├── monitor_YYYYMMDD.csv       # 每日监控数据
+├── README.md                  # 项目说明文档
+└── AGENTS.md                  # 本文件
 ```
 
 ## 🔧 编译命令
 
 ```powershell
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 ```
 
 编译成功标志：无 error 输出（warning 可忽略）
@@ -34,62 +38,128 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 ## ⚠️ 重要注意事项
 
 1. **UI 线程安全** - 后台线程操作 UI 必须使用 `this.BeginInvoke((Action)(() => { ... }))`
-2. **日志精简** - 正常情况不记录日志，只记录异常（TestProxy > 5s，其他 > 2s）
-3. **静默运行** - 所有自动操作不要有弹窗/通知
-4. **节点名称** - 使用 `ExtractJsonString` 解析 Unicode 转义，用 `SafeNodeName` 过滤不可显示字符和 emoji surrogate pair
-5. **代理组切换** - 不要硬编码 GLOBAL，使用 `FindSelectorGroup` 自动发现实际节点所属的 Selector 组
-6. **节点列表获取** - 从 Selector 组的 `all` 数组正向提取节点名（`GetGroupAllNodes`），不要反向扫描 type 字段（会匹配到 `extra` 里的嵌套对象）
+2. **跨线程字段** - `currentNode`/`nodeGroup`/`detectedCoreName`/`detectedClientPath` 声明为 `volatile`；计数器使用 `Interlocked.Increment`；`nodeBlacklist` 使用 `blacklistLock`
+3. **日志精简** - 正常情况不记录日志，只记录异常（TestProxy > 5s，其他 > 2s）
+4. **静默运行** - 所有自动操作不要有弹窗/通知（自动更新除外）
+5. **节点名称** - 使用 `ExtractJsonString` 解析 Unicode 转义，用 `SafeNodeName` 过滤不可显示字符和 emoji surrogate pair
+6. **代理组切换** - 不要硬编码 GLOBAL，使用 `FindSelectorGroup` 自动发现实际节点所属的 Selector 组
+7. **节点列表获取** - 从 Selector 组的 `all` 数组正向提取节点名（`GetGroupAllNodes`），不要反向扫描 type 字段
+8. **JSON 解析** - 使用 `FindObjectBounds` + `FindFieldValue` 统一入口，避免重复的括号匹配代码
+9. **决策逻辑** - `EvaluateStatus` 是纯函数，返回 `StatusDecision` 结构体，不直接修改实例状态
+10. **重启逻辑** - 只终止内核进程，不重启客户端（客户端会自动恢复内核）；仅客户端不在运行时才隐藏启动
+11. **按钮/菜单** - 耗时操作（重启、切换、更新检查）必须通过 `ThreadPool.QueueUserWorkItem` 在后台执行，禁止阻塞 UI 线程
 
-## 🏗️ 核心代码区域
+## 🏗️ 代码模块（按文件）
 
-| 行号范围 | 功能模块 |
-|---------|---------|
-| 1-107 | 配置常量、UI 颜色、运行时配置/状态 |
-| 108-250 | 构造函数、配置加载、进程探测 |
-| 356-520 | UI 初始化、按钮创建 |
-| 543-590 | 日志管理（Log、LogPerf） |
-| 591-636 | API 通信（ApiRequest、ApiPut） |
-| 655-870 | 节点管理（GetCurrentNode、FindProxyNow/Type、ExtractJsonString、SafeNodeName、TriggerDelayTest） |
-| 883-1060 | 节点切换（GetGroupAllNodes、GetNodeDelay、FindSelectorGroup、SwitchToBestNode） |
-| 1061-1090 | 代理测试（TestProxy） |
-| 1093-1165 | 系统监控（GetTcpStats、GetMihomoStats） |
-| 1165-1240 | 重启管理（RestartClash） |
-| 1246-1365 | 后台检测循环（CheckStatus、DoCooldownCheck、DoCheckInBackground） |
-| 1366-1445 | UI 更新与决策逻辑（UpdateUI） |
+### ClashGuardian.cs（主文件）
+| 区域 | 内容 |
+|------|------|
+| 常量 | `DEFAULT_*`、`APP_VERSION`、超时常量、阈值常量 |
+| 结构体 | `StatusDecision` — 决策结果（纯数据） |
+| 静态数组 | `DEFAULT_CORE_NAMES`、`DEFAULT_CLIENT_NAMES`、`DEFAULT_API_PORTS`、`DEFAULT_EXCLUDE_REGIONS` |
+| 字段 | 运行时配置、UI 组件、运行时状态、线程安全设施 |
+| 方法 | 构造函数、`DoFirstCheck`、`LoadConfigFast`、`SaveDefaultConfig`、`DetectRunningCore/Client`、`AutoDiscoverApi`、`Main` |
+
+### ClashGuardian.UI.cs
+| 方法 | 说明 |
+|------|------|
+| `InitializeUI` | 窗口布局和控件创建 |
+| `CreateButton`/`CreateInfoLabel`/`CreateSeparator` | UI 工厂方法 |
+| `InitializeTrayIcon` | 系统托盘菜单（含"检查更新"） |
+| `ToggleAutoStart` | 开机自启注册表操作 |
+| `RefreshNodeDisplay` | 刷新节点和统计显示 |
+| `FormatTimeSpan` | 时间格式化 |
+
+### ClashGuardian.Network.cs
+| 方法 | 说明 |
+|------|------|
+| `ApiRequest`/`ApiPut` | HTTP API 通信 |
+| `FindObjectBounds`/`FindFieldValue` | JSON 对象边界查找和字段提取（统一入口） |
+| `FindProxyNow`/`FindProxyType` | 基于上述方法的便捷包装 |
+| `ExtractJsonString`/`ExtractJsonStringAt` | Unicode 转义解析 |
+| `SafeNodeName` | 节点名安全过滤 |
+| `GetCurrentNode`/`ResolveActualNode` | 节点解析（递归） |
+| `GetGroupAllNodes`/`GetNodeDelay`/`FindSelectorGroup` | 节点组管理 |
+| `SwitchToBestNode`/`CleanBlacklist` | 节点切换和黑名单 |
+| `TriggerDelayTest`/`TestProxy` | 延迟测试和代理测试 |
+
+### ClashGuardian.Monitor.cs
+| 方法 | 说明 |
+|------|------|
+| `Log`/`LogPerf`/`LogData`/`CleanOldLogs` | 日志管理 |
+| `GetTcpStats`/`GetMihomoStats` | 系统状态采集 |
+| `RestartClash` | 重启流程：只杀内核→等客户端自动恢复→仅客户端不在时才启动 |
+| `CheckStatus` | Timer 入口，使用 `Interlocked.CompareExchange` 防重入 |
+| `DoCooldownCheck` | 冷却期检测：内核恢复+代理正常→立即结束冷却 |
+| `DoCheckInBackground` | 正常检测循环 |
+| `UpdateUI` | UI 渲染（调用 EvaluateStatus 获取决策，应用状态，更新界面） |
+| `EvaluateStatus` | **纯决策函数**：输入当前状态，输出 `StatusDecision`，不修改实例 |
+
+### ClashGuardian.Update.cs
+| 方法 | 说明 |
+|------|------|
+| `CheckForUpdate` | 检查 GitHub 最新版本（代理优先，直连回退） |
+| `CompareVersions` | 语义化版本比较 |
+| `ExtractAssetUrl` | 从 Release JSON 提取 .exe 下载链接 |
+| `DownloadAndUpdate` | 下载 + 热替换 + 回滚保护 |
+
+## 📊 决策逻辑（EvaluateStatus）
+
+| 条件 | 动作 | Event |
+|------|------|-------|
+| 进程不存在 | 重启 | `ProcessDown` |
+| 内存 > 150MB | 无条件重启 | `CriticalMemory` |
+| 内存 > 70MB + 代理异常 | 重启 | `HighMemoryNoProxy` |
+| CloseWait > 20 + 代理异常 | 重启 | `CloseWaitLeak` |
+| 代理连续 2 次无响应 | 切换节点 | `NodeSwitch` |
+| 代理连续 4 次无响应 | 重启 | `ProxyTimeout` |
+| 延迟 > 400ms 连续 2 次 | 切换节点 | `HighDelaySwitch` |
+
+## 🔒 线程安全模型
+
+| 字段 | 保护方式 | 说明 |
+|------|---------|------|
+| `currentNode`/`nodeGroup` | `volatile` | 后台写，UI 读 |
+| `detectedCoreName`/`detectedClientPath` | `volatile` | 后台写，UI 读 |
+| `lastDelay` | `Interlocked.Exchange` | 后台写，UI 读 |
+| `totalChecks`/`totalRestarts`/`totalSwitches` | `Interlocked.Increment` | 后台写，UI 读 |
+| `failCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
+| `nodeBlacklist` | `blacklistLock` | 多线程读写 |
+| `_isChecking` | `Interlocked.CompareExchange` | 防重入 |
 
 ## 🔄 关键修复记录
 
+### v0.0.5 改进
+1. **重启静默化** - 只杀内核进程，客户端自动恢复，不再弹出 Clash GUI 窗口
+2. **UI 线程安全** - 重启/切换/更新检查全部移至后台线程，UI 不再卡死
+3. **快速恢复** - 冷却期检测到内核+代理正常后立即结束，恢复时间 ~8s（旧版 ~32s）
+
+### v0.0.4 改进
+1. **自动更新** - 启动时静默检查 GitHub Release，代理优先+直连回退下载，NTFS 热替换，回滚保护
+2. **partial class 拆分** - 单文件拆为 5 个模块文件，按职责分离
+3. **线程安全强化** - `volatile`/`Interlocked` 保护所有跨线程字段
+4. **决策逻辑纯化** - `EvaluateStatus` 返回 `StatusDecision` 结构体
+5. **JSON 解析去重** - `FindObjectBounds`/`FindFieldValue` 统一入口
+6. **节点排除可配置** - `excludeRegions` 从 config.json 加载
+7. **空 catch 全部修复** - 15 处加日志，18 处加注释
+8. **魔法数字消除** - 30+ 个常量替代硬编码值
+
 ### v0.0.3 修复
-1. **节点切换 "proxy not exist"** - 旧代码扫描 `"type":"Shadowsocks"` 反向查找节点名，会误匹配 `extra` 里的 URL 对象。改为从 Selector 组的 `all` 数组正向获取节点列表
-2. **硬编码 GLOBAL 组** - 用 `FindSelectorGroup` 自动发现子 Selector 组（如 BoostNet），切换和测速都对正确的组操作
-3. **节点名框框乱码** - emoji 国旗是 surrogate pair，WinForms 无法渲染，`SafeNodeName` 直接跳过
-4. **测速按钮无反馈** - 测速后立即调用 `TestProxy` 并更新状态栏
-5. **测速阻塞** - `TriggerDelayTest` 改为 `BeginGetResponse` 异步，不等待全部节点测完
-6. **检测频率** - 正常 5s / 异常 1s（原 10s / 3s），子任务间隔按倍数调整保持不变
+1. **节点切换 "proxy not exist"** - 从 Selector 组的 `all` 数组正向获取节点列表
+2. **硬编码 GLOBAL 组** - `FindSelectorGroup` 自动发现子 Selector 组
+3. **节点名框框乱码** - `SafeNodeName` 跳过 surrogate pair
+4. **测速阻塞** - `TriggerDelayTest` 改为 `BeginGetResponse` 异步
 
 ### v0.0.2 修复
-1. **重启后 UI 卡住** - `RestartClash` 在后台线程执行，UI 操作需 `BeginInvoke`
-2. **冷却期无响应** - 冷却期改为主动探测内核+代理，恢复后立即更新状态
-3. **切换后统计不更新** - 添加 `RefreshNodeDisplay()` 统一刷新
-4. **节点名乱码** - 添加 Unicode 转义解析和安全字符过滤
-5. **日志过多** - LogPerf 阈值改为 TestProxy > 5s，其他 > 2s
-
-## 📊 决策逻辑
-
-| 条件 | 动作 |
-|------|------|
-| 进程不存在 | 重启 |
-| 内存 > 150MB | 无条件重启 |
-| 内存 > 70MB + 代理异常 | 重启 |
-| 代理连续 2 次无响应 | 切换节点 |
-| 代理连续 4 次无响应 | 重启 |
-| 延迟 > 400ms 连续 2 次 | 切换节点 |
+1. **重启后 UI 卡住** - `RestartClash` UI 操作需 `BeginInvoke`
+2. **冷却期无响应** - 冷却期主动探测
+3. **节点名乱码** - Unicode 转义解析
 
 ## 🛠️ 常用开发命令
 
 ```powershell
-# 编译
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs
+# 编译（5个文件）
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 
 # 查看 Clash 相关进程
 Get-Process | Where-Object {$_.ProcessName -like "*clash*" -or $_.ProcessName -like "*mihomo*"}
