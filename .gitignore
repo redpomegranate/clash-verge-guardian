@@ -1,0 +1,8 @@
+# 运行时生成的文件
+config.json
+guardian.log
+monitor_*.csv
+
+# 更新临时文件
+*.exe.old
+*.exe.update
