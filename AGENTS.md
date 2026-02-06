@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v0.0.5
+- **版本**：v0.0.7
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -15,10 +15,10 @@
 
 ```
 clash-verge-guardian-0.0.3\
-├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、入口点（~396行）
+├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、路径发现、入口点（~547行）
 ├── ClashGuardian.UI.cs        # UI：窗口初始化、按钮事件、托盘图标、开机自启（~202行）
 ├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
-├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~403行）
+├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~456行）
 ├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
 ├── config.json                # 配置文件（首次运行自动生成）
 ├── guardian.log               # 运行日志（仅异常）
@@ -46,8 +46,9 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 7. **节点列表获取** - 从 Selector 组的 `all` 数组正向提取节点名（`GetGroupAllNodes`），不要反向扫描 type 字段
 8. **JSON 解析** - 使用 `FindObjectBounds` + `FindFieldValue` 统一入口，避免重复的括号匹配代码
 9. **决策逻辑** - `EvaluateStatus` 是纯函数，返回 `StatusDecision` 结构体，不直接修改实例状态
-10. **重启逻辑** - 只终止内核进程，不重启客户端（客户端会自动恢复内核）；仅客户端不在运行时才隐藏启动
+10. **重启逻辑** - 杀内核→等5秒→检查自动恢复→未恢复则杀客户端并重启；`_isRestarting` 标志防止并发
 11. **按钮/菜单** - 耗时操作（重启、切换、更新检查）必须通过 `ThreadPool.QueueUserWorkItem` 在后台执行，禁止阻塞 UI 线程
+12. **客户端路径** - 检测到后持久化到 config.json 的 `clientPath` 字段；搜索优先级：运行进程→config→默认路径→注册表
 
 ## 🏗️ 代码模块（按文件）
 
@@ -58,7 +59,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 | 结构体 | `StatusDecision` — 决策结果（纯数据） |
 | 静态数组 | `DEFAULT_CORE_NAMES`、`DEFAULT_CLIENT_NAMES`、`DEFAULT_API_PORTS`、`DEFAULT_EXCLUDE_REGIONS` |
 | 字段 | 运行时配置、UI 组件、运行时状态、线程安全设施 |
-| 方法 | 构造函数、`DoFirstCheck`、`LoadConfigFast`、`SaveDefaultConfig`、`DetectRunningCore/Client`、`AutoDiscoverApi`、`Main` |
+| 方法 | 构造函数、`DoFirstCheck`、`LoadConfigFast`、`SaveDefaultConfig`、`DetectRunningCore/Client`、`FindClientFromRegistry`、`SaveClientPath`、`AutoDiscoverApi`、`Main` |
 
 ### ClashGuardian.UI.cs
 | 方法 | 说明 |
@@ -88,8 +89,9 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 |------|------|
 | `Log`/`LogPerf`/`LogData`/`CleanOldLogs` | 日志管理 |
 | `GetTcpStats`/`GetMihomoStats` | 系统状态采集 |
-| `RestartClash` | 重启流程：只杀内核→等客户端自动恢复→仅客户端不在时才启动 |
-| `CheckStatus` | Timer 入口，使用 `Interlocked.CompareExchange` 防重入 |
+| `RestartClash` | 重启流程：杀内核→等5秒→检查恢复→未恢复则重启客户端；`_isRestarting` 防并发 |
+| `StartClientProcess` | 启动客户端进程（最小化窗口） |
+| `CheckStatus` | Timer 入口，检查 `_isRestarting` 和 `_isChecking` 防重入 |
 | `DoCooldownCheck` | 冷却期检测：内核恢复+代理正常→立即结束冷却 |
 | `DoCheckInBackground` | 正常检测循环 |
 | `UpdateUI` | UI 渲染（调用 EvaluateStatus 获取决策，应用状态，更新界面） |
@@ -126,8 +128,19 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 | `failCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
 | `nodeBlacklist` | `blacklistLock` | 多线程读写 |
 | `_isChecking` | `Interlocked.CompareExchange` | 防重入 |
+| `_isRestarting` | `volatile bool` | 防止重启期间并发检测 |
 
 ## 🔄 关键修复记录
+
+### v0.0.7 改进
+1. **客户端路径持久化** - `detectedClientPath` 保存到 config.json，客户端关闭后仍可重启
+2. **注册表搜索** - `FindClientFromRegistry` 遍历 HKLM/HKCU Uninstall 键发现安装路径
+3. **默认路径扩充** - 15+ 条路径覆盖 Clash Verge Rev、Scoop、Program Files (x86) 等
+
+### v0.0.6 改进
+1. **重启死循环修复** - 添加 `_isRestarting` 防并发，杀内核后分步检测恢复
+2. **冷却期修正** - 使用 `COOLDOWN_COUNT` 常量（5次 ≈ 25秒）替代硬编码 2 次
+3. **分步恢复** - 杀内核→等5秒→检查恢复→未恢复则重启客户端（智能降级）
 
 ### v0.0.5 改进
 1. **重启静默化** - 只杀内核进程，客户端自动恢复，不再弹出 Clash GUI 窗口

@@ -1,4 +1,4 @@
-# Clash Guardian Pro v0.0.5 - 多内核智能守护进程
+# Clash Guardian Pro v0.0.7 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -37,7 +37,8 @@
 
 ### ⚡ 自动恢复
 - **进程崩溃自动重启** - 检测到进程不存在时自动重启内核
-- **智能重启** - 只终止内核进程，客户端自动重启内核，无弹窗干扰
+- **分步恢复策略** - 杀内核→等待自动恢复→未恢复则重启客户端（智能降级）
+- **防并发重启** - `_isRestarting` 标志阻止重启期间的重复检测
 - **内存过高自动重启** - 内存超过 150MB 无条件重启
 - **智能节点切换** - 代理无响应或延迟过高时自动切换到最优节点
 - **快速恢复** - 重启后主动检测内核状态，一旦恢复立即切换到正常模式
@@ -48,6 +49,12 @@
 - **代理降级** - 优先通过代理下载，失败自动切换直连
 - **热替换** - NTFS 文件热替换，无需手动关闭程序
 - **回滚保护** - 更新失败自动恢复旧版本
+
+### 🔎 客户端路径智能发现
+- **进程探测** - 从运行中进程获取可执行文件路径（最准确）
+- **路径持久化** - 检测到的路径保存到 `config.json`，下次启动直接读取
+- **默认路径列表** - 覆盖 15+ 种常见安装方式
+- **注册表搜索** - 从 HKLM/HKCU Uninstall 键自动发现安装路径（兜底）
 
 ### 📊 数据统计
 - **稳定性统计** - 显示连续稳定时长、运行时长、成功率
@@ -78,7 +85,8 @@
   "blacklistMinutes": 20,
   "coreProcessNames": ["verge-mihomo", "mihomo", "clash-meta", "clash-rs", "clash", "clash-win64"],
   "clientProcessNames": ["Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows"],
-  "excludeRegions": ["HK", "香港", "TW", "台湾", "MO", "澳门"]
+  "excludeRegions": ["HK", "香港", "TW", "台湾", "MO", "澳门"],
+  "clientPath": "C:\\Users\\...\\Clash Verge.exe"
 }
 ```
 
@@ -94,6 +102,7 @@
 | `coreProcessNames` | 内核进程名列表（按优先级） | 见上方示例 |
 | `clientProcessNames` | 客户端进程名列表 | 见上方示例 |
 | `excludeRegions` | 节点排除关键词 | `HK,香港,TW,台湾,MO,澳门` |
+| `clientPath` | 客户端可执行文件路径（自动检测并持久化） | 自动 |
 
 **重要**：请将 `clashSecret` 修改为你的 Clash 客户端中设置的 API 密钥。
 
@@ -132,7 +141,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 - **统计信息** - 检测次数、重启次数、节点切换次数、黑名单数量
 
 **按钮功能：**
-- `立即重启` - 重启 Clash 内核（仅终止内核，客户端自动恢复）
+- `立即重启` - 重启 Clash 内核（先杀内核，若不恢复则重启客户端）
 - `查看日志` - 打开当日 CSV 监控日志
 - `退出` - 完全退出程序
 - `测速` - 手动测试代理延迟并更新状态栏（同时触发 Clash 全节点测速）
@@ -153,11 +162,11 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 ## 📁 项目结构
 
 ```
-├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、入口点
-├── ClashGuardian.UI.cs        # UI：窗口初始化、按钮事件、托盘图标、开机自启
-├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试
-├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑
-├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护
+├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、路径发现、入口点（~547行）
+├── ClashGuardian.UI.cs        # UI：窗口初始化、按钮事件、托盘图标、开机自启（~202行）
+├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
+├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~456行）
+├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
 ├── config.json                # 配置文件（首次运行自动生成）
 ├── guardian.log               # 运行日志（仅异常）
 ├── monitor_YYYYMMDD.csv       # 每日监控数据
@@ -219,19 +228,28 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 
 ## 🔄 更新日志
 
+### v0.0.7 (2026-02-06)
+- **修复：客户端路径丢失** - 持久化 `clientPath` 到 config.json，关闭客户端后仍可正确重启
+- **新增：注册表搜索** - 从 HKLM/HKCU Uninstall 键自动发现客户端安装路径
+- **新增：默认路径扩充** - 覆盖 Clash Verge Rev、Scoop、Program Files (x86) 等 15+ 种安装方式
+- **优化：路径搜索优先级** - 运行进程 → config 持久化 → 默认路径 → 注册表（逐级兜底）
+
+### v0.0.6 (2026-02-06)
+- **修复：重启死循环** - 手动重启后内核无法恢复，导致无限"进程不存在"循环
+- **修复：重启竞态条件** - 添加 `_isRestarting` 标志，阻止重启期间 CheckStatus 并发执行
+- **修复：冷却期过短** - 使用 `COOLDOWN_COUNT` 常量（5次 ≈ 25秒）替代硬编码的 2 次
+- **优化：分步恢复** - 杀内核 → 等 5 秒 → 检查自动恢复 → 未恢复则重启客户端
+
 ### v0.0.5 (2026-02-06)
 - **修复：重启弹窗** - 只终止内核进程，客户端自动重启内核，不再弹出 Clash GUI 窗口
 - **修复：UI 线程阻塞** - 重启/切换/更新检查移至后台线程，UI 不再卡死
-- **优化：快速恢复** - 重启后一旦检测到内核恢复+代理正常，立即切回正常模式（~8秒 vs 旧版 ~32秒）
-- **优化：代码架构** - 拆分为 5 个 partial class 文件（Main/UI/Network/Monitor/Update），按职责分离
-- **优化：线程安全** - `volatile`/`Interlocked` 保护所有跨线程字段，`nodeBlacklist` 专用锁
-- **优化：决策纯化** - `EvaluateStatus` 返回 `StatusDecision` 结构体，不直接修改实例状态
-- **优化：JSON 解析** - 提取 `FindObjectBounds`/`FindFieldValue` 统一入口，消除重复代码
-- **新增：自动更新** - 启动时静默检查 GitHub Release，代理优先+直连回退下载，NTFS 热替换，回滚保护
+- **优化：快速恢复** - 重启后一旦检测到内核恢复+代理正常，立即切回正常模式
+- **优化：代码架构** - 拆分为 5 个 partial class 文件（Main/UI/Network/Monitor/Update）
+- **优化：线程安全** - `volatile`/`Interlocked` 保护所有跨线程字段
+- **优化：决策纯化** - `EvaluateStatus` 返回 `StatusDecision` 结构体
+- **新增：自动更新** - 启动时静默检查 GitHub Release，NTFS 热替换，回滚保护
 - **新增：节点排除可配置** - `excludeRegions` 从 config.json 加载
-- **新增：托盘检查更新** - 右键菜单新增"检查更新"选项
-- **修复：空 catch** - 44 个 catch 块全部添加异常日志或注释说明
-- **修复：魔法数字** - 30+ 个常量替代硬编码值
+- **修复：空 catch / 魔法数字** - 44 个 catch 块修复，30+ 常量替代
 
 ### v0.0.3 (2026-02-06)
 - 修复节点切换失败（自动发现 Selector 组）
