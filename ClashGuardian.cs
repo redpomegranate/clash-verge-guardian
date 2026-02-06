@@ -41,7 +41,7 @@ public partial class ClashGuardian : Form
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
     // 自动更新配置
-    private const string APP_VERSION = "0.0.6";
+    private const string APP_VERSION = "0.0.7";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -268,6 +268,12 @@ public partial class ClashGuardian : Form
 
                 string customExcludes = GetJsonArray(json, "excludeRegions");
                 if (!string.IsNullOrEmpty(customExcludes)) excludeRegions = customExcludes.Split(',');
+
+                // 从配置文件恢复上次检测到的客户端路径
+                string savedClientPath = GetJsonValue(json, "clientPath", "");
+                if (!string.IsNullOrEmpty(savedClientPath) && File.Exists(savedClientPath)) {
+                    detectedClientPath = savedClientPath;
+                }
             } catch (Exception ex) { Log("配置加载异常: " + ex.Message); }
         } else {
             ThreadPool.QueueUserWorkItem(_ => SaveDefaultConfig());
@@ -276,15 +282,35 @@ public partial class ClashGuardian : Form
 
     string[] GetDefaultClientPaths() {
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return new string[] {
-            Path.Combine(localAppData, @"Programs\clash-verge\Clash Verge.exe"),
-            Path.Combine(localAppData, @"Programs\clash-verge\clash-verge.exe"),
-            Path.Combine(localAppData, @"Programs\Clash Nyanpasu\Clash Nyanpasu.exe"),
-            Path.Combine(localAppData, @"mihomo-party\mihomo-party.exe"),
-            Path.Combine(localAppData, @"Programs\Clash for Windows\Clash for Windows.exe"),
-            @"C:\Program Files\Clash Verge\Clash Verge.exe",
-            @"C:\Program Files\mihomo-party\mihomo-party.exe"
-        };
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        List<string> paths = new List<string>();
+
+        // Clash Verge / Clash Verge Rev（常见安装路径）
+        paths.Add(Path.Combine(localAppData, @"Programs\clash-verge\Clash Verge.exe"));
+        paths.Add(Path.Combine(localAppData, @"Programs\clash-verge\clash-verge.exe"));
+        paths.Add(Path.Combine(localAppData, @"Clash Verge\Clash Verge.exe"));
+        paths.Add(Path.Combine(programFiles, @"Clash Verge\Clash Verge.exe"));
+        paths.Add(Path.Combine(programFilesX86, @"Clash Verge\Clash Verge.exe"));
+
+        // Clash Nyanpasu
+        paths.Add(Path.Combine(localAppData, @"Programs\Clash Nyanpasu\Clash Nyanpasu.exe"));
+        paths.Add(Path.Combine(programFiles, @"Clash Nyanpasu\Clash Nyanpasu.exe"));
+
+        // mihomo-party
+        paths.Add(Path.Combine(localAppData, @"mihomo-party\mihomo-party.exe"));
+        paths.Add(Path.Combine(programFiles, @"mihomo-party\mihomo-party.exe"));
+
+        // Clash for Windows
+        paths.Add(Path.Combine(localAppData, @"Programs\Clash for Windows\Clash for Windows.exe"));
+
+        // Scoop 安装路径
+        paths.Add(Path.Combine(userProfile, @"scoop\apps\clash-verge\current\Clash Verge.exe"));
+        paths.Add(Path.Combine(userProfile, @"scoop\apps\clash-nyanpasu\current\Clash Nyanpasu.exe"));
+
+        return paths.ToArray();
     }
 
     void DetectRunningCore() {
@@ -302,6 +328,7 @@ public partial class ClashGuardian : Form
     }
 
     void DetectRunningClient() {
+        // 1. 从运行中的进程获取路径（最准确）
         foreach (string clientName in clientProcessNames) {
             try {
                 Process[] procs = Process.GetProcessesByName(clientName);
@@ -309,13 +336,143 @@ public partial class ClashGuardian : Form
                     try { detectedClientPath = procs[0].MainModule.FileName; }
                     catch { /* 32/64位进程访问限制可忽略 */ }
                     foreach (var p in procs) p.Dispose();
-                    return;
+                    if (!string.IsNullOrEmpty(detectedClientPath)) { SaveClientPath(); return; }
                 }
             } catch { /* 客户端探测：未找到属正常情况 */ }
         }
+
+        // 2. 如果已有持久化路径，验证是否仍然有效
+        if (!string.IsNullOrEmpty(detectedClientPath) && File.Exists(detectedClientPath)) return;
+
+        // 3. 从默认路径列表查找
         foreach (string path in clientPaths) {
-            if (File.Exists(path)) { detectedClientPath = path; return; }
+            if (File.Exists(path)) { detectedClientPath = path; SaveClientPath(); return; }
         }
+
+        // 4. 从注册表查找（兜底）
+        string regPath = FindClientFromRegistry();
+        if (!string.IsNullOrEmpty(regPath)) { detectedClientPath = regPath; SaveClientPath(); return; }
+    }
+
+    // 从注册表搜索客户端安装路径
+    string FindClientFromRegistry() {
+        string[] regRoots = new string[] {
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        };
+        string[] keywords = new string[] { "Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows" };
+
+        foreach (string regRoot in regRoots) {
+            try {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regRoot)) {
+                    if (key == null) continue;
+                    foreach (string subKeyName in key.GetSubKeyNames()) {
+                        try {
+                            using (RegistryKey sub = key.OpenSubKey(subKeyName)) {
+                                if (sub == null) continue;
+                                string displayName = sub.GetValue("DisplayName") as string;
+                                if (string.IsNullOrEmpty(displayName)) continue;
+
+                                foreach (string kw in keywords) {
+                                    if (displayName.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0) {
+                                        string installDir = sub.GetValue("InstallLocation") as string;
+                                        if (!string.IsNullOrEmpty(installDir)) {
+                                            // 尝试常见的可执行文件名
+                                            string[] exeNames = new string[] {
+                                                displayName + ".exe",
+                                                displayName.Replace(" ", "-").ToLower() + ".exe",
+                                                Path.GetFileName(installDir) + ".exe"
+                                            };
+                                            foreach (string exe in exeNames) {
+                                                string fullPath = Path.Combine(installDir, exe);
+                                                if (File.Exists(fullPath)) return fullPath;
+                                            }
+                                            // 搜索目录下的 exe 文件
+                                            try {
+                                                foreach (string f in Directory.GetFiles(installDir, "*.exe")) {
+                                                    string fn = Path.GetFileNameWithoutExtension(f).ToLower();
+                                                    if (fn.Contains("clash") || fn.Contains("mihomo") || fn.Contains("nyanpasu"))
+                                                        return f;
+                                                }
+                                            } catch { /* 目录遍历失败可忽略 */ }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        } catch { /* 单个注册表子键读取失败可忽略 */ }
+                    }
+                }
+            } catch { /* 注册表访问失败可忽略 */ }
+        }
+
+        // 也搜索 HKCU
+        try {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")) {
+                if (key != null) {
+                    foreach (string subKeyName in key.GetSubKeyNames()) {
+                        try {
+                            using (RegistryKey sub = key.OpenSubKey(subKeyName)) {
+                                if (sub == null) continue;
+                                string displayName = sub.GetValue("DisplayName") as string;
+                                if (string.IsNullOrEmpty(displayName)) continue;
+
+                                foreach (string kw in keywords) {
+                                    if (displayName.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0) {
+                                        string installDir = sub.GetValue("InstallLocation") as string;
+                                        if (!string.IsNullOrEmpty(installDir)) {
+                                            try {
+                                                foreach (string f in Directory.GetFiles(installDir, "*.exe")) {
+                                                    string fn = Path.GetFileNameWithoutExtension(f).ToLower();
+                                                    if (fn.Contains("clash") || fn.Contains("mihomo") || fn.Contains("nyanpasu"))
+                                                        return f;
+                                                }
+                                            } catch { /* 目录遍历失败可忽略 */ }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        } catch { /* 单个注册表子键读取失败可忽略 */ }
+                    }
+                }
+            }
+        } catch { /* 注册表访问失败可忽略 */ }
+
+        return null;
+    }
+
+    // 将检测到的客户端路径持久化到 config.json
+    void SaveClientPath() {
+        if (string.IsNullOrEmpty(detectedClientPath)) return;
+        try {
+            if (File.Exists(configFile)) {
+                string json = File.ReadAllText(configFile, Encoding.UTF8);
+                if (json.Contains("\"clientPath\"")) {
+                    // 替换已有的 clientPath
+                    int start = json.IndexOf("\"clientPath\"");
+                    int valueStart = json.IndexOf(':', start) + 1;
+                    // 找到值的结束位置（逗号或 }）
+                    int valueEnd = valueStart;
+                    bool inStr = false;
+                    while (valueEnd < json.Length) {
+                        if (json[valueEnd] == '"') inStr = !inStr;
+                        if (!inStr && (json[valueEnd] == ',' || json[valueEnd] == '}')) break;
+                        valueEnd++;
+                    }
+                    string escaped = detectedClientPath.Replace("\\", "\\\\");
+                    json = json.Substring(0, valueStart) + " \"" + escaped + "\"" + json.Substring(valueEnd);
+                } else {
+                    // 在最后一个 } 前插入
+                    int lastBrace = json.LastIndexOf('}');
+                    if (lastBrace > 0) {
+                        string escaped = detectedClientPath.Replace("\\", "\\\\");
+                        json = json.Substring(0, lastBrace) + ",\n  \"clientPath\": \"" + escaped + "\"\n}";
+                    }
+                }
+                File.WriteAllText(configFile, json, Encoding.UTF8);
+            }
+        } catch { /* 保存客户端路径失败不影响运行 */ }
     }
 
     void AutoDiscoverApi() {
