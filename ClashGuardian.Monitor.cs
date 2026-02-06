@@ -122,18 +122,22 @@ public partial class ClashGuardian
 
     // ==================== 重启管理 ====================
     void RestartClash(string reason) {
-        Log("重启: " + reason);
-        Interlocked.Increment(ref totalRestarts);
+        // 防止并发重启（手动+自动 或 多次自动）
+        if (_isRestarting) return;
+        _isRestarting = true;
 
-        string coreName = detectedCoreName; // volatile read
+        try {
+            Log("重启: " + reason);
+            Interlocked.Increment(ref totalRestarts);
 
-        this.BeginInvoke((Action)(() => {
-            statusLabel.Text = "● 状态: 重启中...";
-            statusLabel.ForeColor = COLOR_WARNING;
-        }));
+            if (this.IsHandleCreated) {
+                this.BeginInvoke((Action)(() => {
+                    statusLabel.Text = "● 状态: 重启中...";
+                    statusLabel.ForeColor = COLOR_WARNING;
+                }));
+            }
 
-        // 只终止内核进程（客户端会自动重启内核，无需重启客户端）
-        if (!string.IsNullOrEmpty(coreName)) {
+            // ===== 第 1 步：终止所有内核进程 =====
             foreach (string name in coreProcessNames) {
                 try {
                     Process[] procs = Process.GetProcessesByName(name);
@@ -144,49 +148,97 @@ public partial class ClashGuardian
                     }
                 } catch { /* 终止失败：进程可能已退出 */ }
             }
-        }
 
-        // 等待客户端自动重启内核（通常 3-5 秒）
-        Thread.Sleep(3000);
+            // ===== 第 2 步：等待客户端自动重启内核（5 秒） =====
+            Thread.Sleep(5000);
 
-        // 检查客户端是否在运行
-        bool clientRunning = false;
-        foreach (string clientName in clientProcessNames) {
-            try {
-                Process[] procs = Process.GetProcessesByName(clientName);
-                if (procs.Length > 0) {
-                    clientRunning = true;
-                    foreach (var p in procs) p.Dispose();
-                    break;
-                }
-            } catch { /* 客户端探测失败可忽略 */ }
-        }
-
-        // 仅当客户端不在运行时才启动（后台隐藏）
-        if (!clientRunning) {
-            string clientPath = detectedClientPath; // volatile read
-            if (!string.IsNullOrEmpty(clientPath) && File.Exists(clientPath)) {
+            // ===== 第 3 步：检查内核是否已自动恢复 =====
+            bool coreBack = false;
+            foreach (string name in coreProcessNames) {
                 try {
-                    ProcessStartInfo psi = new ProcessStartInfo(clientPath);
-                    psi.WindowStyle = ProcessWindowStyle.Hidden;
-                    Process.Start(psi);
-                    Thread.Sleep(5000);
-                } catch (Exception ex) { Log("客户端启动失败: " + ex.Message); }
-            } else {
-                Log("未找到客户端路径");
+                    Process[] procs = Process.GetProcessesByName(name);
+                    if (procs.Length > 0) {
+                        coreBack = true;
+                        detectedCoreName = name;
+                        foreach (var p in procs) p.Dispose();
+                        break;
+                    }
+                    foreach (var p in procs) p.Dispose();
+                } catch { /* 探测失败可忽略 */ }
             }
+
+            if (coreBack) {
+                Log("内核已自动恢复");
+            } else {
+                // ===== 第 4 步：内核未恢复，需要重启客户端 =====
+                Log("内核未自动恢复，重启客户端");
+
+                // 先终止客户端
+                foreach (string clientName in clientProcessNames) {
+                    try {
+                        Process[] procs = Process.GetProcessesByName(clientName);
+                        foreach (var p in procs) {
+                            try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); }
+                            catch { /* 进程可能已退出 */ }
+                            p.Dispose();
+                        }
+                    } catch { /* 客户端终止失败可忽略 */ }
+                }
+
+                Thread.Sleep(1000);
+
+                // 启动客户端（客户端会自动启动内核）
+                string clientPath = detectedClientPath; // volatile read
+                bool started = false;
+
+                if (!string.IsNullOrEmpty(clientPath) && File.Exists(clientPath)) {
+                    started = StartClientProcess(clientPath);
+                }
+
+                // 如果已知路径无效，尝试默认路径
+                if (!started) {
+                    foreach (string path in clientPaths) {
+                        if (File.Exists(path)) {
+                            started = StartClientProcess(path);
+                            if (started) { detectedClientPath = path; break; }
+                        }
+                    }
+                }
+
+                if (!started) {
+                    Log("未找到客户端路径，无法恢复");
+                } else {
+                    // 等待客户端启动内核
+                    Thread.Sleep(5000);
+                }
+
+                DetectRunningCore();
+            }
+
+            // ===== 第 5 步：设置冷却期 =====
+            if (this.IsHandleCreated) {
+                this.BeginInvoke((Action)(() => {
+                    failCount = 0;
+                    consecutiveOK = 0;
+                    cooldownCount = COOLDOWN_COUNT;
+                    timer.Interval = normalInterval;
+                }));
+            }
+        } finally {
+            _isRestarting = false;
         }
+    }
 
-        DetectRunningCore();
-
-        // 短冷却：2 次检测足够确认内核已稳定
-        if (this.IsHandleCreated) {
-            this.BeginInvoke((Action)(() => {
-                failCount = 0;
-                consecutiveOK = 0;
-                cooldownCount = 2;
-                timer.Interval = normalInterval;
-            }));
+    bool StartClientProcess(string path) {
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo(path);
+            psi.WindowStyle = ProcessWindowStyle.Minimized;
+            Process.Start(psi);
+            Log("客户端已启动: " + path);
+            return true;
+        } catch (Exception ex) {
+            Log("客户端启动失败: " + ex.Message);
+            return false;
         }
     }
 
@@ -201,6 +253,7 @@ public partial class ClashGuardian
     }
 
     void CheckStatus(object sender, EventArgs e) {
+        if (_isRestarting) return; // 重启进行中，跳过本轮检测
         if (Interlocked.CompareExchange(ref _isChecking, 1, 0) != 0) return;
         if (cooldownCount > 0) {
             cooldownCount--;

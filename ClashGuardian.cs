@@ -150,6 +150,7 @@ public partial class ClashGuardian : Form
     // ==================== 线程安全设施 ====================
     private readonly object blacklistLock = new object();  // nodeBlacklist 专用锁
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
+    private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
 
     // ==================== 构造函数 ====================
     public ClashGuardian()
