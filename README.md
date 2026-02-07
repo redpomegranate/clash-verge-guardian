@@ -1,4 +1,4 @@
-# Clash Guardian Pro v0.0.9 - 多内核智能守护进程
+﻿# Clash Guardian Pro v1.0.0 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -33,9 +33,11 @@
 - **延迟优化** - 延迟过高自动切换节点
 - **综合判断** - 内存高但网络正常时不重启
 - **定期测速** - 约每 6 分钟触发全节点延迟测试
-- **节点排除可配置** - `excludeRegions` 从配置文件加载，灵活排除地区节点
+- **禁用名单（可勾选）** - 托盘“禁用名单”勾选节点写入 `disabledNodes`；未配置时仍按 `excludeRegions` 关键字排除（默认港澳台）
 
 ### ⚡ 自动恢复
+- **订阅级自动切换（Clash Verge Rev）** - 连续自动切换节点仍不可用时，按白名单轮换订阅并强制重启客户端（默认关闭）
+
 - **进程崩溃自动重启** - 检测到进程不存在时自动重启内核
 - **分步恢复策略** - 杀内核→等待自动恢复→未恢复则重启客户端（智能降级）
 - **防并发重启** - `_isRestarting` + `restartLock` 门闩，避免并发重启竞态
@@ -62,7 +64,7 @@
 - **注册表搜索** - 从 HKLM/HKCU Uninstall 键自动发现安装路径（兜底）
 
 ### 📊 数据统计
-- **稳定性统计** - 显示连续稳定时长、运行时长、成功率
+- **问题段落次数** - UI 只统计“正常→异常”的次数，异常持续不重复累加
 - **监控日志** - 记录关键事件到 `guardian.log`（仅记录异常）
 - **详细数据** - 记录每次检测数据到按日期命名的 CSV 文件
 - **自动清理** - 自动清理 7 天前的日志文件
@@ -94,7 +96,15 @@
   "blacklistMinutes": 20,
   "coreProcessNames": ["verge-mihomo", "mihomo", "clash-meta", "clash-rs", "clash", "clash-win64"],
   "clientProcessNames": ["Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows"],
+
   "excludeRegions": ["HK", "香港", "TW", "台湾", "MO", "澳门"],
+  "disabledNodes": [],
+
+  "autoSwitchSubscription": false,
+  "subscriptionSwitchThreshold": 3,
+  "subscriptionSwitchCooldownMinutes": 15,
+  "subscriptionWhitelist": [],
+
   "clientPath": "C:\\Users\\...\\Clash Verge.exe"
 }
 ```
@@ -112,6 +122,11 @@
 | `clientProcessNames` | 客户端进程名列表 | 见上方示例 |
 | `excludeRegions` | 节点排除关键词 | `HK,香港,TW,台湾,MO,澳门` |
 | `clientPath` | 客户端可执行文件路径（自动检测并持久化） | 自动 |
+| `disabledNodes` | 节点禁用显式名单（存在则优先，覆盖 `excludeRegions`） | 空数组 |
+| `autoSwitchSubscription` | 订阅级自动切换（仅 Clash Verge Rev；默认关闭） | `false` |
+| `subscriptionSwitchThreshold` | 连续自动切换节点仍不可用时触发阈值 | `3` |
+| `subscriptionSwitchCooldownMinutes` | 订阅切换冷却期（分钟） | `15` |
+| `subscriptionWhitelist` | 订阅白名单（profile name 或 uid；至少 2 条才会切换） | `[]` |
 
 **重要**：请将 `clashSecret` 修改为你的 Clash 客户端中设置的 API 密钥。
 
@@ -137,11 +152,15 @@
 ### 从源码编译
 
 ```powershell
+# 推荐：一键编译（含 icon）
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+# 或手动编译（需指定 win32 icon）
 mkdir dist -Force | Out-Null
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\\ClashGuardian.ico /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 ```
 
-也可以直接运行 `build.ps1` 一键编译到 `dist\\ClashGuardian.exe`。
+编译产物输出到 `dist\\ClashGuardian.exe`。
 
 ### 界面操作
 
@@ -149,8 +168,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 - **状态显示** - 当前运行状态（运行中/重启中/等待内核）
 - **内核信息** - 检测到的内核名称、内存占用、句柄数
 - **代理状态** - 代理连通性、延迟和当前节点名称
-- **稳定性统计** - 稳定时长、运行时长、成功率
-- **统计信息** - 检测次数、重启次数、节点切换次数、黑名单数量
+- **稳定性统计** - 稳定时长、运行时长、问题段落次数
+- **统计信息** - 问题次数、重启次数、节点切换次数、黑名单数量
 
 **按钮功能：**
 - `立即重启` - 重启 Clash 内核（先杀内核，若不恢复则重启客户端）
@@ -169,6 +188,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 - 立即重启
 - 切换节点
 - 触发测速
+- 禁用名单（勾选即禁用）
 - 导出诊断包
 - 打开配置 / 查看监控数据 / 查看异常日志
 - 检查更新
@@ -178,15 +198,19 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 ## 📁 项目结构
 
 ```
-├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、路径发现、入口点（~547行）
-├── ClashGuardian.UI.cs        # UI：窗口初始化、按钮事件、托盘图标、开机自启（~202行）
-├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
-├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~456行）
-├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
-├── build.ps1                  # 一键编译脚本（输出到 dist\）
+ClashGuardian\
+├── ClashGuardian.cs
+├── ClashGuardian.UI.cs
+├── ClashGuardian.Network.cs
+├── ClashGuardian.Monitor.cs
+├── ClashGuardian.Update.cs
+├── assets\
+│   ├── icon-source.png
+│   └── ClashGuardian.ico
+├── build.ps1
 ├── dist\                      # 编译产物输出目录（本地生成，不提交）
-├── README.md                  # 本文档
-└── AGENTS.md                  # AI 开发指南
+├── README.md
+└── AGENTS.md
 ```
 
 **运行时文件不会写入 exe 所在目录**，默认存放在：`%LOCALAPPDATA%\\ClashGuardian\\`
@@ -244,11 +268,17 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 ## ⚠️ 注意事项
 
 1. 确保 Clash 客户端的外部控制 API 已启用
-2. 确保 API 密钥配置正确（修改 `config.json`）
+2. 确保 API 密钥配置正确（托盘菜单“打开配置”修改 `%LOCALAPPDATA%\\ClashGuardian\\config\\config.json`）
 3. 程序需要管理员权限来终止和启动进程
 4. 代理测试端口需与 Clash 客户端设置一致
 
 ## 🔄 更新日志
+
+### v1.0.0 (2026-02-07)
+- **新增：禁用名单（节点级）可配置** - 托盘勾选写入 `disabledNodes`；未配置则按 `excludeRegions` 关键字排除（默认港澳台）
+- **新增：订阅级自动切换（Clash Verge Rev）** - 连续自动切换节点仍不可用时，按白名单轮换订阅并强制重启客户端（默认关闭）
+- **优化：图标统一** - `build.ps1` 编译产物内置 icon，窗口/托盘图标与 EXE 一致
+- **调整：统计口径** - UI 统计改为“问题段落次数”（正常→异常 +1）
 
 ### v0.0.9 (2026-02-07)
 - **优化：运行数据目录分离** - `config/log/monitor/diagnostics` 统一迁移到 `%LOCALAPPDATA%\\ClashGuardian\\`，避免与源码/可执行混放（启动时自动尝试迁移旧文件）
@@ -301,3 +331,7 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 ## 📄 License
 
 MIT License
+
+
+
+

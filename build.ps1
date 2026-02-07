@@ -9,8 +9,12 @@ $outDir = Join-Path $PSScriptRoot "dist"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $outExe = Join-Path $outDir "ClashGuardian.exe"
+$icon = Join-Path $PSScriptRoot "assets\\ClashGuardian.ico"
+if (-not (Test-Path $icon)) {
+  throw "icon not found: $icon"
+}
 
-& $csc /nologo /target:winexe /out:$outExe `
+& $csc /nologo /target:winexe /win32icon:$icon /out:$outExe `
   "$PSScriptRoot\\ClashGuardian.cs" `
   "$PSScriptRoot\\ClashGuardian.UI.cs" `
   "$PSScriptRoot\\ClashGuardian.Network.cs" `
@@ -18,4 +22,3 @@ $outExe = Join-Path $outDir "ClashGuardian.exe"
   "$PSScriptRoot\\ClashGuardian.Update.cs"
 
 Write-Host "Built: $outExe"
-

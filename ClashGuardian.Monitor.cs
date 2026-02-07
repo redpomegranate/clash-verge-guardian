@@ -180,6 +180,7 @@ public partial class ClashGuardian
             sb.AppendLine("lastDelay=" + Thread.VolatileRead(ref lastDelay));
             sb.AppendLine("blacklistCount=" + blCount);
             sb.AppendLine("totalChecks=" + totalChecks);
+            sb.AppendLine("totalIssues=" + totalIssues);
             sb.AppendLine("totalRestarts=" + totalRestarts);
             sb.AppendLine("totalSwitches=" + totalSwitches);
             sb.AppendLine("failCount=" + failCount);
@@ -259,7 +260,7 @@ public partial class ClashGuardian
     }
 
     // ==================== 重启管理 ====================
-    void RestartClash(string reason) {
+    void RestartClash(string reason, bool forceRestartClient = false) {
         // 防止并发重启（手动+自动 或 多次自动）
         lock (restartLock) {
             if (_isRestarting) return;
@@ -307,11 +308,12 @@ public partial class ClashGuardian
                 } catch { /* 探测失败可忽略 */ }
             }
 
-            if (coreBack) {
+            if (coreBack && !forceRestartClient) {
                 Log("内核已自动恢复");
             } else {
-                // ===== 第 4 步：内核未恢复，需要重启客户端 =====
-                Log("内核未自动恢复，重启客户端");
+                // ===== 第 4 步：内核未恢复，或需要强制重启客户端（例如切换订阅后生效） =====
+                if (forceRestartClient) Log("强制重启客户端");
+                else Log("内核未自动恢复，重启客户端");
 
                 // 先终止客户端
                 foreach (string clientName in clientProcessNames) {
@@ -490,6 +492,15 @@ public partial class ClashGuardian
         else if (decision.IncrementConsecutiveOK) consecutiveOK++;
         if (decision.ResetStableTime) lastStableTime = DateTime.Now;
 
+        // “问题段落次数”：从正常->异常记 1 次，异常持续期间不累加
+        if (decision.HasIssue && !lastHadIssue) totalIssues++;
+        lastHadIssue = decision.HasIssue;
+
+        // 健康时清零“连续成功切换节点次数”（用于订阅级自动切换触发）
+        if (running && proxyOK && dl > 0 && dl <= highDelayThreshold) {
+            consecutiveSuccessfulAutoSwitchesWithoutRecovery = 0;
+        }
+
         // 渲染 UI
         string delayStr = dl > 0 ? dl + "ms" : "--";
         string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
@@ -499,12 +510,11 @@ public partial class ClashGuardian
         proxyLabel.ForeColor = !proxyOK ? COLOR_ERROR : (dl > highDelayThreshold ? COLOR_WARNING : COLOR_OK);
         int blCount;
         lock (blacklistLock) { blCount = nodeBlacklist.Count; }
-        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + blCount;
+        checkLabel.Text = "统  计:  问题 " + totalIssues + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + blCount;
 
         TimeSpan stableTime = DateTime.Now - lastStableTime;
         TimeSpan runTime = DateTime.Now - startTime;
-        double stableRate = totalChecks > 0 ? (double)(totalChecks - totalFails) / totalChecks * 100 : 100;
-        stableLabel.Text = "稳定性:  连续 " + FormatTimeSpan(stableTime) + "  |  运行 " + FormatTimeSpan(runTime) + "  |  成功率 " + stableRate.ToString("F1") + "%";
+        stableLabel.Text = "稳定性:  连续 " + FormatTimeSpan(stableTime) + "  |  运行 " + FormatTimeSpan(runTime) + "  |  问题 " + totalIssues;
 
         // 状态指示
         string cn = currentNode;
@@ -542,6 +552,24 @@ public partial class ClashGuardian
         // 记录数据
         LogData(proxyOK, dl, mem, handles, tw, est, cw, cn, decision.Event);
 
+        // 订阅级自动切换（Clash Verge Rev）：连续成功切换多个节点仍不可用，则切换订阅并强制重启客户端
+        if (!paused && autoSwitchSubscription) {
+            bool whitelistOk = subscriptionWhitelist != null && subscriptionWhitelist.Length >= 2;
+            bool networkBad = running && mem <= memoryWarning && (!proxyOK || (dl > 0 && dl > highDelayThreshold));
+            DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
+            bool cooldownOk = (DateTime.Now - lastSub).TotalMinutes >= subscriptionSwitchCooldownMinutes;
+            bool switchingOk = !_isRestarting && !_isSwitchingSubscription;
+
+            if (switchingOk && whitelistOk && cooldownOk && networkBad &&
+                consecutiveSuccessfulAutoSwitchesWithoutRecovery >= subscriptionSwitchThreshold) {
+
+                int switches = consecutiveSuccessfulAutoSwitchesWithoutRecovery;
+                consecutiveSuccessfulAutoSwitchesWithoutRecovery = 0;
+                ThreadPool.QueueUserWorkItem(_ => SwitchSubscriptionAndRestart(decision.Event, switches));
+                return;
+            }
+        }
+
         // 执行决策（在后台线程，避免阻塞 UI）
         if (paused && (decision.NeedSwitch || decision.NeedRestart)) {
             if ((DateTime.Now - lastSuppressedActionLog).TotalSeconds > 60) {
@@ -550,19 +578,183 @@ public partial class ClashGuardian
             }
         } else {
             if (decision.NeedSwitch) {
-                ThreadPool.QueueUserWorkItem(_ => {
-                    if (SwitchToBestNode()) {
-                        this.BeginInvoke((Action)(() => {
-                            failCount = 0;
-                            RefreshNodeDisplay();
-                        }));
-                    }
-                });
+                QueueSwitchToBestNode(true);
             }
             if (decision.NeedRestart) {
                 ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason));
             }
         }
+    }
+
+    void QueueSwitchToBestNode(bool isAuto) {
+        ThreadPool.QueueUserWorkItem(_ => {
+            try {
+                if (SwitchToBestNode()) {
+                    this.BeginInvoke((Action)(() => {
+                        failCount = 0;
+                        RefreshNodeDisplay();
+                        if (isAuto) consecutiveSuccessfulAutoSwitchesWithoutRecovery++;
+                    }));
+                }
+            } catch (Exception ex) {
+                Log("切换节点异常: " + ex.Message);
+            }
+        });
+    }
+
+    void SwitchSubscriptionAndRestart(string reasonEvent, int switches) {
+        lock (subscriptionLock) {
+            if (_isSwitchingSubscription) return;
+            if (_isRestarting) return;
+            _isSwitchingSubscription = true;
+        }
+
+        try {
+            if (!autoSwitchSubscription) return;
+            if (subscriptionWhitelist == null || subscriptionWhitelist.Length < 2) return;
+
+            DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
+            if ((DateTime.Now - lastSub).TotalMinutes < subscriptionSwitchCooldownMinutes) return;
+
+            string oldName, newName;
+            if (!TrySwitchClashVergeRevSubscription(subscriptionWhitelist, out oldName, out newName)) {
+                Log("订阅切换失败: 未找到可切换的订阅或 profiles.yaml 不可用");
+                return;
+            }
+
+            Interlocked.Exchange(ref lastSubscriptionSwitchTicks, DateTime.Now.Ticks);
+            Log("订阅切换: " + oldName + " -> " + newName + " (reason=" + reasonEvent + ", switches=" + switches + ")");
+
+            // 强制重启客户端以生效（不依赖内核自愈）
+            RestartClash("订阅切换: " + oldName + " -> " + newName, true);
+        } catch (Exception ex) {
+            Log("订阅切换异常: " + ex.Message);
+        } finally {
+            _isSwitchingSubscription = false;
+        }
+    }
+
+    bool TrySwitchClashVergeRevSubscription(string[] whitelist, out string oldName, out string newName) {
+        oldName = "";
+        newName = "";
+
+        try {
+            string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(appData)) return false;
+            string profilesFile = Path.Combine(appData, "io.github.clash-verge-rev.clash-verge-rev", "profiles.yaml");
+            if (!File.Exists(profilesFile)) return false;
+
+            string text = File.ReadAllText(profilesFile, Encoding.UTF8);
+            string nl = text.Contains("\r\n") ? "\r\n" : "\n";
+            string[] lines = text.Split(new string[] { "\r\n", "\n" }, StringSplitOptions.None);
+
+            string currentUid = "";
+            List<string> remoteUids = new List<string>();
+            List<string> remoteNames = new List<string>();
+
+            string uid = null;
+            string type = null;
+            string name = null;
+
+            Action flush = delegate {
+                if (string.IsNullOrEmpty(uid)) return;
+                if (string.Equals(type, "remote", StringComparison.OrdinalIgnoreCase)) {
+                    remoteUids.Add(uid);
+                    remoteNames.Add(string.IsNullOrEmpty(name) ? uid : name);
+                }
+                uid = null; type = null; name = null;
+            };
+
+            for (int i = 0; i < lines.Length; i++) {
+                string t = lines[i].Trim();
+                if (t.StartsWith("current:", StringComparison.OrdinalIgnoreCase)) {
+                    currentUid = t.Substring("current:".Length).Trim();
+                    continue;
+                }
+
+                if (t.StartsWith("- uid:", StringComparison.OrdinalIgnoreCase)) {
+                    flush();
+                    uid = t.Substring("- uid:".Length).Trim();
+                    continue;
+                }
+
+                if (uid != null) {
+                    if (t.StartsWith("type:", StringComparison.OrdinalIgnoreCase)) {
+                        type = t.Substring("type:".Length).Trim();
+                    } else if (t.StartsWith("name:", StringComparison.OrdinalIgnoreCase)) {
+                        name = t.Substring("name:".Length).Trim();
+                        if (string.Equals(name, "null", StringComparison.OrdinalIgnoreCase)) name = "";
+                        if (name.StartsWith("\"") && name.EndsWith("\"") && name.Length >= 2) name = name.Substring(1, name.Length - 2);
+                        if (name.StartsWith("'") && name.EndsWith("'") && name.Length >= 2) name = name.Substring(1, name.Length - 2);
+                    }
+                }
+            }
+            flush();
+
+            if (remoteUids.Count == 0) return false;
+
+            List<int> candidates = new List<int>();
+            for (int i = 0; i < remoteUids.Count; i++) {
+                if (IsWhitelisted(remoteUids[i], remoteNames[i], whitelist)) candidates.Add(i);
+            }
+            if (candidates.Count < 2) return false;
+
+            int curCandidatePos = -1;
+            for (int i = 0; i < candidates.Count; i++) {
+                int ridx = candidates[i];
+                if (string.Equals(remoteUids[ridx], currentUid, StringComparison.OrdinalIgnoreCase)) { curCandidatePos = i; break; }
+            }
+
+            int nextPos = curCandidatePos >= 0 ? (curCandidatePos + 1) % candidates.Count : 0;
+            int nextIdx = candidates[nextPos];
+
+            // oldName: 尝试从列表里找到 current 对应名称
+            oldName = currentUid;
+            for (int i = 0; i < remoteUids.Count; i++) {
+                if (string.Equals(remoteUids[i], currentUid, StringComparison.OrdinalIgnoreCase)) {
+                    oldName = string.IsNullOrEmpty(remoteNames[i]) ? remoteUids[i] : remoteNames[i];
+                    break;
+                }
+            }
+
+            string newUid = remoteUids[nextIdx];
+            newName = string.IsNullOrEmpty(remoteNames[nextIdx]) ? newUid : remoteNames[nextIdx];
+
+            // 修改 current: 行
+            bool replaced = false;
+            for (int i = 0; i < lines.Length; i++) {
+                string raw = lines[i];
+                string t = raw.TrimStart();
+                if (t.StartsWith("current:", StringComparison.OrdinalIgnoreCase)) {
+                    int pos = raw.IndexOf("current:", StringComparison.OrdinalIgnoreCase);
+                    string indent = pos > 0 ? raw.Substring(0, pos) : "";
+                    lines[i] = indent + "current: " + newUid;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) return false;
+
+            string newText = string.Join(nl, lines);
+            string tmp = profilesFile + ".tmp";
+            File.WriteAllText(tmp, newText, Encoding.UTF8);
+            File.Copy(tmp, profilesFile, true);
+            try { File.Delete(tmp); } catch { /* ignore */ }
+
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    static bool IsWhitelisted(string uid, string name, string[] whitelist) {
+        if (whitelist == null || whitelist.Length == 0) return false;
+        foreach (string w in whitelist) {
+            if (string.IsNullOrEmpty(w)) continue;
+            if (!string.IsNullOrEmpty(uid) && string.Equals(uid, w, StringComparison.OrdinalIgnoreCase)) return true;
+            if (!string.IsNullOrEmpty(name) && string.Equals(name, w, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
     }
 
     // ==================== 纯决策逻辑（无副作用，可独立测试） ====================

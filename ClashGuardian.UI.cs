@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Diagnostics;
@@ -11,13 +12,27 @@ using Microsoft.Win32;
 /// </summary>
 public partial class ClashGuardian
 {
+    Icon _cachedAppIcon;
+    ToolStripMenuItem disabledNodesMenu;
+    DateTime lastDisabledNodesMenuRefresh = DateTime.MinValue;
+
+    Icon AppIcon {
+        get {
+            if (_cachedAppIcon != null) return _cachedAppIcon;
+            try { _cachedAppIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { _cachedAppIcon = SystemIcons.Shield; }
+            if (_cachedAppIcon == null) _cachedAppIcon = SystemIcons.Shield;
+            return _cachedAppIcon;
+        }
+    }
+
     void InitializeUI() {
         this.Text = "Clash Guardian Pro v" + APP_VERSION;
         this.Size = new Size(400, 340);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedSingle;
         this.MaximizeBox = false;
-        this.Icon = SystemIcons.Shield;
+        this.Icon = AppIcon;
         this.Font = new Font("Microsoft YaHei UI", 9);
         this.BackColor = COLOR_FORM_BG;
 
@@ -147,12 +162,19 @@ public partial class ClashGuardian
 
     void InitializeTrayIcon() {
         trayIcon = new NotifyIcon();
-        trayIcon.Icon = SystemIcons.Shield;
+        trayIcon.Icon = AppIcon;
         trayIcon.Text = "Clash 守护";
         trayIcon.Visible = true;
         trayIcon.DoubleClick += delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); };
 
         ContextMenuStrip menu = new ContextMenuStrip();
+        menu.Opening += delegate {
+            try {
+                if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds > 60) {
+                    RefreshDisabledNodesMenuAsync(false);
+                }
+            } catch { /* ignore */ }
+        };
 
         menu.Items.Add("显示窗口", null, delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); });
         menu.Items.Add("暂停自动操作 10分钟", null, delegate { PauseAutoActionsFor(10); });
@@ -165,6 +187,14 @@ public partial class ClashGuardian
         menu.Items.Add("立即重启", null, delegate { ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")); });
         menu.Items.Add("切换节点", null, delegate { ThreadPool.QueueUserWorkItem(_ => SwitchToBestNode()); });
         menu.Items.Add("触发测速", null, delegate { TriggerDelayTest(); });
+
+        disabledNodesMenu = new ToolStripMenuItem("禁用名单");
+        disabledNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
+        disabledNodesMenu.DropDownItems.Add(new ToolStripSeparator());
+        ToolStripMenuItem placeholder = new ToolStripMenuItem("无法获取节点列表");
+        placeholder.Enabled = false;
+        disabledNodesMenu.DropDownItems.Add(placeholder);
+        menu.Items.Add(disabledNodesMenu);
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -194,6 +224,112 @@ public partial class ClashGuardian
 
         menu.Items.Add("退出", null, delegate { trayIcon.Visible = false; Application.Exit(); });
         trayIcon.ContextMenuStrip = menu;
+
+        // 启动后异步拉取一次节点列表，生成“禁用名单”子菜单
+        RefreshDisabledNodesMenuAsync(true);
+    }
+
+    void RefreshDisabledNodesMenuAsync(bool force) {
+        if (disabledNodesMenu == null) return;
+        if (!force) {
+            if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds < 60) return;
+        }
+        lastDisabledNodesMenuRefresh = DateTime.Now;
+
+        ThreadPool.QueueUserWorkItem(_ => {
+            List<string> nodes = new List<string>();
+            try {
+                string json = ApiRequest("/proxies");
+                if (!string.IsNullOrEmpty(json)) {
+                    string group = FindSelectorGroup(json);
+                    nodes = GetCandidateNodesFromProxiesJson(json, group);
+                }
+            } catch (Exception ex) {
+                Log("刷新禁用名单失败: " + ex.Message);
+            }
+
+            try {
+                if (!this.IsHandleCreated) return;
+                this.BeginInvoke((Action)(() => BuildDisabledNodesMenu(nodes)));
+            } catch { /* ignore */ }
+        });
+    }
+
+    void BuildDisabledNodesMenu(List<string> nodes) {
+        if (disabledNodesMenu == null) return;
+
+        disabledNodesMenu.DropDownItems.Clear();
+        disabledNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
+        disabledNodesMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        if (nodes == null || nodes.Count == 0) {
+            ToolStripMenuItem empty = new ToolStripMenuItem("无法获取节点列表");
+            empty.Enabled = false;
+            disabledNodesMenu.DropDownItems.Add(empty);
+            return;
+        }
+
+        foreach (string node in nodes) {
+            if (string.IsNullOrEmpty(node)) continue;
+            ToolStripMenuItem mi = new ToolStripMenuItem(TruncateNodeName(SafeNodeName(node)));
+            mi.CheckOnClick = true;
+            mi.Tag = node;
+            mi.Checked = IsNodeDisabledForUi(node);
+            mi.Click += delegate {
+                try {
+                    OnToggleDisabledNode(mi);
+                } catch (Exception ex) {
+                    Log("禁用名单操作失败: " + ex.Message);
+                }
+            };
+            disabledNodesMenu.DropDownItems.Add(mi);
+        }
+    }
+
+    bool IsNodeDisabledForUi(string nodeName) {
+        if (string.IsNullOrEmpty(nodeName)) return false;
+
+        if (disabledNodesExplicitMode) {
+            lock (disabledNodesLock) { return disabledNodes.Contains(nodeName); }
+        }
+
+        if (excludeRegions == null) return false;
+        foreach (string region in excludeRegions) {
+            if (!string.IsNullOrEmpty(region) && nodeName.Contains(region)) return true;
+        }
+        return false;
+    }
+
+    void OnToggleDisabledNode(ToolStripMenuItem clicked) {
+        if (clicked == null) return;
+        string nodeName = clicked.Tag as string;
+        if (string.IsNullOrEmpty(nodeName)) return;
+
+        // 第一次在 UI 上修改时，将关键字模式“实体化”为显示名单 (disabledNodes)
+        if (!disabledNodesExplicitMode) {
+            disabledNodesExplicitMode = true;
+            lock (disabledNodesLock) {
+                disabledNodes.Clear();
+                foreach (ToolStripItem tsi in disabledNodesMenu.DropDownItems) {
+                    ToolStripMenuItem mi = tsi as ToolStripMenuItem;
+                    if (mi == null || mi.Tag == null) continue;
+                    if (mi.Checked) {
+                        string n = mi.Tag as string;
+                        if (!string.IsNullOrEmpty(n)) disabledNodes.Add(n);
+                    }
+                }
+            }
+            ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
+            Log((clicked.Checked ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
+            return;
+        }
+
+        lock (disabledNodesLock) {
+            if (clicked.Checked) disabledNodes.Add(nodeName);
+            else disabledNodes.Remove(nodeName);
+        }
+        ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
+        Log((clicked.Checked ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
     }
 
     void OpenFileInNotepad(string path, string label) {
@@ -252,7 +388,7 @@ public partial class ClashGuardian
         proxyLabel.ForeColor = COLOR_OK;
         int blCount;
         lock (blacklistLock) { blCount = nodeBlacklist.Count; }
-        checkLabel.Text = "统  计:  检测 " + totalChecks + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + blCount;
+        checkLabel.Text = "统  计:  问题 " + totalIssues + "  |  重启 " + totalRestarts + "  |  切换 " + totalSwitches + "  |  黑名单 " + blCount;
     }
 
     string FormatTimeSpan(TimeSpan ts) {

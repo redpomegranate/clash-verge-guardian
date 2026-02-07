@@ -41,7 +41,7 @@ public partial class ClashGuardian : Form
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
     // 自动更新配置
-    private const string APP_VERSION = "0.0.9";
+    private const string APP_VERSION = "1.0.0";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -111,6 +111,16 @@ public partial class ClashGuardian : Form
     private string[] clientPaths;
     private string[] excludeRegions;  // 可配置的节点排除规则
 
+    // 节点禁用（显式名单优先；若 config 中不存在 disabledNodes 则退回到 excludeRegions 关键字模式）
+    private HashSet<string> disabledNodes = new HashSet<string>();
+    private bool disabledNodesExplicitMode = false;
+
+    // 订阅级自动切换（Clash Verge Rev，默认关闭）
+    private bool autoSwitchSubscription = false;
+    private int subscriptionSwitchThreshold = 3;
+    private int subscriptionSwitchCooldownMinutes = 15;
+    private string[] subscriptionWhitelist = new string[0];
+
     // 当前检测到的进程信息（volatile 保证跨线程可见性）
     private volatile string detectedCoreName = "";
     private volatile string detectedClientPath = "";
@@ -133,8 +143,11 @@ public partial class ClashGuardian : Form
     // 以下字段仅在 UI 线程修改（通过 BeginInvoke 确保），无需额外同步
     private int failCount = 0;
     private int totalFails = 0;
+    private int totalIssues = 0; // 只统计“问题段落次数”（正常->异常记1次）
     private int consecutiveOK = 0;
     private int cooldownCount = 0;
+    private int consecutiveSuccessfulAutoSwitchesWithoutRecovery = 0; // 连续自动切换节点成功次数（未恢复期间）
+    private bool lastHadIssue = false;
     private DateTime lastStableTime;
     private DateTime startTime;
 
@@ -151,6 +164,11 @@ public partial class ClashGuardian : Form
     // ==================== 线程安全设施 ====================
     private readonly object blacklistLock = new object();  // nodeBlacklist 专用锁
     private readonly object restartLock = new object();    // RestartClash 并发门闩
+    private readonly object disabledNodesLock = new object(); // disabledNodes 跨线程读写
+    private readonly object configLock = new object();        // 串行化写 config.json，避免字段互相覆盖
+    private readonly object subscriptionLock = new object();  // 订阅切换门闩
+    private volatile bool _isSwitchingSubscription = false;
+    private long lastSubscriptionSwitchTicks = 0;            // DateTime.Ticks (Interlocked 读写)
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
     private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
 
@@ -326,8 +344,8 @@ public partial class ClashGuardian : Form
                 statusLabel.Text = "● 状态: 运行中";
                 statusLabel.ForeColor = COLOR_OK;
 
-                checkLabel.Text = "统  计:  检测 1  |  重启 0  |  切换 0  |  黑名单 0";
-                stableLabel.Text = "稳定性:  连续 0s  |  运行 0s  |  成功率 100.0%";
+                checkLabel.Text = "统  计:  问题 0  |  重启 0  |  切换 0  |  黑名单 0";
+                stableLabel.Text = "稳定性:  连续 0s  |  运行 0s  |  问题 0";
 
                 if (!string.IsNullOrEmpty(detectedCoreName)) {
                     Log("检测到内核: " + detectedCoreName);
@@ -435,8 +453,40 @@ public partial class ClashGuardian : Form
                 string customClients = GetJsonArray(json, "clientProcessNames");
                 if (!string.IsNullOrEmpty(customClients)) clientProcessNames = customClients.Split(',');
 
-                string customExcludes = GetJsonArray(json, "excludeRegions");
-                if (!string.IsNullOrEmpty(customExcludes)) excludeRegions = customExcludes.Split(',');
+                List<string> excludes = GetJsonStringArray(json, "excludeRegions");
+                if (excludes.Count > 0) excludeRegions = excludes.ToArray();
+
+                // 节点禁用名单（显式模式：disabledNodes 存在则以其为准；否则走 excludeRegions 关键字）
+                disabledNodesExplicitMode = ConfigHasKey(json, "disabledNodes");
+                if (disabledNodesExplicitMode) {
+                    List<string> dn = GetJsonStringArray(json, "disabledNodes");
+                    lock (disabledNodesLock) {
+                        disabledNodes.Clear();
+                        foreach (string n in dn) {
+                            if (!string.IsNullOrEmpty(n)) disabledNodes.Add(n);
+                        }
+                    }
+                }
+
+                // 订阅级自动切换（Clash Verge Rev）
+                string rawAutoSub = GetJsonValue(json, "autoSwitchSubscription", autoSwitchSubscription ? "true" : "false");
+                bool autoSub;
+                if (bool.TryParse(rawAutoSub, out autoSub)) autoSwitchSubscription = autoSub;
+
+                string rawSubTh = GetJsonValue(json, "subscriptionSwitchThreshold", subscriptionSwitchThreshold.ToString());
+                int subThParsed = TryParseInt(rawSubTh, subscriptionSwitchThreshold, out parsed);
+                int subThFixed = ClampInt(subThParsed, 1, 10);
+                if (!parsed || subThFixed != subThParsed) Log("配置修正: subscriptionSwitchThreshold " + rawSubTh + " -> " + subThFixed);
+                subscriptionSwitchThreshold = subThFixed;
+
+                string rawSubCd = GetJsonValue(json, "subscriptionSwitchCooldownMinutes", subscriptionSwitchCooldownMinutes.ToString());
+                int subCdParsed = TryParseInt(rawSubCd, subscriptionSwitchCooldownMinutes, out parsed);
+                int subCdFixed = ClampInt(subCdParsed, 1, 1440);
+                if (!parsed || subCdFixed != subCdParsed) Log("配置修正: subscriptionSwitchCooldownMinutes " + rawSubCd + " -> " + subCdFixed);
+                subscriptionSwitchCooldownMinutes = subCdFixed;
+
+                List<string> wl = GetJsonStringArray(json, "subscriptionWhitelist");
+                subscriptionWhitelist = wl.Count > 0 ? wl.ToArray() : new string[0];
 
                 // 从配置文件恢复上次检测到的客户端路径
                 string savedClientPath = GetJsonValue(json, "clientPath", "");
@@ -615,33 +665,93 @@ public partial class ClashGuardian : Form
     void SaveClientPath() {
         if (string.IsNullOrEmpty(detectedClientPath)) return;
         try {
-            if (File.Exists(configFile)) {
-                string json = File.ReadAllText(configFile, Encoding.UTF8);
-                if (json.Contains("\"clientPath\"")) {
-                    // 替换已有的 clientPath
-                    int start = json.IndexOf("\"clientPath\"");
-                    int valueStart = json.IndexOf(':', start) + 1;
-                    // 找到值的结束位置（逗号或 }）
-                    int valueEnd = valueStart;
-                    bool inStr = false;
-                    while (valueEnd < json.Length) {
-                        if (json[valueEnd] == '"') inStr = !inStr;
-                        if (!inStr && (json[valueEnd] == ',' || json[valueEnd] == '}')) break;
-                        valueEnd++;
-                    }
-                    string escaped = detectedClientPath.Replace("\\", "\\\\");
-                    json = json.Substring(0, valueStart) + " \"" + escaped + "\"" + json.Substring(valueEnd);
-                } else {
-                    // 在最后一个 } 前插入
-                    int lastBrace = json.LastIndexOf('}');
-                    if (lastBrace > 0) {
+            lock (configLock) {
+                if (File.Exists(configFile)) {
+                    string json = File.ReadAllText(configFile, Encoding.UTF8);
+                    if (json.Contains("\"clientPath\"")) {
+                        // 替换已有的 clientPath
+                        int start = json.IndexOf("\"clientPath\"");
+                        int valueStart = json.IndexOf(':', start) + 1;
+                        // 找到值的结束位置（逗号或 }）
+                        int valueEnd = valueStart;
+                        bool inStr = false;
+                        while (valueEnd < json.Length) {
+                            if (json[valueEnd] == '"') inStr = !inStr;
+                            if (!inStr && (json[valueEnd] == ',' || json[valueEnd] == '}')) break;
+                            valueEnd++;
+                        }
                         string escaped = detectedClientPath.Replace("\\", "\\\\");
-                        json = json.Substring(0, lastBrace) + ",\n  \"clientPath\": \"" + escaped + "\"\n}";
+                        json = json.Substring(0, valueStart) + " \"" + escaped + "\"" + json.Substring(valueEnd);
+                    } else {
+                        // 在最后一个 } 前插入
+                        int lastBrace = json.LastIndexOf('}');
+                        if (lastBrace > 0) {
+                            string escaped = detectedClientPath.Replace("\\", "\\\\");
+                            json = json.Substring(0, lastBrace) + ",\n  \"clientPath\": \"" + escaped + "\"\n}";
+                        }
                     }
+                    File.WriteAllText(configFile, json, Encoding.UTF8);
                 }
-                File.WriteAllText(configFile, json, Encoding.UTF8);
             }
         } catch { /* 保存客户端路径失败不影响运行 */ }
+    }
+
+    void SaveDisabledNodes() {
+        try {
+            List<string> snapshot = new List<string>();
+            lock (disabledNodesLock) {
+                foreach (string n in disabledNodes) {
+                    if (!string.IsNullOrEmpty(n)) snapshot.Add(n);
+                }
+            }
+            snapshot.Sort(StringComparer.OrdinalIgnoreCase);
+
+            // 确保存在配置文件（首次运行可能还未写入）
+            if (!File.Exists(configFile)) {
+                SaveDefaultConfig();
+            }
+
+            StringBuilder sbArr = new StringBuilder();
+            sbArr.Append("[");
+            for (int i = 0; i < snapshot.Count; i++) {
+                if (i > 0) sbArr.Append(", ");
+                sbArr.Append("\"").Append(EscapeJsonString(snapshot[i])).Append("\"");
+            }
+            sbArr.Append("]");
+            string arr = sbArr.ToString();
+
+            lock (configLock) {
+                if (!File.Exists(configFile)) return;
+                string json = File.ReadAllText(configFile, Encoding.UTF8);
+
+                string key = "\"disabledNodes\"";
+                int keyIdx = json.IndexOf(key, StringComparison.Ordinal);
+
+                if (keyIdx >= 0) {
+                    int colon = json.IndexOf(':', keyIdx);
+                    int arrStart = colon >= 0 ? json.IndexOf('[', colon) : -1;
+                    if (arrStart > 0) {
+                        int arrEnd = FindMatchingArrayBracket(json, arrStart);
+                        if (arrEnd > arrStart) {
+                            json = json.Substring(0, arrStart) + arr + json.Substring(arrEnd + 1);
+                        }
+                    }
+                } else {
+                    int lastBrace = json.LastIndexOf('}');
+                    if (lastBrace > 0) {
+                        int p = lastBrace - 1;
+                        while (p >= 0 && char.IsWhiteSpace(json[p])) p--;
+                        bool needComma = p >= 0 && json[p] != '{' && json[p] != ',';
+                        string insert = (needComma ? "," : "") + "\n  \"disabledNodes\": " + arr + "\n";
+                        json = json.Substring(0, lastBrace) + insert + json.Substring(lastBrace);
+                    }
+                }
+
+                File.WriteAllText(configFile, json, Encoding.UTF8);
+            }
+        } catch (Exception ex) {
+            Log("保存禁用名单失败: " + ex.Message);
+        }
     }
 
     void AutoDiscoverApi() {
@@ -678,6 +788,121 @@ public partial class ClashGuardian : Form
         return arr.Replace("\"", "").Replace(" ", "").Replace("\n", "").Replace("\r", "");
     }
 
+    bool ConfigHasKey(string json, string key) {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return false;
+        return json.IndexOf("\"" + key + "\"", StringComparison.Ordinal) >= 0;
+    }
+
+    static string EscapeJsonString(string s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.Length + 8);
+        foreach (char c in s) {
+            switch (c) {
+                case '\\': sb.Append("\\\\"); break;
+                case '"': sb.Append("\\\""); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.Append(' ');
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 轻量 JSON 字符串数组解析：["a","b"] -> List<string>
+    List<string> GetJsonStringArray(string json, string key) {
+        List<string> result = new List<string>();
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return result;
+
+        string search = "\"" + key + "\":";
+        int idx = json.IndexOf(search, StringComparison.Ordinal);
+        if (idx < 0) return result;
+
+        idx = json.IndexOf('[', idx);
+        if (idx < 0) return result;
+
+        int i = idx + 1;
+        bool inString = false;
+        bool escape = false;
+        StringBuilder sb = new StringBuilder();
+
+        while (i < json.Length) {
+            char c = json[i];
+
+            if (!inString) {
+                if (c == ']') break;
+                if (c == '"') { inString = true; sb.Length = 0; }
+                i++;
+                continue;
+            }
+
+            if (escape) {
+                escape = false;
+                switch (c) {
+                    case '"': sb.Append('"'); break;
+                    case '\\': sb.Append('\\'); break;
+                    case '/': sb.Append('/'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'u':
+                        if (i + 4 < json.Length) {
+                            try {
+                                string hex = json.Substring(i + 1, 4);
+                                int code = int.Parse(hex, System.Globalization.NumberStyles.HexNumber);
+                                sb.Append((char)code);
+                                i += 4;
+                            } catch { /* ignore invalid */ }
+                        }
+                        break;
+                    default:
+                        sb.Append(c);
+                        break;
+                }
+                i++;
+                continue;
+            }
+
+            if (c == '\\') { escape = true; i++; continue; }
+            if (c == '"') {
+                inString = false;
+                result.Add(sb.ToString());
+                i++;
+                continue;
+            }
+
+            sb.Append(c);
+            i++;
+        }
+
+        return result;
+    }
+
+    static int FindMatchingArrayBracket(string json, int arrStart) {
+        if (string.IsNullOrEmpty(json) || arrStart < 0 || arrStart >= json.Length) return -1;
+        bool inString = false;
+        bool escape = false;
+        int depth = 0;
+        for (int i = arrStart; i < json.Length; i++) {
+            char c = json[i];
+            if (escape) { escape = false; continue; }
+            if (inString && c == '\\') { escape = true; continue; }
+            if (c == '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (c == '[') depth++;
+            else if (c == ']') {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
     void SaveDefaultConfig() {
         string coreNames = string.Join("\", \"", DEFAULT_CORE_NAMES);
         string clientNames = string.Join("\", \"", DEFAULT_CLIENT_NAMES);
@@ -691,11 +916,17 @@ public partial class ClashGuardian : Form
             "  \"memoryThreshold\": " + memoryThreshold + ",\n" +
             "  \"highDelayThreshold\": " + highDelayThreshold + ",\n" +
             "  \"blacklistMinutes\": " + blacklistMinutes + ",\n" +
+            "  \"autoSwitchSubscription\": false,\n" +
+            "  \"subscriptionSwitchThreshold\": 3,\n" +
+            "  \"subscriptionSwitchCooldownMinutes\": 15,\n" +
+            "  \"subscriptionWhitelist\": [],\n" +
             "  \"coreProcessNames\": [\"" + coreNames + "\"],\n" +
             "  \"clientProcessNames\": [\"" + clientNames + "\"],\n" +
             "  \"excludeRegions\": [\"" + excludeNames + "\"]\n" +
             "}";
-        try { File.WriteAllText(configFile, config, Encoding.UTF8); }
+        try {
+            lock (configLock) { File.WriteAllText(configFile, config, Encoding.UTF8); }
+        }
         catch (Exception ex) { Log("保存配置失败: " + ex.Message); }
     }
 

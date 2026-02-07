@@ -325,6 +325,29 @@ public partial class ClashGuardian
         lock (blacklistLock) { return nodeBlacklist.Remove(cn); }
     }
 
+    // 获取 selector 组里可供手动禁用/启用的节点候选（过滤策略组与非节点类型）
+    List<string> GetCandidateNodesFromProxiesJson(string json, string selectorGroup) {
+        List<string> allNodes = GetGroupAllNodes(json, selectorGroup);
+        List<string> candidates = new List<string>();
+        string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
+
+        foreach (string nodeName in allNodes) {
+            if (string.IsNullOrEmpty(nodeName) || nodeName.Length > MAX_NODE_NAME_LENGTH) continue;
+
+            bool skip = false;
+            foreach (string sg in SKIP_GROUPS) { if (nodeName == sg) { skip = true; break; } }
+            if (skip) continue;
+
+            string nodeType = FindProxyType(json, nodeName);
+            foreach (string st in skipTypes) { if (nodeType == st) { skip = true; break; } }
+            if (skip) continue;
+
+            candidates.Add(nodeName);
+        }
+
+        return candidates;
+    }
+
     bool SwitchToBestNode() {
         CleanBlacklist();
         try {
@@ -357,8 +380,12 @@ public partial class ClashGuardian
 
                 // 排除可配置的地区节点
                 bool excluded = false;
-                foreach (string region in excludeRegions) {
-                    if (nodeName.Contains(region)) { excluded = true; break; }
+                if (disabledNodesExplicitMode) {
+                    lock (disabledNodesLock) { excluded = disabledNodes.Contains(nodeName); }
+                } else if (excludeRegions != null) {
+                    foreach (string region in excludeRegions) {
+                        if (!string.IsNullOrEmpty(region) && nodeName.Contains(region)) { excluded = true; break; }
+                    }
                 }
                 if (excluded) continue;
 

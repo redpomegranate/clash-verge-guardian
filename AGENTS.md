@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v0.0.9
+- **版本**：v1.0.0
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -14,12 +14,15 @@
 ## 📁 项目结构
 
 ```
-clash-verge-guardian-0.0.3\
-├── ClashGuardian.cs           # 主文件：常量、字段、构造函数、配置管理、路径发现、入口点（~547行）
-├── ClashGuardian.UI.cs        # UI：窗口初始化、按钮事件、托盘图标、开机自启（~202行）
-├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
-├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~456行）
-├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
+ClashGuardian\
+├── ClashGuardian.cs
+├── ClashGuardian.UI.cs
+├── ClashGuardian.Network.cs
+├── ClashGuardian.Monitor.cs
+├── ClashGuardian.Update.cs
+├── assets\
+│   ├── icon-source.png        # icon 源图
+│   └── ClashGuardian.ico      # 编译用 win32 icon
 ├── build.ps1                  # 一键编译脚本（输出到 dist\）
 ├── dist\                      # 编译产物输出目录（本地生成，不提交）
 ├── README.md                  # 项目说明文档
@@ -38,8 +41,12 @@ clash-verge-guardian-0.0.3\
 ## 🔧 编译命令
 
 ```powershell
+# 推荐：一键编译（含 icon）
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+# 或手动编译（需指定 win32 icon）
 mkdir dist -Force | Out-Null
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\ClashGuardian.ico /out:dist\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 ```
 
 编译成功标志：无 error 输出（warning 可忽略）
@@ -60,6 +67,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 12. **客户端路径** - 检测到后持久化到 config.json 的 `clientPath` 字段；搜索优先级：运行进程→config→默认路径→注册表
 13. **暂停自动操作** - 暂停期间仅抑制自动重启/自动切换，检测与 UI 更新仍继续；恢复时重置 failCount/consecutiveOK
 14. **诊断导出** - `ExportDiagnostics` 仅用户触发，脱敏 `clashSecret`，导出到 `%LOCALAPPDATA%\\ClashGuardian\\diagnostics_*`
+15. **禁用名单（disabledNodes）** - 托盘勾选后写入 config；一旦存在 `disabledNodes` 将忽略 `excludeRegions`
+16. **订阅级自动切换（Clash Verge Rev）** - 默认关闭；通过修改 `%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\profiles.yaml` 的 `current:` 并强制重启客户端生效；严禁日志输出订阅 URL/token
 
 ## 🏗️ 代码模块（按文件）
 
@@ -77,7 +86,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 |------|------|
 | `InitializeUI` | 窗口布局和控件创建 |
 | `CreateButton`/`CreateInfoLabel`/`CreateSeparator` | UI 工厂方法 |
-| `InitializeTrayIcon` | 系统托盘菜单（含暂停自动操作/诊断导出/黑名单管理/检查更新） |
+| `InitializeTrayIcon` | 系统托盘菜单（含禁用名单/暂停自动操作/诊断导出/黑名单管理/检查更新） |
 | `OpenFileInNotepad` | 安全打开配置/数据/日志（try/catch，不崩溃） |
 | `PauseAutoActionsFor`/`ResumeAutoActions` | 暂停/恢复自动操作（仅抑制自动重启/切换） |
 | `ToggleAutoStart` | 开机自启注册表操作 |
@@ -139,7 +148,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 | `currentNode`/`nodeGroup` | `volatile` | 后台写，UI 读 |
 | `detectedCoreName`/`detectedClientPath` | `volatile` | 后台写，UI 读 |
 | `lastDelay` | `Interlocked.Exchange` | 后台写，UI 读 |
-| `totalChecks`/`totalRestarts`/`totalSwitches` | `Interlocked.Increment` | 后台写，UI 读 |
+| `totalIssues`/`totalChecks`/`totalRestarts`/`totalSwitches` | `Interlocked.Increment` | 后台写，UI 读 |
 | `failCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
 | `nodeBlacklist` | `blacklistLock` | 多线程读写 |
 | `restartLock` | `lock` | 重启门闩原子化（避免并发重启竞态） |
@@ -148,6 +157,12 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 | `pauseAutoActionsUntil`/`lastSuppressedActionLog` | UI 线程专用 | 托盘菜单设置，UpdateUI 读取 |
 
 ## 🔄 关键修复记录
+
+### v1.0.0 改进
+1. **禁用名单可配置** - 托盘“禁用名单”勾选节点，写入 `disabledNodes`，并覆盖 `excludeRegions`
+2. **订阅级自动切换（Clash Verge Rev）** - 连续自动切换节点仍不可用时，按白名单轮换订阅并强制重启客户端（默认关闭）
+3. **统计口径调整** - UI 统计由检测次数改为“问题段落次数”（正常→异常 +1）
+4. **图标内置** - `build.ps1` 使用 `/win32icon`，窗口/托盘图标与 EXE 一致
 
 ### v0.0.9 改进
 1. **运行数据目录分离** - `config/log/monitor/diagnostics` 统一存放到 `%LOCALAPPDATA%\\ClashGuardian\\`，避免与源码/可执行混放（启动时自动尝试迁移旧文件）
@@ -199,9 +214,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist
 ## 🛠️ 常用开发命令
 
 ```powershell
-# 编译（5个文件）
-mkdir dist -Force | Out-Null
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+# 编译（推荐：含 icon）
+powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 # 查看 Clash 相关进程
 Get-Process | Where-Object {$_.ProcessName -like "*clash*" -or $_.ProcessName -like "*mihomo*"}
