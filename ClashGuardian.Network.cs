@@ -18,6 +18,8 @@ public partial class ClashGuardian
             req.Headers.Add("Authorization", "Bearer " + clashSecret);
             req.Timeout = timeout;
             req.ReadWriteTimeout = timeout;
+            // 本地 API 不应走系统代理（避免 PAC/全局代理导致 127.0.0.1 被代理转发）
+            try { if (req.RequestUri != null && req.RequestUri.IsLoopback) req.Proxy = null; } catch { /* 忽略 */ }
             using (HttpWebResponse resp = req.GetResponse() as HttpWebResponse)
             using (StreamReader reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) {
                 return reader.ReadToEnd();
@@ -32,6 +34,8 @@ public partial class ClashGuardian
             req.Headers.Add("Authorization", "Bearer " + clashSecret);
             req.ContentType = "application/json; charset=utf-8";
             req.Timeout = API_TIMEOUT_NORMAL;
+            // 本地 API 不应走系统代理（避免 PAC/全局代理导致 127.0.0.1 被代理转发）
+            try { if (req.RequestUri != null && req.RequestUri.IsLoopback) req.Proxy = null; } catch { /* 忽略 */ }
             byte[] data = Encoding.UTF8.GetBytes(body);
             req.ContentLength = data.Length;
             using (Stream stream = req.GetRequestStream()) {
@@ -75,12 +79,23 @@ public partial class ClashGuardian
         objStart = idx + search.Length - 1;
         int braceCount = 1;
         objEnd = objStart + 1;
-        while (objEnd < json.Length && braceCount > 0) {
-            if (json[objEnd] == '{') braceCount++;
-            else if (json[objEnd] == '}') braceCount--;
+        bool inString = false;
+        bool escape = false;
+        while (objEnd < json.Length) {
+            char c = json[objEnd];
+            if (inString) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') inString = false;
+            } else {
+                if (c == '"') inString = true;
+                else if (c == '{') braceCount++;
+                else if (c == '}') braceCount--;
+                if (braceCount == 0) { objEnd++; return true; }
+            }
             objEnd++;
         }
-        return true;
+        return false;
     }
 
     /// <summary>
@@ -300,6 +315,16 @@ public partial class ClashGuardian
         }
     }
 
+    void ClearBlacklist() {
+        lock (blacklistLock) { nodeBlacklist.Clear(); }
+    }
+
+    bool RemoveCurrentNodeFromBlacklist() {
+        string cn = currentNode; // volatile read
+        if (string.IsNullOrEmpty(cn)) return false;
+        lock (blacklistLock) { return nodeBlacklist.Remove(cn); }
+    }
+
     bool SwitchToBestNode() {
         CleanBlacklist();
         try {
@@ -397,6 +422,8 @@ public partial class ClashGuardian
             req.Method = "GET";
             req.Headers.Add("Authorization", "Bearer " + clashSecret);
             req.Timeout = 2000;
+            // 本地 API 不应走系统代理
+            try { if (req.RequestUri != null && req.RequestUri.IsLoopback) req.Proxy = null; } catch { /* ignore */ }
             req.BeginGetResponse(ar => { try { req.EndGetResponse(ar).Close(); } catch { /* 测速异步回调异常可忽略 */ } }, null);
         } catch { /* 测速请求发送失败不影响主流程 */ }
     }

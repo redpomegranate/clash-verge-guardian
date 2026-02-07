@@ -120,10 +120,11 @@ public partial class ClashGuardian
 
             // 尝试代理下载
             try {
-                WebClient wc = new WebClient();
-                wc.Proxy = new WebProxy("127.0.0.1", proxyPort);
-                wc.Headers.Add("User-Agent", "ClashGuardian/" + APP_VERSION);
-                wc.DownloadFile(downloadUrl, updatePath);
+                using (WebClient wc = new WebClient()) {
+                    wc.Proxy = new WebProxy("127.0.0.1", proxyPort);
+                    wc.Headers.Add("User-Agent", "ClashGuardian/" + APP_VERSION);
+                    wc.DownloadFile(downloadUrl, updatePath);
+                }
                 downloaded = true;
                 Log("更新: 代理下载完成");
             } catch {
@@ -133,10 +134,11 @@ public partial class ClashGuardian
             // 回退直连下载
             if (!downloaded) {
                 try {
-                    WebClient wc = new WebClient();
-                    wc.Proxy = null;
-                    wc.Headers.Add("User-Agent", "ClashGuardian/" + APP_VERSION);
-                    wc.DownloadFile(downloadUrl, updatePath);
+                    using (WebClient wc = new WebClient()) {
+                        wc.Proxy = null;
+                        wc.Headers.Add("User-Agent", "ClashGuardian/" + APP_VERSION);
+                        wc.DownloadFile(downloadUrl, updatePath);
+                    }
                     downloaded = true;
                     Log("更新: 直连下载完成");
                 } catch (Exception ex) {

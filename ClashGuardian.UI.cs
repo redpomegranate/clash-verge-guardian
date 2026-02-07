@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 using Microsoft.Win32;
 
@@ -62,7 +63,7 @@ public partial class ClashGuardian
         int btnSpacing = 10;
 
         restartBtn = CreateButton("立即重启", padding, y, btnWidth, btnHeight, () => ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")));
-        logBtn = CreateButton("查看日志", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, () => Process.Start("notepad", dataFile));
+        logBtn = CreateButton("查看数据", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, () => OpenFileInNotepad(dataFile, "监控数据"));
         exitBtn = CreateButton("退出", padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight, () => { trayIcon.Visible = false; Application.Exit(); });
         y += btnHeight + 8;
 
@@ -152,15 +153,75 @@ public partial class ClashGuardian
         trayIcon.DoubleClick += delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); };
 
         ContextMenuStrip menu = new ContextMenuStrip();
+
         menu.Items.Add("显示窗口", null, delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); });
+        menu.Items.Add("暂停自动操作 10分钟", null, delegate { PauseAutoActionsFor(10); });
+        menu.Items.Add("暂停自动操作 30分钟", null, delegate { PauseAutoActionsFor(30); });
+        menu.Items.Add("暂停自动操作 60分钟", null, delegate { PauseAutoActionsFor(60); });
+        menu.Items.Add("恢复自动操作", null, delegate { ResumeAutoActions(); });
+
+        menu.Items.Add(new ToolStripSeparator());
+
         menu.Items.Add("立即重启", null, delegate { ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")); });
         menu.Items.Add("切换节点", null, delegate { ThreadPool.QueueUserWorkItem(_ => SwitchToBestNode()); });
         menu.Items.Add("触发测速", null, delegate { TriggerDelayTest(); });
-        menu.Items.Add("查看日志", null, delegate { Process.Start("notepad", dataFile); });
+
+        menu.Items.Add(new ToolStripSeparator());
+
+        menu.Items.Add("导出诊断包", null, delegate { ThreadPool.QueueUserWorkItem(_ => ExportDiagnostics()); });
+        menu.Items.Add("打开配置", null, delegate { OpenFileInNotepad(configFile, "配置"); });
+        menu.Items.Add("查看监控数据", null, delegate { OpenFileInNotepad(dataFile, "监控数据"); });
+        menu.Items.Add("查看异常日志", null, delegate { OpenFileInNotepad(logFile, "异常日志"); });
         menu.Items.Add("检查更新", null, delegate { ThreadPool.QueueUserWorkItem(_ => CheckForUpdate(false)); });
-        menu.Items.Add("-");
+
+        menu.Items.Add(new ToolStripSeparator());
+
+        menu.Items.Add("清空黑名单", null, delegate {
+            ClearBlacklist();
+            RefreshNodeDisplay();
+            Log("黑名单已清空");
+        });
+        menu.Items.Add("移除当前节点黑名单", null, delegate {
+            if (RemoveCurrentNodeFromBlacklist()) {
+                RefreshNodeDisplay();
+                Log("已移除当前节点黑名单");
+            } else {
+                Log("移除黑名单失败: 当前节点不在黑名单");
+            }
+        });
+
+        menu.Items.Add(new ToolStripSeparator());
+
         menu.Items.Add("退出", null, delegate { trayIcon.Visible = false; Application.Exit(); });
         trayIcon.ContextMenuStrip = menu;
+    }
+
+    void OpenFileInNotepad(string path, string label) {
+        try {
+            if (string.IsNullOrEmpty(path)) { Log("打开" + label + "失败: 路径为空"); return; }
+            if (!File.Exists(path)) { Log("打开" + label + "失败: 文件不存在"); return; }
+            Process.Start("notepad", "\"" + path + "\"");
+        } catch (Exception ex) {
+            Log("打开" + label + "失败: " + ex.Message);
+        }
+    }
+
+    void PauseAutoActionsFor(int minutes) {
+        if (minutes <= 0) return;
+        pauseAutoActionsUntil = DateTime.Now.AddMinutes(minutes);
+        lastSuppressedActionLog = DateTime.MinValue;
+        try { if (timer != null) timer.Interval = normalInterval; } catch { /* ignore */ }
+        Log("已暂停自动操作 " + minutes + "分钟");
+    }
+
+    void ResumeAutoActions() {
+        pauseAutoActionsUntil = DateTime.MinValue;
+        lastSuppressedActionLog = DateTime.MinValue;
+        failCount = 0;
+        consecutiveOK = 0;
+        lastStableTime = DateTime.Now;
+        try { if (timer != null) timer.Interval = normalInterval; } catch { /* ignore */ }
+        Log("已恢复自动操作");
     }
 
     void ToggleAutoStart() {

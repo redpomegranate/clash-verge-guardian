@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v0.0.7
+- **版本**：v0.0.8
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -46,9 +46,11 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 7. **节点列表获取** - 从 Selector 组的 `all` 数组正向提取节点名（`GetGroupAllNodes`），不要反向扫描 type 字段
 8. **JSON 解析** - 使用 `FindObjectBounds` + `FindFieldValue` 统一入口，避免重复的括号匹配代码
 9. **决策逻辑** - `EvaluateStatus` 是纯函数，返回 `StatusDecision` 结构体，不直接修改实例状态
-10. **重启逻辑** - 杀内核→等5秒→检查自动恢复→未恢复则杀客户端并重启；`_isRestarting` 标志防止并发
+10. **重启逻辑** - 杀内核→等5秒→检查自动恢复→未恢复则杀客户端并重启；`restartLock` + `_isRestarting` 防并发
 11. **按钮/菜单** - 耗时操作（重启、切换、更新检查）必须通过 `ThreadPool.QueueUserWorkItem` 在后台执行，禁止阻塞 UI 线程
 12. **客户端路径** - 检测到后持久化到 config.json 的 `clientPath` 字段；搜索优先级：运行进程→config→默认路径→注册表
+13. **暂停自动操作** - 暂停期间仅抑制自动重启/自动切换，检测与 UI 更新仍继续；恢复时重置 failCount/consecutiveOK
+14. **诊断导出** - `ExportDiagnostics` 仅用户触发，脱敏 `clashSecret`，导出到 `%LOCALAPPDATA%\\ClashGuardian\\diagnostics_*`
 
 ## 🏗️ 代码模块（按文件）
 
@@ -66,7 +68,9 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 |------|------|
 | `InitializeUI` | 窗口布局和控件创建 |
 | `CreateButton`/`CreateInfoLabel`/`CreateSeparator` | UI 工厂方法 |
-| `InitializeTrayIcon` | 系统托盘菜单（含"检查更新"） |
+| `InitializeTrayIcon` | 系统托盘菜单（含暂停自动操作/诊断导出/黑名单管理/检查更新） |
+| `OpenFileInNotepad` | 安全打开配置/数据/日志（try/catch，不崩溃） |
+| `PauseAutoActionsFor`/`ResumeAutoActions` | 暂停/恢复自动操作（仅抑制自动重启/切换） |
 | `ToggleAutoStart` | 开机自启注册表操作 |
 | `RefreshNodeDisplay` | 刷新节点和统计显示 |
 | `FormatTimeSpan` | 时间格式化 |
@@ -75,19 +79,21 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 | 方法 | 说明 |
 |------|------|
 | `ApiRequest`/`ApiPut` | HTTP API 通信 |
-| `FindObjectBounds`/`FindFieldValue` | JSON 对象边界查找和字段提取（统一入口） |
+| `FindObjectBounds`/`FindFieldValue` | JSON 对象边界查找和字段提取（统一入口，忽略字符串内花括号） |
 | `FindProxyNow`/`FindProxyType` | 基于上述方法的便捷包装 |
 | `ExtractJsonString`/`ExtractJsonStringAt` | Unicode 转义解析 |
 | `SafeNodeName` | 节点名安全过滤 |
 | `GetCurrentNode`/`ResolveActualNode` | 节点解析（递归） |
 | `GetGroupAllNodes`/`GetNodeDelay`/`FindSelectorGroup` | 节点组管理 |
 | `SwitchToBestNode`/`CleanBlacklist` | 节点切换和黑名单 |
+| `ClearBlacklist`/`RemoveCurrentNodeFromBlacklist` | 黑名单管理（托盘操作） |
 | `TriggerDelayTest`/`TestProxy` | 延迟测试和代理测试 |
 
 ### ClashGuardian.Monitor.cs
 | 方法 | 说明 |
 |------|------|
 | `Log`/`LogPerf`/`LogData`/`CleanOldLogs` | 日志管理 |
+| `ExportDiagnostics` | 诊断包导出：summary+脱敏配置+日志+监控数据 |
 | `GetTcpStats`/`GetMihomoStats` | 系统状态采集 |
 | `RestartClash` | 重启流程：杀内核→等5秒→检查恢复→未恢复则重启客户端；`_isRestarting` 防并发 |
 | `StartClientProcess` | 启动客户端进程（最小化窗口） |
@@ -127,10 +133,19 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 | `totalChecks`/`totalRestarts`/`totalSwitches` | `Interlocked.Increment` | 后台写，UI 读 |
 | `failCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
 | `nodeBlacklist` | `blacklistLock` | 多线程读写 |
+| `restartLock` | `lock` | 重启门闩原子化（避免并发重启竞态） |
 | `_isChecking` | `Interlocked.CompareExchange` | 防重入 |
 | `_isRestarting` | `volatile bool` | 防止重启期间并发检测 |
+| `pauseAutoActionsUntil`/`lastSuppressedActionLog` | UI 线程专用 | 托盘菜单设置，UpdateUI 读取 |
 
 ## 🔄 关键修复记录
+
+### v0.0.8 改进
+1. **并发重启门闩** - `restartLock` + `_isRestarting` 原子化，避免重启流程并发
+2. **配置兜底** - 配置数值 `TryParse + Clamp`，异常配置不再导致崩溃（不回写 config）
+3. **JSON 边界加固** - `FindObjectBounds` 忽略字符串内花括号，降低误判
+4. **本地 API 直连** - loopback API 禁用系统代理，避免 PAC/全局代理干扰
+5. **控制与诊断增强** - 托盘支持暂停自动操作、导出诊断包、打开配置/数据/日志、黑名单管理
 
 ### v0.0.7 改进
 1. **客户端路径持久化** - `detectedClientPath` 保存到 config.json，客户端关闭后仍可重启

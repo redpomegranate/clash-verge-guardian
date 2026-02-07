@@ -41,7 +41,7 @@ public partial class ClashGuardian : Form
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
     // 自动更新配置
-    private const string APP_VERSION = "0.0.7";
+    private const string APP_VERSION = "0.0.8";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -149,8 +149,25 @@ public partial class ClashGuardian : Form
 
     // ==================== 线程安全设施 ====================
     private readonly object blacklistLock = new object();  // nodeBlacklist 专用锁
+    private readonly object restartLock = new object();    // RestartClash 并发门闩
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
     private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
+
+    // ==================== 控制与诊断：暂停自动操作 ====================
+    // 仅暂停“自动切换/自动重启”，不影响检测与 UI 更新；手动操作仍可执行
+    private DateTime pauseAutoActionsUntil = DateTime.MinValue;
+    private DateTime lastSuppressedActionLog = DateTime.MinValue;
+
+    bool IsAutoActionsPaused {
+        get { return DateTime.Now < pauseAutoActionsUntil; }
+    }
+
+    TimeSpan GetAutoActionsPauseRemaining() {
+        DateTime now = DateTime.Now;
+        if (now >= pauseAutoActionsUntil) return TimeSpan.Zero;
+        TimeSpan ts = pauseAutoActionsUntil - now;
+        return ts < TimeSpan.Zero ? TimeSpan.Zero : ts;
+    }
 
     // ==================== 构造函数 ====================
     public ClashGuardian()
@@ -233,6 +250,23 @@ public partial class ClashGuardian : Form
     }
 
     // ==================== 配置管理 ====================
+    static int ClampInt(int v, int min, int max) {
+        if (v < min) return min;
+        if (v > max) return max;
+        return v;
+    }
+
+    static int TryParseInt(string s, int fallback, out bool parsed) {
+        int v;
+        parsed = int.TryParse(s, out v);
+        return parsed ? v : fallback;
+    }
+
+    static int TryParseInt(string s, int fallback) {
+        bool _;
+        return TryParseInt(s, fallback, out _);
+    }
+
     void LoadConfigFast() {
         clashApi = "http://127.0.0.1:" + DEFAULT_API_PORT;
         clashSecret = "set-your-secret";
@@ -252,13 +286,51 @@ public partial class ClashGuardian : Form
         if (File.Exists(configFile)) {
             try {
                 string json = File.ReadAllText(configFile, Encoding.UTF8);
+
                 clashApi = GetJsonValue(json, "clashApi", clashApi);
+                if (clashApi == null) clashApi = "";
+                clashApi = clashApi.Trim().TrimEnd('/');
+
                 clashSecret = GetJsonValue(json, "clashSecret", clashSecret);
-                proxyPort = int.Parse(GetJsonValue(json, "proxyPort", proxyPort.ToString()));
-                normalInterval = int.Parse(GetJsonValue(json, "normalInterval", normalInterval.ToString()));
-                memoryThreshold = int.Parse(GetJsonValue(json, "memoryThreshold", memoryThreshold.ToString()));
-                highDelayThreshold = int.Parse(GetJsonValue(json, "highDelayThreshold", highDelayThreshold.ToString()));
-                blacklistMinutes = int.Parse(GetJsonValue(json, "blacklistMinutes", blacklistMinutes.ToString()));
+
+                bool parsed;
+                string rawProxyPort = GetJsonValue(json, "proxyPort", proxyPort.ToString());
+                int proxyPortParsed = TryParseInt(rawProxyPort, proxyPort, out parsed);
+                int proxyPortFixed = ClampInt(proxyPortParsed, 1, 65535);
+                if (!parsed || proxyPortFixed != proxyPortParsed) Log("配置修正: proxyPort " + rawProxyPort + " -> " + proxyPortFixed);
+                proxyPort = proxyPortFixed;
+
+                string rawNormalInterval = GetJsonValue(json, "normalInterval", normalInterval.ToString());
+                int normalIntervalParsed = TryParseInt(rawNormalInterval, normalInterval, out parsed);
+                int normalIntervalFixed = ClampInt(normalIntervalParsed, 500, 600000);
+                if (!parsed || normalIntervalFixed != normalIntervalParsed) Log("配置修正: normalInterval " + rawNormalInterval + " -> " + normalIntervalFixed);
+                normalInterval = normalIntervalFixed;
+
+                string rawMemoryThreshold = GetJsonValue(json, "memoryThreshold", memoryThreshold.ToString());
+                int memoryThresholdParsed = TryParseInt(rawMemoryThreshold, memoryThreshold, out parsed);
+                int memoryThresholdFixed = ClampInt(memoryThresholdParsed, 10, 4096);
+                if (!parsed || memoryThresholdFixed != memoryThresholdParsed) Log("配置修正: memoryThreshold " + rawMemoryThreshold + " -> " + memoryThresholdFixed);
+                memoryThreshold = memoryThresholdFixed;
+
+                string rawHighDelay = GetJsonValue(json, "highDelayThreshold", highDelayThreshold.ToString());
+                int highDelayParsed = TryParseInt(rawHighDelay, highDelayThreshold, out parsed);
+                int highDelayFixed = ClampInt(highDelayParsed, 50, 10000);
+                if (!parsed || highDelayFixed != highDelayParsed) Log("配置修正: highDelayThreshold " + rawHighDelay + " -> " + highDelayFixed);
+                highDelayThreshold = highDelayFixed;
+
+                string rawBlacklist = GetJsonValue(json, "blacklistMinutes", blacklistMinutes.ToString());
+                int blacklistParsed = TryParseInt(rawBlacklist, blacklistMinutes, out parsed);
+                int blacklistFixed = ClampInt(blacklistParsed, 1, 1440);
+                if (!parsed || blacklistFixed != blacklistParsed) Log("配置修正: blacklistMinutes " + rawBlacklist + " -> " + blacklistFixed);
+                blacklistMinutes = blacklistFixed;
+
+                // 只影响极端误配：保持阈值一致性，避免配置导致异常行为
+                memoryWarning = ClampInt(memoryWarning, 10, 4096);
+                if (memoryThreshold < memoryWarning) {
+                    Log("配置修正: memoryThreshold " + memoryThreshold + " -> " + memoryWarning + " (>=memoryWarning)");
+                    memoryThreshold = memoryWarning;
+                }
+                fastInterval = ClampInt(fastInterval, 200, normalInterval);
 
                 string customCores = GetJsonArray(json, "coreProcessNames");
                 if (!string.IsNullOrEmpty(customCores)) coreProcessNames = customCores.Split(',');
@@ -483,6 +555,8 @@ public partial class ClashGuardian : Form
                 HttpWebRequest req = WebRequest.Create(testApi + "/version") as HttpWebRequest;
                 req.Headers.Add("Authorization", "Bearer " + clashSecret);
                 req.Timeout = API_DISCOVER_TIMEOUT;
+                // 本地 API 不应走系统代理
+                try { if (req.RequestUri != null && req.RequestUri.IsLoopback) req.Proxy = null; } catch { /* ignore */ }
                 using (HttpWebResponse resp = req.GetResponse() as HttpWebResponse) {
                     if (resp.StatusCode == HttpStatusCode.OK) {
                         clashApi = testApi;

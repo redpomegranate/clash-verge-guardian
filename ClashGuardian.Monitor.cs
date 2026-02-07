@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
 using System.Windows.Forms;
 
 /// <summary>
@@ -59,6 +60,132 @@ public partial class ClashGuardian
                 }
             }
         } catch { /* 日志清理遍历失败不影响程序运行 */ }
+    }
+
+    // ==================== 诊断导出（用户触发） ====================
+    string MaskJsonStringValue(string json, string key, out bool ok) {
+        ok = false;
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return json;
+
+        string search = "\"" + key + "\"";
+        int idx = json.IndexOf(search, StringComparison.Ordinal);
+        if (idx < 0) { ok = true; return json; } // 未找到字段，无需脱敏
+
+        int colon = json.IndexOf(':', idx + search.Length);
+        if (colon < 0) return json;
+
+        int pos = colon + 1;
+        while (pos < json.Length && char.IsWhiteSpace(json[pos])) pos++;
+        if (pos >= json.Length || json[pos] != '"') return json;
+
+        int valueStart = pos + 1;
+        int i = valueStart;
+        bool escape = false;
+        while (i < json.Length) {
+            char c = json[i];
+            if (escape) { escape = false; i++; continue; }
+            if (c == '\\') { escape = true; i++; continue; }
+            if (c == '"') break;
+            i++;
+        }
+        if (i >= json.Length) return json;
+
+        int valueEnd = i; // 指向 closing quote
+        ok = true;
+        return json.Substring(0, valueStart) + "***" + json.Substring(valueEnd);
+    }
+
+    void ExportDiagnostics() {
+        try {
+            string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClashGuardian");
+            string dir = Path.Combine(root, "diagnostics_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+            Directory.CreateDirectory(dir);
+
+            // 1) 导出 config（脱敏）
+            bool maskOk = false;
+            if (File.Exists(configFile)) {
+                try {
+                    string cfg = File.ReadAllText(configFile, Encoding.UTF8);
+                    string masked = MaskJsonStringValue(cfg, "clashSecret", out maskOk);
+                    if (maskOk) {
+                        File.WriteAllText(Path.Combine(dir, "config.masked.json"), masked, Encoding.UTF8);
+                    }
+                } catch { /* 配置读取失败：仅记录到 summary */ }
+            }
+
+            // 2) 复制日志
+            if (File.Exists(logFile)) {
+                try { File.Copy(logFile, Path.Combine(dir, Path.GetFileName(logFile)), true); } catch { /* 文件占用可忽略 */ }
+            }
+
+            // 3) 复制最近 2 份监控数据
+            try {
+                string[] monitors = Directory.GetFiles(baseDir, "monitor_*.csv");
+                List<FileInfo> fis = new List<FileInfo>();
+                foreach (string f in monitors) {
+                    try { fis.Add(new FileInfo(f)); } catch { /* ignore */ }
+                }
+                fis.Sort((a, b) => b.LastWriteTime.CompareTo(a.LastWriteTime));
+
+                int copied = 0;
+                foreach (FileInfo fi in fis) {
+                    if (copied >= 2) break;
+                    try {
+                        File.Copy(fi.FullName, Path.Combine(dir, fi.Name), true);
+                        copied++;
+                    } catch { /* 文件占用可忽略 */ }
+                }
+            } catch { /* ignore */ }
+
+            // 4) summary.txt（最后写，确保反映真实导出结果）
+            int blCount = 0;
+            lock (blacklistLock) { blCount = nodeBlacklist.Count; }
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("ClashGuardian Pro v" + APP_VERSION);
+            sb.AppendLine("Time: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("BaseDir: " + baseDir);
+            sb.AppendLine("OS: " + Environment.OSVersion);
+            sb.AppendLine(".NET: " + Environment.Version);
+            sb.AppendLine("Process: " + (Environment.Is64BitProcess ? "x64" : "x86"));
+            sb.AppendLine();
+
+            sb.AppendLine("[Config]");
+            sb.AppendLine("clashApi=" + clashApi);
+            sb.AppendLine("proxyPort=" + proxyPort);
+            sb.AppendLine("normalInterval=" + normalInterval);
+            sb.AppendLine("memoryWarning=" + memoryWarning);
+            sb.AppendLine("memoryThreshold=" + memoryThreshold);
+            sb.AppendLine("highDelayThreshold=" + highDelayThreshold);
+            sb.AppendLine("blacklistMinutes=" + blacklistMinutes);
+            sb.AppendLine("config.masked.json=" + (maskOk ? "OK" : (File.Exists(configFile) ? "MASK_FAILED" : "MISSING")));
+            sb.AppendLine();
+
+            sb.AppendLine("[Runtime]");
+            sb.AppendLine("detectedCoreName=" + detectedCoreName);
+            sb.AppendLine("detectedClientPath=" + detectedClientPath);
+            sb.AppendLine("currentNode=" + currentNode);
+            sb.AppendLine("nodeGroup=" + nodeGroup);
+            sb.AppendLine("lastDelay=" + Thread.VolatileRead(ref lastDelay));
+            sb.AppendLine("blacklistCount=" + blCount);
+            sb.AppendLine("totalChecks=" + totalChecks);
+            sb.AppendLine("totalRestarts=" + totalRestarts);
+            sb.AppendLine("totalSwitches=" + totalSwitches);
+            sb.AppendLine("failCount=" + failCount);
+            sb.AppendLine("cooldownCount=" + cooldownCount);
+            sb.AppendLine("isRestarting=" + _isRestarting);
+            sb.AppendLine("autoActionsPaused=" + IsAutoActionsPaused);
+            if (IsAutoActionsPaused) sb.AppendLine("pauseRemaining=" + FormatTimeSpan(GetAutoActionsPauseRemaining()));
+
+            try { File.WriteAllText(Path.Combine(dir, "summary.txt"), sb.ToString(), Encoding.UTF8); }
+            catch { /* summary 写入失败可忽略 */ }
+
+            Log("诊断包已导出: " + dir);
+            try { Process.Start("explorer.exe", "\"" + dir + "\""); }
+            catch (Exception ex) { Log("打开诊断目录失败: " + ex.Message); }
+        } catch (Exception ex) {
+            Log("导出诊断包失败: " + ex.Message);
+        }
     }
 
     // ==================== 系统监控 ====================
@@ -123,8 +250,10 @@ public partial class ClashGuardian
     // ==================== 重启管理 ====================
     void RestartClash(string reason) {
         // 防止并发重启（手动+自动 或 多次自动）
-        if (_isRestarting) return;
-        _isRestarting = true;
+        lock (restartLock) {
+            if (_isRestarting) return;
+            _isRestarting = true;
+        }
 
         try {
             Log("重启: " + reason);
@@ -244,6 +373,11 @@ public partial class ClashGuardian
 
     // ==================== 检测循环 ====================
     void AdjustInterval(bool hasIssue) {
+        if (IsAutoActionsPaused) {
+            // 暂停自动操作期间，固定使用 normalInterval，避免异常导致 1s 频率刷屏
+            if (timer.Interval != normalInterval) timer.Interval = normalInterval;
+            return;
+        }
         if (hasIssue) {
             timer.Interval = fastInterval;
             consecutiveOK = 0;
@@ -332,6 +466,8 @@ public partial class ClashGuardian
     void UpdateUI(bool running, double mem, int handles, bool proxyOK, int delay, int[] tcp) {
         int tw = tcp[0], est = tcp[1], cw = tcp[2];
         int dl = delay;
+        bool paused = IsAutoActionsPaused;
+        TimeSpan pauseLeft = paused ? GetAutoActionsPauseRemaining() : TimeSpan.Zero;
 
         // 纯逻辑决策（不修改任何 UI 或实例状态）
         StatusDecision decision = EvaluateStatus(running, mem, proxyOK, dl, cw, failCount);
@@ -362,19 +498,32 @@ public partial class ClashGuardian
         // 状态指示
         string cn = currentNode;
         if (!running) {
-            statusLabel.Text = "● 状态: 内核未运行";
+            statusLabel.Text = paused
+                ? ("● 状态: 已暂停自动(" + FormatTimeSpan(pauseLeft) + ") | 内核未运行")
+                : "● 状态: 内核未运行";
             statusLabel.ForeColor = COLOR_ERROR;
         } else if (!proxyOK) {
-            statusLabel.Text = "● 状态: 代理异常(F" + failCount + ")";
+            statusLabel.Text = paused
+                ? ("● 状态: 已暂停自动(" + FormatTimeSpan(pauseLeft) + ") | 代理异常(F" + failCount + ")")
+                : ("● 状态: 代理异常(F" + failCount + ")");
             statusLabel.ForeColor = COLOR_ERROR;
         } else {
-            statusLabel.Text = "● 状态: 运行中";
-            statusLabel.ForeColor = COLOR_OK;
+            statusLabel.Text = paused
+                ? ("● 状态: 已暂停自动(" + FormatTimeSpan(pauseLeft) + ") | 运行中")
+                : "● 状态: 运行中";
+            statusLabel.ForeColor = paused ? COLOR_WARNING : COLOR_OK;
         }
 
         // 托盘
         string coreDisplay = string.IsNullOrEmpty(detectedCoreName) ? "?" : detectedCoreName;
-        trayIcon.Text = coreDisplay + " | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
+        string trayText = coreDisplay + " | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
+        if (paused) {
+            int mleft = (int)Math.Ceiling(pauseLeft.TotalMinutes);
+            if (mleft < 1) mleft = 1;
+            trayText += " | P" + mleft + "m";
+        }
+        if (trayText.Length > 63) trayText = trayText.Substring(0, 63);
+        trayIcon.Text = trayText;
 
         // 调整检测频率
         AdjustInterval(decision.HasIssue);
@@ -383,18 +532,25 @@ public partial class ClashGuardian
         LogData(proxyOK, dl, mem, handles, tw, est, cw, cn, decision.Event);
 
         // 执行决策（在后台线程，避免阻塞 UI）
-        if (decision.NeedSwitch) {
-            ThreadPool.QueueUserWorkItem(_ => {
-                if (SwitchToBestNode()) {
-                    this.BeginInvoke((Action)(() => {
-                        failCount = 0;
-                        RefreshNodeDisplay();
-                    }));
-                }
-            });
-        }
-        if (decision.NeedRestart) {
-            ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason));
+        if (paused && (decision.NeedSwitch || decision.NeedRestart)) {
+            if ((DateTime.Now - lastSuppressedActionLog).TotalSeconds > 60) {
+                lastSuppressedActionLog = DateTime.Now;
+                Log("已暂停自动操作，跳过: " + decision.Event);
+            }
+        } else {
+            if (decision.NeedSwitch) {
+                ThreadPool.QueueUserWorkItem(_ => {
+                    if (SwitchToBestNode()) {
+                        this.BeginInvoke((Action)(() => {
+                            failCount = 0;
+                            RefreshNodeDisplay();
+                        }));
+                    }
+                });
+            }
+            if (decision.NeedRestart) {
+                ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason));
+            }
         }
     }
 
