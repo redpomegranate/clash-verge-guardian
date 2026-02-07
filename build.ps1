@@ -1,0 +1,21 @@
+$ErrorActionPreference = "Stop"
+
+$csc = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe"
+if (-not (Test-Path $csc)) {
+  throw "csc.exe not found: $csc"
+}
+
+$outDir = Join-Path $PSScriptRoot "dist"
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+$outExe = Join-Path $outDir "ClashGuardian.exe"
+
+& $csc /nologo /target:winexe /out:$outExe `
+  "$PSScriptRoot\\ClashGuardian.cs" `
+  "$PSScriptRoot\\ClashGuardian.UI.cs" `
+  "$PSScriptRoot\\ClashGuardian.Network.cs" `
+  "$PSScriptRoot\\ClashGuardian.Monitor.cs" `
+  "$PSScriptRoot\\ClashGuardian.Update.cs"
+
+Write-Host "Built: $outExe"
+

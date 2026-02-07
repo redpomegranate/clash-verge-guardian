@@ -1,4 +1,4 @@
-# Clash Guardian Pro v0.0.8 - 多内核智能守护进程
+# Clash Guardian Pro v0.0.9 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -77,7 +77,11 @@
 
 ### 配置文件（推荐）
 
-首次运行时会自动生成 `config.json` 配置文件：
+首次运行时会自动生成配置文件（默认路径）：
+
+- `%LOCALAPPDATA%\\ClashGuardian\\config\\config.json`
+
+也可以通过托盘菜单的 `打开配置` 快速定位。
 
 ```json
 {
@@ -133,8 +137,11 @@
 ### 从源码编译
 
 ```powershell
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+mkdir dist -Force | Out-Null
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 ```
+
+也可以直接运行 `build.ps1` 一键编译到 `dist\\ClashGuardian.exe`。
 
 ### 界面操作
 
@@ -176,12 +183,18 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 ├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
 ├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~456行）
 ├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
-├── config.json                # 配置文件（首次运行自动生成）
-├── guardian.log               # 运行日志（仅异常）
-├── monitor_YYYYMMDD.csv       # 每日监控数据
+├── build.ps1                  # 一键编译脚本（输出到 dist\）
+├── dist\                      # 编译产物输出目录（本地生成，不提交）
 ├── README.md                  # 本文档
 └── AGENTS.md                  # AI 开发指南
 ```
+
+**运行时文件不会写入 exe 所在目录**，默认存放在：`%LOCALAPPDATA%\\ClashGuardian\\`
+
+- `config\\config.json` - 配置文件
+- `logs\\guardian.log` - 异常日志（仅异常）
+- `monitor\\monitor_YYYYMMDD.csv` - 监控数据
+- `diagnostics\\diagnostics_YYYYMMDD_HHmmss\\` - 诊断包导出目录
 
 ### CSV 数据格式
 
@@ -236,6 +249,10 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 4. 代理测试端口需与 Clash 客户端设置一致
 
 ## 🔄 更新日志
+
+### v0.0.9 (2026-02-07)
+- **优化：运行数据目录分离** - `config/log/monitor/diagnostics` 统一迁移到 `%LOCALAPPDATA%\\ClashGuardian\\`，避免与源码/可执行混放（启动时自动尝试迁移旧文件）
+- **优化：编译产物分离** - 提供 `build.ps1`，默认输出到 `dist\\ClashGuardian.exe`
 
 ### v0.0.8 (2026-02-07)
 - **修复：并发重启竞态** - `restartLock` + `_isRestarting` 原子化门闩，避免重启流程并发

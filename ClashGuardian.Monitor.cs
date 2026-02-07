@@ -52,7 +52,8 @@ public partial class ClashGuardian
 
     void CleanOldLogs() {
         try {
-            string[] files = Directory.GetFiles(baseDir, "monitor_*.csv");
+            string dir = string.IsNullOrEmpty(monitorDir) ? baseDir : monitorDir;
+            string[] files = Directory.GetFiles(dir, "monitor_*.csv");
             foreach (string f in files) {
                 FileInfo fi = new FileInfo(f);
                 if ((DateTime.Now - fi.LastWriteTime).TotalDays > LOG_RETENTION_DAYS) {
@@ -97,7 +98,11 @@ public partial class ClashGuardian
 
     void ExportDiagnostics() {
         try {
-            string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClashGuardian");
+            string root = diagnosticsDir;
+            if (string.IsNullOrEmpty(root)) {
+                root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClashGuardian", "diagnostics");
+            }
+            Directory.CreateDirectory(root);
             string dir = Path.Combine(root, "diagnostics_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
             Directory.CreateDirectory(dir);
 
@@ -120,7 +125,8 @@ public partial class ClashGuardian
 
             // 3) 复制最近 2 份监控数据
             try {
-                string[] monitors = Directory.GetFiles(baseDir, "monitor_*.csv");
+                string scanDir = string.IsNullOrEmpty(monitorDir) ? baseDir : monitorDir;
+                string[] monitors = Directory.GetFiles(scanDir, "monitor_*.csv");
                 List<FileInfo> fis = new List<FileInfo>();
                 foreach (string f in monitors) {
                     try { fis.Add(new FileInfo(f)); } catch { /* ignore */ }
@@ -145,6 +151,11 @@ public partial class ClashGuardian
             sb.AppendLine("ClashGuardian Pro v" + APP_VERSION);
             sb.AppendLine("Time: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             sb.AppendLine("BaseDir: " + baseDir);
+            sb.AppendLine("AppDataDir: " + appDataDir);
+            sb.AppendLine("ConfigFile: " + configFile);
+            sb.AppendLine("LogFile: " + logFile);
+            sb.AppendLine("MonitorDir: " + monitorDir);
+            sb.AppendLine("DiagnosticsDir: " + diagnosticsDir);
             sb.AppendLine("OS: " + Environment.OSVersion);
             sb.AppendLine(".NET: " + Environment.Version);
             sb.AppendLine("Process: " + (Environment.Is64BitProcess ? "x64" : "x86"));

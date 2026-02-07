@@ -41,7 +41,7 @@ public partial class ClashGuardian : Form
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
     // 自动更新配置
-    private const string APP_VERSION = "0.0.8";
+    private const string APP_VERSION = "0.0.9";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -123,6 +123,7 @@ public partial class ClashGuardian : Form
 
     // ==================== 运行时状态 ====================
     private string logFile, dataFile, configFile, baseDir;
+    private string appDataDir, configDir, logsDir, monitorDir, diagnosticsDir;
 
     // 计数器：跨线程写入使用 Interlocked，UI 读取无需加锁（int 读取原子）
     private int totalChecks = 0;
@@ -173,11 +174,10 @@ public partial class ClashGuardian : Form
     public ClashGuardian()
     {
         baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        logFile = Path.Combine(baseDir, "guardian.log");
-        dataFile = Path.Combine(baseDir, "monitor_" + DateTime.Now.ToString("yyyyMMdd") + ".csv");
-        configFile = Path.Combine(baseDir, "config.json");
         startTime = DateTime.Now;
         lastStableTime = DateTime.Now;
+
+        InitRuntimePaths();
 
         LoadConfigFast();
 
@@ -197,6 +197,103 @@ public partial class ClashGuardian : Form
         Log("守护启动 Pro");
 
         ThreadPool.QueueUserWorkItem(_ => DoFirstCheck());
+    }
+
+    // ==================== 运行时目录规划（运行数据与源码/可执行分离） ====================
+    void InitRuntimePaths() {
+        // 默认回退：仍放在程序目录
+        appDataDir = baseDir;
+        configDir = baseDir;
+        logsDir = baseDir;
+        monitorDir = baseDir;
+        diagnosticsDir = baseDir;
+
+        configFile = Path.Combine(configDir, "config.json");
+        logFile = Path.Combine(logsDir, "guardian.log");
+        dataFile = Path.Combine(monitorDir, "monitor_" + DateTime.Now.ToString("yyyyMMdd") + ".csv");
+
+        try {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrEmpty(local)) return;
+
+            appDataDir = Path.Combine(local, "ClashGuardian");
+            configDir = Path.Combine(appDataDir, "config");
+            logsDir = Path.Combine(appDataDir, "logs");
+            monitorDir = Path.Combine(appDataDir, "monitor");
+            diagnosticsDir = Path.Combine(appDataDir, "diagnostics");
+
+            Directory.CreateDirectory(configDir);
+            Directory.CreateDirectory(logsDir);
+            Directory.CreateDirectory(monitorDir);
+            Directory.CreateDirectory(diagnosticsDir);
+
+            configFile = Path.Combine(configDir, "config.json");
+            logFile = Path.Combine(logsDir, "guardian.log");
+            dataFile = Path.Combine(monitorDir, "monitor_" + DateTime.Now.ToString("yyyyMMdd") + ".csv");
+
+            // 配置迁移需要同步完成，否则本次启动无法读取到旧配置
+            MigrateLegacyConfig();
+
+            // 日志/监控数据迁移不影响启动，放后台做
+            ThreadPool.QueueUserWorkItem(_ => MigrateLegacyLogsAndMonitor());
+        } catch {
+            // 保持回退路径，不打断启动
+        }
+    }
+
+    void MigrateLegacyConfig() {
+        try {
+            if (string.IsNullOrEmpty(baseDir) || string.IsNullOrEmpty(configFile)) return;
+            string legacy = Path.Combine(baseDir, "config.json");
+            if (!File.Exists(legacy)) return;
+            if (File.Exists(configFile)) return;
+
+            try {
+                Directory.CreateDirectory(Path.GetDirectoryName(configFile));
+                File.Move(legacy, configFile);
+                Log("迁移配置: 已移动到 " + configFile);
+            } catch {
+                try {
+                    File.Copy(legacy, configFile, true);
+                    Log("迁移配置: 已复制到 " + configFile);
+                } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+    }
+
+    void MigrateLegacyLogsAndMonitor() {
+        try {
+            if (string.IsNullOrEmpty(baseDir)) return;
+
+            // 迁移 guardian.log
+            try {
+                string legacyLog = Path.Combine(baseDir, "guardian.log");
+                if (File.Exists(legacyLog) && !string.Equals(legacyLog, logFile, StringComparison.OrdinalIgnoreCase)) {
+                    try {
+                        Directory.CreateDirectory(Path.GetDirectoryName(logFile));
+                        if (!File.Exists(logFile)) {
+                            File.Move(legacyLog, logFile);
+                        } else {
+                            string legacyName = "guardian_legacy_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log";
+                            File.Copy(legacyLog, Path.Combine(logsDir, legacyName), true);
+                        }
+                    } catch { /* ignore */ }
+                }
+            } catch { /* ignore */ }
+
+            // 迁移 monitor_*.csv
+            try {
+                string[] files = Directory.GetFiles(baseDir, "monitor_*.csv");
+                foreach (string f in files) {
+                    try {
+                        string dest = Path.Combine(monitorDir, Path.GetFileName(f));
+                        Directory.CreateDirectory(Path.GetDirectoryName(dest));
+                        if (!File.Exists(dest)) File.Move(f, dest);
+                        else File.Copy(f, dest, true);
+                    } catch { /* ignore */ }
+                }
+            } catch { /* ignore */ }
+        } catch { /* ignore */ }
     }
 
     // 首次检测（后台执行，含进程探测）

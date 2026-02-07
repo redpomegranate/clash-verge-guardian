@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v0.0.8
+- **版本**：v0.0.9
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -20,17 +20,26 @@ clash-verge-guardian-0.0.3\
 ├── ClashGuardian.Network.cs   # 网络：API通信、JSON解析、节点管理、代理测试（~435行）
 ├── ClashGuardian.Monitor.cs   # 监控：日志、系统统计、重启管理、检测循环、决策逻辑（~456行）
 ├── ClashGuardian.Update.cs    # 更新：版本检查、下载、热替换、回滚保护（~212行）
-├── config.json                # 配置文件（首次运行自动生成）
-├── guardian.log               # 运行日志（仅异常）
-├── monitor_YYYYMMDD.csv       # 每日监控数据
+├── build.ps1                  # 一键编译脚本（输出到 dist\）
+├── dist\                      # 编译产物输出目录（本地生成，不提交）
 ├── README.md                  # 项目说明文档
 └── AGENTS.md                  # 本文件
 ```
 
+## 📂 运行数据目录（重要）
+
+运行时文件默认存放在 `%LOCALAPPDATA%\\ClashGuardian\\`，不会与源码/可执行混放：
+
+- `config\\config.json` - 配置文件
+- `logs\\guardian.log` - 异常日志（仅异常）
+- `monitor\\monitor_YYYYMMDD.csv` - 监控数据
+- `diagnostics\\diagnostics_YYYYMMDD_HHmmss\\` - 诊断包导出目录
+
 ## 🔧 编译命令
 
 ```powershell
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+mkdir dist -Force | Out-Null
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 ```
 
 编译成功标志：无 error 输出（warning 可忽略）
@@ -140,6 +149,10 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 
 ## 🔄 关键修复记录
 
+### v0.0.9 改进
+1. **运行数据目录分离** - `config/log/monitor/diagnostics` 统一存放到 `%LOCALAPPDATA%\\ClashGuardian\\`，避免与源码/可执行混放（启动时自动尝试迁移旧文件）
+2. **编译产物分离** - 提供 `build.ps1`，默认输出到 `dist\\ClashGuardian.exe`
+
 ### v0.0.8 改进
 1. **并发重启门闩** - `restartLock` + `_isRestarting` 原子化，避免重启流程并发
 2. **配置兜底** - 配置数值 `TryParse + Clamp`，异常配置不再导致崩溃（不回写 config）
@@ -187,7 +200,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:Clas
 
 ```powershell
 # 编译（5个文件）
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+mkdir dist -Force | Out-Null
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
 
 # 查看 Clash 相关进程
 Get-Process | Where-Object {$_.ProcessName -like "*clash*" -or $_.ProcessName -like "*mihomo*"}
