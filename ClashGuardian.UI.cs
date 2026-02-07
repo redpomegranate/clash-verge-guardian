@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
@@ -14,6 +14,7 @@ public partial class ClashGuardian
 {
     Icon _cachedAppIcon;
     ToolStripMenuItem disabledNodesMenu;
+    ToolStripMenuItem preferredNodesMenu;
     DateTime lastDisabledNodesMenuRefresh = DateTime.MinValue;
 
     Icon AppIcon {
@@ -196,6 +197,14 @@ public partial class ClashGuardian
         disabledNodesMenu.DropDownItems.Add(placeholder);
         menu.Items.Add(disabledNodesMenu);
 
+        preferredNodesMenu = new ToolStripMenuItem("偏好节点");
+        preferredNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
+        preferredNodesMenu.DropDownItems.Add(new ToolStripSeparator());
+        ToolStripMenuItem placeholder2 = new ToolStripMenuItem("无法获取节点列表");
+        placeholder2.Enabled = false;
+        preferredNodesMenu.DropDownItems.Add(placeholder2);
+        menu.Items.Add(preferredNodesMenu);
+
         menu.Items.Add(new ToolStripSeparator());
 
         menu.Items.Add("导出诊断包", null, delegate { ThreadPool.QueueUserWorkItem(_ => ExportDiagnostics()); });
@@ -230,7 +239,7 @@ public partial class ClashGuardian
     }
 
     void RefreshDisabledNodesMenuAsync(bool force) {
-        if (disabledNodesMenu == null) return;
+        if (disabledNodesMenu == null && preferredNodesMenu == null) return;
         if (!force) {
             if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds < 60) return;
         }
@@ -250,7 +259,7 @@ public partial class ClashGuardian
 
             try {
                 if (!this.IsHandleCreated) return;
-                this.BeginInvoke((Action)(() => BuildDisabledNodesMenu(nodes)));
+                this.BeginInvoke((Action)(() => { BuildDisabledNodesMenu(nodes); BuildPreferredNodesMenu(nodes); }));
             } catch { /* ignore */ }
         });
     }
@@ -285,12 +294,68 @@ public partial class ClashGuardian
             disabledNodesMenu.DropDownItems.Add(mi);
         }
     }
+    void BuildPreferredNodesMenu(List<string> nodes) {
+        if (preferredNodesMenu == null) return;
+
+        preferredNodesMenu.DropDownItems.Clear();
+        preferredNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
+        preferredNodesMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        if (nodes == null || nodes.Count == 0) {
+            ToolStripMenuItem empty = new ToolStripMenuItem("无法获取节点列表");
+            empty.Enabled = false;
+            preferredNodesMenu.DropDownItems.Add(empty);
+            return;
+        }
+
+        foreach (string node in nodes) {
+            if (string.IsNullOrEmpty(node)) continue;
+            ToolStripMenuItem mi = new ToolStripMenuItem(TruncateNodeName(SafeNodeName(node)));
+            mi.CheckOnClick = true;
+            mi.Tag = node;
+            mi.Checked = IsNodePreferredForUi(node);
+            mi.Click += delegate {
+                try {
+                    OnTogglePreferredNode(mi);
+                } catch (Exception ex) {
+                    Log("偏好节点操作失败: " + ex.Message);
+                }
+            };
+            preferredNodesMenu.DropDownItems.Add(mi);
+        }
+    }
+
+    ToolStripMenuItem FindNodeMenuItem(ToolStripMenuItem menu, string nodeName) {
+        if (menu == null || string.IsNullOrEmpty(nodeName)) return null;
+        foreach (ToolStripItem tsi in menu.DropDownItems) {
+            ToolStripMenuItem mi = tsi as ToolStripMenuItem;
+            if (mi == null || mi.Tag == null) continue;
+            string tag = mi.Tag as string;
+            if (!string.IsNullOrEmpty(tag) && string.Equals(tag, nodeName, StringComparison.Ordinal)) return mi;
+        }
+        return null;
+    }
+
+    bool IsNodePreferredForUi(string nodeName) {
+        if (string.IsNullOrEmpty(nodeName)) return false;
+        if (disabledNodesExplicitMode) {
+            lock (disabledNodesLock) { if (disabledNodes.Contains(nodeName)) return false; }
+        }
+        lock (preferredNodesLock) { return preferredNodes.Contains(nodeName); }
+    }
+
+
 
     bool IsNodeDisabledForUi(string nodeName) {
         if (string.IsNullOrEmpty(nodeName)) return false;
 
         if (disabledNodesExplicitMode) {
             lock (disabledNodesLock) { return disabledNodes.Contains(nodeName); }
+        }
+
+        // 关键字模式下：若节点被标记为偏好，则允许其覆盖 excludeRegions
+        lock (preferredNodesLock) {
+            if (preferredNodes.Contains(nodeName)) return false;
         }
 
         if (excludeRegions == null) return false;
@@ -304,6 +369,15 @@ public partial class ClashGuardian
         if (clicked == null) return;
         string nodeName = clicked.Tag as string;
         if (string.IsNullOrEmpty(nodeName)) return;
+
+        // 禁用与偏好互斥：禁用时自动取消偏好
+        if (clicked.Checked) {
+            bool removedPref = false;
+            lock (preferredNodesLock) { removedPref = preferredNodes.Remove(nodeName); }
+            if (removedPref) ThreadPool.QueueUserWorkItem(_ => SavePreferredNodes());
+            ToolStripMenuItem pm = FindNodeMenuItem(preferredNodesMenu, nodeName);
+            if (pm != null) pm.Checked = false;
+        }
 
         // 第一次在 UI 上修改时，将关键字模式“实体化”为显示名单 (disabledNodes)
         if (!disabledNodesExplicitMode) {
@@ -330,6 +404,33 @@ public partial class ClashGuardian
         }
         ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
         Log((clicked.Checked ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
+    }
+
+    void OnTogglePreferredNode(ToolStripMenuItem clicked) {
+        if (clicked == null) return;
+        string nodeName = clicked.Tag as string;
+        if (string.IsNullOrEmpty(nodeName)) return;
+
+        // 偏好与禁用互斥：设置偏好时自动取消禁用（显式禁用则移除；关键字禁用则由偏好覆盖）
+        if (clicked.Checked) {
+            bool removedDisabled = false;
+            if (disabledNodesExplicitMode) {
+                lock (disabledNodesLock) { removedDisabled = disabledNodes.Remove(nodeName); }
+                if (removedDisabled) ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
+            }
+        }
+
+        lock (preferredNodesLock) {
+            if (clicked.Checked) preferredNodes.Add(nodeName);
+            else preferredNodes.Remove(nodeName);
+        }
+        ThreadPool.QueueUserWorkItem(_ => SavePreferredNodes());
+
+        // 同步 UI：禁用菜单勾选状态按最新规则刷新
+        ToolStripMenuItem dm = FindNodeMenuItem(disabledNodesMenu, nodeName);
+        if (dm != null) dm.Checked = IsNodeDisabledForUi(nodeName);
+
+        Log((clicked.Checked ? "偏好: " : "取消偏好: " ) + SafeNodeName(nodeName));
     }
 
     void OpenFileInNotepad(string path, string label) {
@@ -397,3 +498,4 @@ public partial class ClashGuardian
         return string.Format("{0:F0}s", ts.TotalSeconds);
     }
 }
+

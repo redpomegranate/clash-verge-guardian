@@ -68,7 +68,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 13. **暂停自动操作** - 暂停期间仅抑制自动重启/自动切换，检测与 UI 更新仍继续；恢复时重置 failCount/consecutiveOK
 14. **诊断导出** - `ExportDiagnostics` 仅用户触发，脱敏 `clashSecret`，导出到 `%LOCALAPPDATA%\\ClashGuardian\\diagnostics_*`
 15. **禁用名单（disabledNodes）** - 托盘勾选后写入 config；一旦存在 `disabledNodes` 将忽略 `excludeRegions`
-16. **订阅级自动切换（Clash Verge Rev）** - 默认关闭；通过修改 `%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\profiles.yaml` 的 `current:` 并强制重启客户端生效；严禁日志输出订阅 URL/token
+16. **偏好节点（preferredNodes）** - 托盘勾选后写入 config；自动切换优先偏好节点（不可用则回退，偏好集合过小可能降低抗风险）
+17. **订阅级自动切换（Clash Verge Rev）** - 默认关闭；通过修改 `%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\profiles.yaml` 的 `current:` 并强制重启客户端生效；严禁日志输出订阅 URL/token
 
 ## 🏗️ 代码模块（按文件）
 
@@ -86,7 +87,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 |------|------|
 | `InitializeUI` | 窗口布局和控件创建 |
 | `CreateButton`/`CreateInfoLabel`/`CreateSeparator` | UI 工厂方法 |
-| `InitializeTrayIcon` | 系统托盘菜单（含禁用名单/暂停自动操作/诊断导出/黑名单管理/检查更新） |
+| `InitializeTrayIcon` | 系统托盘菜单（含禁用名单/偏好节点/暂停自动操作/诊断导出/黑名单管理/检查更新） |
 | `OpenFileInNotepad` | 安全打开配置/数据/日志（try/catch，不崩溃） |
 | `PauseAutoActionsFor`/`ResumeAutoActions` | 暂停/恢复自动操作（仅抑制自动重启/切换） |
 | `ToggleAutoStart` | 开机自启注册表操作 |
@@ -160,9 +161,10 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 
 ### v1.0.0 改进
 1. **禁用名单可配置** - 托盘“禁用名单”勾选节点，写入 `disabledNodes`，并覆盖 `excludeRegions`
-2. **订阅级自动切换（Clash Verge Rev）** - 连续自动切换节点仍不可用时，按白名单轮换订阅并强制重启客户端（默认关闭）
-3. **统计口径调整** - UI 统计由检测次数改为“问题段落次数”（正常→异常 +1）
-4. **图标内置** - `build.ps1` 使用 `/win32icon`，窗口/托盘图标与 EXE 一致
+2. **偏好节点** - 托盘“偏好节点”勾选节点，自动切换优先偏好节点（不可用则回退）
+3. **订阅级自动切换（Clash Verge Rev）** - 连续自动切换节点仍不可用时，按白名单轮换订阅并强制重启客户端（默认关闭）
+4. **统计口径调整** - UI 统计由检测次数改为“问题段落次数”（正常→异常 +1）
+5. **图标内置** - `build.ps1` 使用 `/win32icon`，窗口/托盘图标与 EXE 一致
 
 ### v0.0.9 改进
 1. **运行数据目录分离** - `config/log/monitor/diagnostics` 统一存放到 `%LOCALAPPDATA%\\ClashGuardian\\`，避免与源码/可执行混放（启动时自动尝试迁移旧文件）

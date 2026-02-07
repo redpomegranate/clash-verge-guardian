@@ -2,6 +2,8 @@
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
+Icon based on Clash Verge, modified background by [Tao Zheng].
+
 **支持多种客户端和内核：**
 - Clash Verge / Clash Verge Rev (verge-mihomo)
 - Mihomo Party (mihomo)
@@ -34,6 +36,7 @@
 - **综合判断** - 内存高但网络正常时不重启
 - **定期测速** - 约每 6 分钟触发全节点延迟测试
 - **禁用名单（可勾选）** - 托盘“禁用名单”勾选节点写入 `disabledNodes`；未配置时仍按 `excludeRegions` 关键字排除（默认港澳台）
+- **偏好节点（可勾选）** - 托盘“偏好节点”会在自动切换时优先选择；偏好集合过小/不稳定时抗风险会下降（不可用则回退）
 
 ### ⚡ 自动恢复
 - **订阅级自动切换（Clash Verge Rev）** - 连续自动切换节点仍不可用时，按白名单轮换订阅并强制重启客户端（默认关闭）
@@ -99,6 +102,7 @@
 
   "excludeRegions": ["HK", "香港", "TW", "台湾", "MO", "澳门"],
   "disabledNodes": [],
+  "preferredNodes": [],
 
   "autoSwitchSubscription": false,
   "subscriptionSwitchThreshold": 3,
@@ -123,6 +127,7 @@
 | `excludeRegions` | 节点排除关键词 | `HK,香港,TW,台湾,MO,澳门` |
 | `clientPath` | 客户端可执行文件路径（自动检测并持久化） | 自动 |
 | `disabledNodes` | 节点禁用显式名单（存在则优先，覆盖 `excludeRegions`） | 空数组 |
+| `preferredNodes` | 偏好节点名单（自动切换优先；不可用则回退到其他节点） | 空数组 |
 | `autoSwitchSubscription` | 订阅级自动切换（仅 Clash Verge Rev；默认关闭） | `false` |
 | `subscriptionSwitchThreshold` | 连续自动切换节点仍不可用时触发阈值 | `3` |
 | `subscriptionSwitchCooldownMinutes` | 订阅切换冷却期（分钟） | `15` |
@@ -189,6 +194,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 - 切换节点
 - 触发测速
 - 禁用名单（勾选即禁用）
+- 偏好节点（勾选即偏好）
 - 导出诊断包
 - 打开配置 / 查看监控数据 / 查看异常日志
 - 检查更新

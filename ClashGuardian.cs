@@ -115,6 +115,9 @@ public partial class ClashGuardian : Form
     private HashSet<string> disabledNodes = new HashSet<string>();
     private bool disabledNodesExplicitMode = false;
 
+    // 节点偏好（自动切换时优先考虑；当偏好节点不可用时仍会回退到其他节点）
+    private HashSet<string> preferredNodes = new HashSet<string>();
+
     // 订阅级自动切换（Clash Verge Rev，默认关闭）
     private bool autoSwitchSubscription = false;
     private int subscriptionSwitchThreshold = 3;
@@ -165,6 +168,7 @@ public partial class ClashGuardian : Form
     private readonly object blacklistLock = new object();  // nodeBlacklist 专用锁
     private readonly object restartLock = new object();    // RestartClash 并发门闩
     private readonly object disabledNodesLock = new object(); // disabledNodes 跨线程读写
+    private readonly object preferredNodesLock = new object(); // preferredNodes 跨线程读写
     private readonly object configLock = new object();        // 串行化写 config.json，避免字段互相覆盖
     private readonly object subscriptionLock = new object();  // 订阅切换门闩
     private volatile bool _isSwitchingSubscription = false;
@@ -468,6 +472,26 @@ public partial class ClashGuardian : Form
                     }
                 }
 
+                // 偏好节点（仅影响自动切换的优先级；若同时出现在 disabledNodes，则以禁用为准）
+                List<string> pn = GetJsonStringArray(json, "preferredNodes");
+                if (pn.Count > 0) {
+                    lock (preferredNodesLock) {
+                        preferredNodes.Clear();
+                        foreach (string n in pn) {
+                            if (!string.IsNullOrEmpty(n)) preferredNodes.Add(n);
+                        }
+                    }
+                    if (disabledNodesExplicitMode) {
+                        lock (disabledNodesLock) {
+                            lock (preferredNodesLock) {
+                                foreach (string n in disabledNodes) {
+                                    if (!string.IsNullOrEmpty(n)) preferredNodes.Remove(n);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 订阅级自动切换（Clash Verge Rev）
                 string rawAutoSub = GetJsonValue(json, "autoSwitchSubscription", autoSwitchSubscription ? "true" : "false");
                 bool autoSub;
@@ -754,6 +778,64 @@ public partial class ClashGuardian : Form
         }
     }
 
+    void SavePreferredNodes() {
+        try {
+            List<string> snapshot = new List<string>();
+            lock (preferredNodesLock) {
+                foreach (string n in preferredNodes) {
+                    if (!string.IsNullOrEmpty(n)) snapshot.Add(n);
+                }
+            }
+            snapshot.Sort(StringComparer.OrdinalIgnoreCase);
+
+            // 确保存在配置文件（首次运行可能还未写入）
+            if (!File.Exists(configFile)) {
+                SaveDefaultConfig();
+            }
+
+            StringBuilder sbArr = new StringBuilder();
+            sbArr.Append("[");
+            for (int i = 0; i < snapshot.Count; i++) {
+                if (i > 0) sbArr.Append(", ");
+                sbArr.Append("\"").Append(EscapeJsonString(snapshot[i])).Append("\"");
+            }
+            sbArr.Append("]");
+            string arr = sbArr.ToString();
+
+            lock (configLock) {
+                if (!File.Exists(configFile)) return;
+                string json = File.ReadAllText(configFile, Encoding.UTF8);
+
+                string key = "\"preferredNodes\"";
+                int keyIdx = json.IndexOf(key, StringComparison.Ordinal);
+
+                if (keyIdx >= 0) {
+                    int colon = json.IndexOf(':', keyIdx);
+                    int arrStart = colon >= 0 ? json.IndexOf('[', colon) : -1;
+                    if (arrStart > 0) {
+                        int arrEnd = FindMatchingArrayBracket(json, arrStart);
+                        if (arrEnd > arrStart) {
+                            json = json.Substring(0, arrStart) + arr + json.Substring(arrEnd + 1);
+                        }
+                    }
+                } else {
+                    int lastBrace = json.LastIndexOf('}');
+                    if (lastBrace > 0) {
+                        int p = lastBrace - 1;
+                        while (p >= 0 && char.IsWhiteSpace(json[p])) p--;
+                        bool needComma = p >= 0 && json[p] != '{' && json[p] != ',';
+                        string insert = (needComma ? "," : "") + "\n  \"preferredNodes\": " + arr + "\n";
+                        json = json.Substring(0, lastBrace) + insert + json.Substring(lastBrace);
+                    }
+                }
+
+                File.WriteAllText(configFile, json, Encoding.UTF8);
+            }
+        } catch (Exception ex) {
+            Log("保存偏好节点失败: " + ex.Message);
+        }
+    }
+
     void AutoDiscoverApi() {
         Stopwatch sw = Stopwatch.StartNew();
         foreach (int port in DEFAULT_API_PORTS) {
@@ -922,7 +1004,8 @@ public partial class ClashGuardian : Form
             "  \"subscriptionWhitelist\": [],\n" +
             "  \"coreProcessNames\": [\"" + coreNames + "\"],\n" +
             "  \"clientProcessNames\": [\"" + clientNames + "\"],\n" +
-            "  \"excludeRegions\": [\"" + excludeNames + "\"]\n" +
+            "  \"excludeRegions\": [\"" + excludeNames + "\"],\n" +
+            "  \"preferredNodes\": []\n" +
             "}";
         try {
             lock (configLock) { File.WriteAllText(configFile, config, Encoding.UTF8); }

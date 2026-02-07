@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net;
 using System.IO;
 using System.Text;
@@ -362,7 +362,15 @@ public partial class ClashGuardian
 
             List<string> allNodes = GetGroupAllNodes(json, group);
 
-            List<KeyValuePair<string, int>> nodesWithDelay = new List<KeyValuePair<string, int>>();
+            HashSet<string> preferredSnapshot = null;
+            lock (preferredNodesLock) {
+                if (preferredNodes != null && preferredNodes.Count > 0) {
+                    preferredSnapshot = new HashSet<string>(preferredNodes);
+                }
+            }
+
+            List<KeyValuePair<string, int>> preferredWithDelay = new List<KeyValuePair<string, int>>();
+            List<KeyValuePair<string, int>> normalWithDelay = new List<KeyValuePair<string, int>>();
             string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
 
             foreach (string nodeName in allNodes) {
@@ -378,11 +386,13 @@ public partial class ClashGuardian
                 foreach (string st in skipTypes) { if (nodeType == st) { skip = true; break; } }
                 if (skip) continue;
 
-                // 排除可配置的地区节点
+                bool isPreferred = preferredSnapshot != null && preferredSnapshot.Contains(nodeName);
+
+                // 排除可配置的地区节点（关键字模式下：偏好节点可覆盖关键字排除）
                 bool excluded = false;
                 if (disabledNodesExplicitMode) {
                     lock (disabledNodesLock) { excluded = disabledNodes.Contains(nodeName); }
-                } else if (excludeRegions != null) {
+                } else if (excludeRegions != null && !isPreferred) {
                     foreach (string region in excludeRegions) {
                         if (!string.IsNullOrEmpty(region) && nodeName.Contains(region)) { excluded = true; break; }
                     }
@@ -395,25 +405,42 @@ public partial class ClashGuardian
 
                 int delay = GetNodeDelay(json, nodeName);
                 if (delay > 0) {
-                    nodesWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
+                    if (isPreferred) preferredWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
+                    else normalWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
                 }
             }
 
-            if (nodesWithDelay.Count == 0) {
+            if (preferredWithDelay.Count + normalWithDelay.Count == 0) {
                 Log("切换失败: 无可用节点(请先测速) group=" + group + " allCount=" + allNodes.Count);
                 return false;
             }
 
-            nodesWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
+            preferredWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
+            normalWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
 
+            string cn = currentNode; // volatile read
             string bestNode = null;
             int bestDelay = int.MaxValue;
-            string cn = currentNode; // volatile read
-            foreach (var kv in nodesWithDelay) {
+            bool bestPreferred = false;
+
+            foreach (var kv in preferredWithDelay) {
                 if (kv.Key != cn) {
                     bestNode = kv.Key;
                     bestDelay = kv.Value;
+                    bestPreferred = true;
                     break;
+                }
+            }
+
+            // 偏好节点不可用或延迟不可接受时，回退到非偏好节点
+            if (bestNode == null || bestDelay >= MAX_ACCEPTABLE_DELAY) {
+                foreach (var kv in normalWithDelay) {
+                    if (kv.Key != cn) {
+                        bestNode = kv.Key;
+                        bestDelay = kv.Value;
+                        bestPreferred = false;
+                        break;
+                    }
                 }
             }
 
@@ -424,7 +451,8 @@ public partial class ClashGuardian
 
                 string url = "/proxies/" + Uri.EscapeDataString(group);
                 if (ApiPut(url, "{\"name\":\"" + bestNode + "\"}")) {
-                    Log("切换: " + SafeNodeName(bestNode) + " (" + bestDelay + "ms) @" + group);
+                    string prefMark = bestPreferred ? " [偏好]" : "";
+                    Log("切换: " + SafeNodeName(bestNode) + " (" + bestDelay + "ms) @" + group + prefMark);
                     currentNode = bestNode;
                     Interlocked.Exchange(ref lastDelay, bestDelay);
                     Interlocked.Increment(ref totalSwitches);
@@ -434,12 +462,15 @@ public partial class ClashGuardian
                 }
             } else if (bestNode == null) {
                 Log("切换失败: 无更优节点");
+            } else {
+                Log("切换失败: 延迟过高 " + bestDelay + "ms");
             }
         } catch (Exception ex) {
             Log("切换异常: " + ex.Message);
         }
         return false;
     }
+
 
     // ==================== 延迟测试 ====================
     void TriggerDelayTest() {
@@ -487,3 +518,4 @@ public partial class ClashGuardian
         return result;
     }
 }
+
