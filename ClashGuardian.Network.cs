@@ -197,22 +197,32 @@ public partial class ClashGuardian
         "🚀 节点选择", "♻️ 自动选择", "🎯 全球直连", "🛑 全球拦截"
     };
 
-    void GetCurrentNode() {
+    void GetCurrentNode(int timeout = API_TIMEOUT_NORMAL) {
         try {
-            string json = ApiRequest("/proxies", API_TIMEOUT_NORMAL);
+            string json = ApiRequest("/proxies", timeout);
             if (string.IsNullOrEmpty(json)) return;
 
-            string node = ResolveActualNode(json, "GLOBAL", 0);
+            // Prefer the actual selector group discovered from GLOBAL's "all" list,
+            // so manual switches and nested selectors can be reflected correctly.
+            string group = FindSelectorGroup(json);
+            if (!string.IsNullOrEmpty(group)) nodeGroup = group;
+
+            string node = ResolveActualNode(json, string.IsNullOrEmpty(group) ? "GLOBAL" : group, 0);
+            if (string.IsNullOrEmpty(node) && group != "GLOBAL") {
+                node = ResolveActualNode(json, "GLOBAL", 0);
+            }
             if (!string.IsNullOrEmpty(node)) {
-                currentNode = SafeNodeName(node);
+                currentNode = node; // keep raw; UI will SafeNodeName() for display
                 return;
             }
 
+            // Fallback: try common selector names
             foreach (string selector in SELECTOR_NAMES) {
                 if (selector == "GLOBAL") continue;
                 node = ResolveActualNode(json, selector, 0);
                 if (!string.IsNullOrEmpty(node)) {
-                    currentNode = SafeNodeName(node);
+                    nodeGroup = selector;
+                    currentNode = node;
                     return;
                 }
             }

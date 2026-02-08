@@ -41,14 +41,14 @@ public partial class ClashGuardian : Form
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
     // 自动更新配置
-    private const string APP_VERSION = "1.0.0";
+    private const string APP_VERSION = "1.0.2";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
     // 网络超时常量
     private const int API_TIMEOUT_FAST = 1000;             // 快速 API 超时 (ms)
     private const int API_TIMEOUT_NORMAL = 3000;           // 正常 API 超时 (ms)
-    private const int PROXY_TEST_TIMEOUT = 2500;           // 代理测试超时 (ms)
+    private const int PROXY_TEST_TIMEOUT = 900;            // 代理测试超时 (ms) - 提速探测
     private const int API_DISCOVER_TIMEOUT = 500;          // API 发现超时 (ms)
 
     // 性能日志阈值
@@ -101,6 +101,9 @@ public partial class ClashGuardian : Form
     private int proxyPort;
     private int normalInterval;
     private int fastInterval;
+    private int speedFactor;                     // 检测提速倍率（>=1）
+    private int effectiveNormalInterval;         // 实际使用的 normalInterval（考虑 speedFactor）
+    private int effectiveFastInterval;           // 实际使用的 fastInterval（考虑 speedFactor）
     private int memoryThreshold;
     private int memoryWarning;
     private int highDelayThreshold;
@@ -108,8 +111,12 @@ public partial class ClashGuardian : Form
 
     private string[] coreProcessNames;
     private string[] clientProcessNames;
+    private string[] clientProcessNamesExpanded; // 归一化+扩展变体后的进程名列表（用于更可靠的跟随/检测）
     private string[] clientPaths;
     private string[] excludeRegions;  // 可配置的节点排除规则
+
+    // 静音策略：默认不允许自动启动/重启 Clash 客户端（避免弹出 UI 干扰用户）
+    private bool allowAutoStartClient = false;
 
     // 节点禁用（显式名单优先；若 config 中不存在 disabledNodes 则退回到 excludeRegions 关键字模式）
     private HashSet<string> disabledNodes = new HashSet<string>();
@@ -131,7 +138,7 @@ public partial class ClashGuardian : Form
     // ==================== UI 组件 ====================
     private NotifyIcon trayIcon;
     private Label statusLabel, memLabel, proxyLabel, logLabel, checkLabel, stableLabel;
-    private Button restartBtn, exitBtn, logBtn;
+    private Button restartBtn, exitBtn, pauseBtn, followBtn;
     private System.Windows.Forms.Timer timer;
 
     // ==================== 运行时状态 ====================
@@ -176,21 +183,15 @@ public partial class ClashGuardian : Form
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
     private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
 
-    // ==================== 控制与诊断：暂停自动操作 ====================
-    // 仅暂停“自动切换/自动重启”，不影响检测与 UI 更新；手动操作仍可执行
-    private DateTime pauseAutoActionsUntil = DateTime.MinValue;
-    private DateTime lastSuppressedActionLog = DateTime.MinValue;
+    // ==================== 控制：暂停检测 ====================
+    // 暂停整个检测循环（Timer 停止），不会再自动切换/重启；手动操作仍可执行
+    private volatile bool _isDetectionPaused = false;
 
-    bool IsAutoActionsPaused {
-        get { return DateTime.Now < pauseAutoActionsUntil; }
-    }
-
-    TimeSpan GetAutoActionsPauseRemaining() {
-        DateTime now = DateTime.Now;
-        if (now >= pauseAutoActionsUntil) return TimeSpan.Zero;
-        TimeSpan ts = pauseAutoActionsUntil - now;
-        return ts < TimeSpan.Zero ? TimeSpan.Zero : ts;
-    }
+    // Follow Clash exit monitor (enabled only in --follow-clash mode)
+    private static bool s_followClashMode = false;
+    private System.Windows.Forms.Timer followExitTimer;
+    private DateTime followMissingSince = DateTime.MinValue;
+    private bool _followInitialHideDone = false;
 
     // ==================== 构造函数 ====================
     public ClashGuardian()
@@ -212,7 +213,7 @@ public partial class ClashGuardian : Form
         InitializeTrayIcon();
 
         timer = new System.Windows.Forms.Timer();
-        timer.Interval = normalInterval;
+        timer.Interval = effectiveNormalInterval;
         timer.Tick += CheckStatus;
         timer.Start();
 
@@ -340,7 +341,7 @@ public partial class ClashGuardian : Form
                 string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
                 memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB  |  句柄: " + handles;
 
-                string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : currentNode;
+                string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : SafeNodeName(currentNode);
                 string nodeShort = TruncateNodeName(nodeDisplay);
                 proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
                 proxyLabel.ForeColor = proxyOK ? COLOR_OK : COLOR_ERROR;
@@ -392,6 +393,8 @@ public partial class ClashGuardian : Form
         proxyPort = DEFAULT_PROXY_PORT;
         normalInterval = DEFAULT_NORMAL_INTERVAL;
         fastInterval = DEFAULT_FAST_INTERVAL;
+        speedFactor = 3;
+        allowAutoStartClient = false;
         memoryThreshold = DEFAULT_MEMORY_THRESHOLD;
         memoryWarning = DEFAULT_MEMORY_WARNING;
         highDelayThreshold = DEFAULT_HIGH_DELAY;
@@ -399,6 +402,7 @@ public partial class ClashGuardian : Form
 
         coreProcessNames = DEFAULT_CORE_NAMES;
         clientProcessNames = DEFAULT_CLIENT_NAMES;
+        clientProcessNamesExpanded = NormalizeAndExpandProcessNamesStatic(clientProcessNames);
         clientPaths = GetDefaultClientPaths();
         excludeRegions = DEFAULT_EXCLUDE_REGIONS;
 
@@ -424,6 +428,22 @@ public partial class ClashGuardian : Form
                 int normalIntervalFixed = ClampInt(normalIntervalParsed, 500, 600000);
                 if (!parsed || normalIntervalFixed != normalIntervalParsed) Log("配置修正: normalInterval " + rawNormalInterval + " -> " + normalIntervalFixed);
                 normalInterval = normalIntervalFixed;
+
+                string rawFastInterval = GetJsonValue(json, "fastInterval", fastInterval.ToString());
+                int fastIntervalParsed = TryParseInt(rawFastInterval, fastInterval, out parsed);
+                int fastIntervalFixed = ClampInt(fastIntervalParsed, 200, normalInterval);
+                if (!parsed || fastIntervalFixed != fastIntervalParsed) Log("閰嶇疆淇: fastInterval " + rawFastInterval + " -> " + fastIntervalFixed);
+                fastInterval = fastIntervalFixed;
+
+                string rawSpeed = GetJsonValue(json, "speedFactor", speedFactor.ToString());
+                int speedParsed = TryParseInt(rawSpeed, speedFactor, out parsed);
+                int speedFixed = ClampInt(speedParsed, 1, 5);
+                if (!parsed || speedFixed != speedParsed) Log("配置修正: speedFactor " + rawSpeed + " -> " + speedFixed);
+                speedFactor = speedFixed;
+
+                string rawAllowAutoStartClient = GetJsonValue(json, "allowAutoStartClient", allowAutoStartClient ? "true" : "false");
+                bool allowClient;
+                if (bool.TryParse(rawAllowAutoStartClient, out allowClient)) allowAutoStartClient = allowClient;
 
                 string rawMemoryThreshold = GetJsonValue(json, "memoryThreshold", memoryThreshold.ToString());
                 int memoryThresholdParsed = TryParseInt(rawMemoryThreshold, memoryThreshold, out parsed);
@@ -451,11 +471,12 @@ public partial class ClashGuardian : Form
                 }
                 fastInterval = ClampInt(fastInterval, 200, normalInterval);
 
-                string customCores = GetJsonArray(json, "coreProcessNames");
-                if (!string.IsNullOrEmpty(customCores)) coreProcessNames = customCores.Split(',');
+                List<string> customCores = GetJsonStringArray(json, "coreProcessNames");
+                if (customCores.Count > 0) coreProcessNames = customCores.ToArray();
 
-                string customClients = GetJsonArray(json, "clientProcessNames");
-                if (!string.IsNullOrEmpty(customClients)) clientProcessNames = customClients.Split(',');
+                List<string> customClients = GetJsonStringArray(json, "clientProcessNames");
+                if (customClients.Count > 0) clientProcessNames = customClients.ToArray();
+                clientProcessNamesExpanded = NormalizeAndExpandProcessNamesStatic(clientProcessNames);
 
                 List<string> excludes = GetJsonStringArray(json, "excludeRegions");
                 if (excludes.Count > 0) excludeRegions = excludes.ToArray();
@@ -521,6 +542,17 @@ public partial class ClashGuardian : Form
         } else {
             ThreadPool.QueueUserWorkItem(_ => SaveDefaultConfig());
         }
+
+        ComputeEffectiveIntervals();
+    }
+
+    void ComputeEffectiveIntervals() {
+        int sf = speedFactor;
+        if (sf < 1) sf = 1;
+
+        // Keep base interval values in config, but use effective intervals for runtime.
+        effectiveNormalInterval = ClampInt(normalInterval / sf, 300, 600000);
+        effectiveFastInterval = ClampInt(fastInterval / sf, 200, effectiveNormalInterval);
     }
 
     string[] GetDefaultClientPaths() {
@@ -572,7 +604,10 @@ public partial class ClashGuardian : Form
 
     void DetectRunningClient() {
         // 1. 从运行中的进程获取路径（最准确）
-        foreach (string clientName in clientProcessNames) {
+        string[] names = (clientProcessNamesExpanded != null && clientProcessNamesExpanded.Length > 0)
+            ? clientProcessNamesExpanded
+            : clientProcessNames;
+        foreach (string clientName in names) {
             try {
                 Process[] procs = Process.GetProcessesByName(clientName);
                 if (procs.Length > 0) {
@@ -995,6 +1030,9 @@ public partial class ClashGuardian : Form
             "  \"clashSecret\": \"" + clashSecret + "\",\n" +
             "  \"proxyPort\": " + proxyPort + ",\n" +
             "  \"normalInterval\": " + normalInterval + ",\n" +
+            "  \"fastInterval\": " + fastInterval + ",\n" +
+            "  \"speedFactor\": " + speedFactor + ",\n" +
+            "  \"allowAutoStartClient\": " + (allowAutoStartClient ? "true" : "false") + ",\n" +
             "  \"memoryThreshold\": " + memoryThreshold + ",\n" +
             "  \"highDelayThreshold\": " + highDelayThreshold + ",\n" +
             "  \"blacklistMinutes\": " + blacklistMinutes + ",\n" +
@@ -1005,6 +1043,7 @@ public partial class ClashGuardian : Form
             "  \"coreProcessNames\": [\"" + coreNames + "\"],\n" +
             "  \"clientProcessNames\": [\"" + clientNames + "\"],\n" +
             "  \"excludeRegions\": [\"" + excludeNames + "\"],\n" +
+            "  \"disabledNodes\": [],\n" +
             "  \"preferredNodes\": []\n" +
             "}";
         try {
@@ -1033,6 +1072,16 @@ public partial class ClashGuardian : Form
         if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; this.Hide(); }
     }
 
+    protected override void SetVisibleCore(bool value) {
+        // In follow mode, keep fully silent on startup: no main window pop.
+        if (s_followClashMode && !_followInitialHideDone && value) {
+            _followInitialHideDone = true;
+            base.SetVisibleCore(false);
+            return;
+        }
+        base.SetVisibleCore(value);
+    }
+
     [STAThread]
     static void Main(string[] args) {
         if (args.Length >= 2 && args[0] == "--wait-pid") {
@@ -1048,11 +1097,234 @@ public partial class ClashGuardian : Form
             } catch { /* 清理旧版本失败不影响运行 */ }
         }
 
+        bool watch = false;
+        bool follow = false;
+        if (args != null) {
+            for (int i = 0; i < args.Length; i++) {
+                string a = args[i];
+                if (a == "--watch-clash") watch = true;
+                else if (a == "--follow-clash") follow = true;
+            }
+        }
+
+        if (watch) {
+            RunClashWatcherLoop();
+            return;
+        }
+
+        s_followClashMode = follow;
+
         bool createdNew;
         using (Mutex mutex = new Mutex(true, "ClashGuardianSingleInstance", out createdNew)) {
             if (!createdNew) return;
             Application.EnableVisualStyles();
             Application.Run(new ClashGuardian());
+        }
+    }
+
+    // ==================== Watcher: follow Clash launch (no UI) ====================
+
+    static string GetWatcherConfigFilePath() {
+        try {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrEmpty(local)) {
+                return Path.Combine(local, "ClashGuardian", "config", "config.json");
+            }
+        } catch { /* ignore */ }
+        try { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json"); }
+        catch { return "config.json"; }
+    }
+
+    static List<string> ParseJsonStringArrayStatic(string json, string key) {
+        List<string> result = new List<string>();
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return result;
+
+        string search = "\"" + key + "\":";
+        int idx = json.IndexOf(search, StringComparison.Ordinal);
+        if (idx < 0) return result;
+
+        idx = json.IndexOf('[', idx);
+        if (idx < 0) return result;
+
+        int i = idx + 1;
+        bool inString = false;
+        bool escape = false;
+        StringBuilder sb = new StringBuilder();
+
+        while (i < json.Length) {
+            char c = json[i];
+
+            if (!inString) {
+                if (c == ']') break;
+                if (c == '"') { inString = true; sb.Length = 0; }
+                i++;
+                continue;
+            }
+
+            if (escape) {
+                escape = false;
+                switch (c) {
+                    case '"': sb.Append('"'); break;
+                    case '\\': sb.Append('\\'); break;
+                    case '/': sb.Append('/'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'u':
+                        if (i + 4 < json.Length) {
+                            try {
+                                string hex = json.Substring(i + 1, 4);
+                                int code = int.Parse(hex, System.Globalization.NumberStyles.HexNumber);
+                                sb.Append((char)code);
+                                i += 4;
+                            } catch { /* ignore invalid */ }
+                        }
+                        break;
+                    default:
+                        sb.Append(c);
+                        break;
+                }
+                i++;
+                continue;
+            }
+
+            if (c == '\\') { escape = true; i++; continue; }
+            if (c == '"') {
+                inString = false;
+                result.Add(sb.ToString());
+                i++;
+                continue;
+            }
+
+            sb.Append(c);
+            i++;
+        }
+
+        return result;
+    }
+
+    static string[] ExpandProcessNameVariantsStatic(string name) {
+        if (string.IsNullOrEmpty(name)) return new string[0];
+        string n = name.Trim();
+        if (n.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) n = n.Substring(0, n.Length - 4);
+        if (string.IsNullOrEmpty(n)) return new string[0];
+
+        // Keep list small: only a few high-signal variants to tolerate config/process-name mismatch.
+        HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        set.Add(n);
+        set.Add(n.ToLowerInvariant());
+
+        string dash = n.Replace(' ', '-');
+        if (!string.Equals(dash, n, StringComparison.Ordinal)) {
+            set.Add(dash);
+        }
+        set.Add(dash.ToLowerInvariant());
+
+        string[] arr = new string[set.Count];
+        set.CopyTo(arr);
+        return arr;
+    }
+
+    static string[] NormalizeAndExpandProcessNamesStatic(string[] processNames) {
+        if (processNames == null || processNames.Length == 0) return new string[0];
+        HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string name in processNames) {
+            string[] variants = ExpandProcessNameVariantsStatic(name);
+            foreach (string v in variants) {
+                if (!string.IsNullOrEmpty(v)) set.Add(v);
+            }
+        }
+        string[] arr = new string[set.Count];
+        set.CopyTo(arr);
+        return arr;
+    }
+
+    static string[] TryLoadClientProcessNamesFromConfigForWatcher() {
+        try {
+            string cfg = GetWatcherConfigFilePath();
+            if (!string.IsNullOrEmpty(cfg) && File.Exists(cfg)) {
+                string json = File.ReadAllText(cfg, Encoding.UTF8);
+                List<string> arr = ParseJsonStringArrayStatic(json, "clientProcessNames");
+                if (arr.Count > 0) return arr.ToArray();
+            }
+        } catch { /* ignore */ }
+        return DEFAULT_CLIENT_NAMES;
+    }
+
+    static bool IsAnyNamedProcessRunningStatic(string[] processNames) {
+        if (processNames == null || processNames.Length == 0) return false;
+        foreach (string name in processNames) {
+            if (string.IsNullOrEmpty(name)) continue;
+            try {
+                Process[] procs = Process.GetProcessesByName(name);
+                if (procs != null && procs.Length > 0) {
+                    foreach (var p in procs) p.Dispose();
+                    return true;
+                }
+                if (procs != null) foreach (var p in procs) p.Dispose();
+            } catch { /* ignore */ }
+        }
+        return false;
+    }
+
+    static bool IsGuardianRunningByMutexStatic() {
+        try {
+            using (Mutex m = Mutex.OpenExisting("ClashGuardianSingleInstance")) { }
+            return true;
+        } catch { return false; }
+    }
+
+    static void RunClashWatcherLoop() {
+        bool createdNew;
+        using (Mutex mutex = new Mutex(true, "ClashGuardianWatcherSingleInstance", out createdNew)) {
+            if (!createdNew) return;
+
+            EventWaitHandle stopEvent = null;
+            try {
+                stopEvent = new EventWaitHandle(false, EventResetMode.ManualReset, "ClashGuardianWatcherStopEvent");
+                stopEvent.Reset();
+            } catch { stopEvent = null; }
+
+            string exePath = "";
+            try { exePath = Application.ExecutablePath; }
+            catch {
+                try { exePath = Process.GetCurrentProcess().MainModule.FileName; }
+                catch { exePath = ""; }
+            }
+            if (string.IsNullOrEmpty(exePath)) return;
+
+            DateTime lastConfigReload = DateTime.MinValue;
+            string[] clientNames = NormalizeAndExpandProcessNamesStatic(DEFAULT_CLIENT_NAMES);
+            DateTime lastLaunchAttempt = DateTime.MinValue;
+
+            while (true) {
+                try {
+                    DateTime now = DateTime.Now;
+                    if ((now - lastConfigReload).TotalSeconds >= 30) {
+                        clientNames = NormalizeAndExpandProcessNamesStatic(TryLoadClientProcessNamesFromConfigForWatcher());
+                        lastConfigReload = now;
+                    }
+
+                    if (IsAnyNamedProcessRunningStatic(clientNames)) {
+                        if (!IsGuardianRunningByMutexStatic() && (now - lastLaunchAttempt).TotalSeconds >= 5) {
+                            try {
+                                ProcessStartInfo psi = new ProcessStartInfo(exePath, "--follow-clash");
+                                psi.UseShellExecute = false;
+                                psi.CreateNoWindow = true;
+                                try { psi.WorkingDirectory = Path.GetDirectoryName(exePath); } catch { /* ignore */ }
+                                Process.Start(psi);
+                            } catch { /* ignore */ }
+                            lastLaunchAttempt = now;
+                        }
+                    }
+                } catch { /* ignore */ }
+
+                try {
+                    if (stopEvent != null && stopEvent.WaitOne(500)) break;
+                } catch { Thread.Sleep(500); }
+            }
         }
     }
 }

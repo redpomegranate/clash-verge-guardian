@@ -15,6 +15,17 @@ public partial class ClashGuardian
     Icon _cachedAppIcon;
     ToolStripMenuItem disabledNodesMenu;
     ToolStripMenuItem preferredNodesMenu;
+    ToolStripMenuItem pauseDetectionMenuItem;
+
+    ToolStripDropDown disabledNodesDropDown;
+    ToolStripDropDown preferredNodesDropDown;
+    CheckedListBox disabledNodesListBox;
+    CheckedListBox preferredNodesListBox;
+    bool suppressDisabledNodesListEvent = false;
+    bool suppressPreferredNodesListEvent = false;
+
+    const int POPUP_WIDTH = 340;
+    const int POPUP_HEIGHT = 360;
     DateTime lastDisabledNodesMenuRefresh = DateTime.MinValue;
 
     Icon AppIcon {
@@ -79,7 +90,7 @@ public partial class ClashGuardian
         int btnSpacing = 10;
 
         restartBtn = CreateButton("立即重启", padding, y, btnWidth, btnHeight, () => ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")));
-        logBtn = CreateButton("查看数据", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, () => OpenFileInNotepad(dataFile, "监控数据"));
+        pauseBtn = CreateButton("暂停检测", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, ToggleDetectionPause);
         exitBtn = CreateButton("退出", padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight, () => { trayIcon.Visible = false; Application.Exit(); });
         y += btnHeight + 8;
 
@@ -110,7 +121,8 @@ public partial class ClashGuardian
                 }
             });
         });
-        Button autoStartBtn = CreateButton("开机自启", padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight, ToggleAutoStart);
+        followBtn = CreateButton(GetFollowClashButtonText(), padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight,
+            () => ThreadPool.QueueUserWorkItem(_ => ToggleFollowClashWatcher()));
 
         this.Controls.Add(statusLabel);
         this.Controls.Add(line1);
@@ -121,11 +133,11 @@ public partial class ClashGuardian
         this.Controls.Add(line2);
         this.Controls.Add(logLabel);
         this.Controls.Add(restartBtn);
-        this.Controls.Add(logBtn);
+        this.Controls.Add(pauseBtn);
         this.Controls.Add(exitBtn);
         this.Controls.Add(testBtn);
         this.Controls.Add(switchBtn);
-        this.Controls.Add(autoStartBtn);
+        this.Controls.Add(followBtn);
 
         this.Resize += delegate { if (this.WindowState == FormWindowState.Minimized) this.Hide(); };
     }
@@ -171,6 +183,9 @@ public partial class ClashGuardian
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Opening += delegate {
             try {
+                if (pauseDetectionMenuItem != null) {
+                    pauseDetectionMenuItem.Text = _isDetectionPaused ? "恢复检测" : "暂停检测";
+                }
                 if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds > 60) {
                     RefreshDisabledNodesMenuAsync(false);
                 }
@@ -178,32 +193,79 @@ public partial class ClashGuardian
         };
 
         menu.Items.Add("显示窗口", null, delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); });
-        menu.Items.Add("暂停自动操作 10分钟", null, delegate { PauseAutoActionsFor(10); });
-        menu.Items.Add("暂停自动操作 30分钟", null, delegate { PauseAutoActionsFor(30); });
-        menu.Items.Add("暂停自动操作 60分钟", null, delegate { PauseAutoActionsFor(60); });
-        menu.Items.Add("恢复自动操作", null, delegate { ResumeAutoActions(); });
+        pauseDetectionMenuItem = new ToolStripMenuItem("暂停检测");
+        pauseDetectionMenuItem.Click += delegate { ToggleDetectionPause(); };
+        menu.Items.Add(pauseDetectionMenuItem);
 
         menu.Items.Add(new ToolStripSeparator());
 
         menu.Items.Add("立即重启", null, delegate { ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")); });
-        menu.Items.Add("切换节点", null, delegate { ThreadPool.QueueUserWorkItem(_ => SwitchToBestNode()); });
+        menu.Items.Add("切换节点", null, delegate {
+            ThreadPool.QueueUserWorkItem(_ => {
+                try {
+                    if (SwitchToBestNode()) {
+                        this.BeginInvoke((Action)(() => { RefreshNodeDisplay(); Log("手动切换成功"); }));
+                    } else {
+                        this.BeginInvoke((Action)(() => Log("切换失败")));
+                    }
+                } catch (Exception ex) {
+                    Log("切换异常: " + ex.Message);
+                }
+            });
+        });
         menu.Items.Add("触发测速", null, delegate { TriggerDelayTest(); });
 
         disabledNodesMenu = new ToolStripMenuItem("禁用名单");
-        disabledNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
-        disabledNodesMenu.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem placeholder = new ToolStripMenuItem("无法获取节点列表");
-        placeholder.Enabled = false;
-        disabledNodesMenu.DropDownItems.Add(placeholder);
+        disabledNodesDropDown = CreateScrollableNodeDropDown(out disabledNodesListBox, "刷新列表", () => RefreshDisabledNodesMenuAsync(true));
+        disabledNodesMenu.DropDown = disabledNodesDropDown;
         menu.Items.Add(disabledNodesMenu);
 
         preferredNodesMenu = new ToolStripMenuItem("偏好节点");
-        preferredNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
-        preferredNodesMenu.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem placeholder2 = new ToolStripMenuItem("无法获取节点列表");
-        placeholder2.Enabled = false;
-        preferredNodesMenu.DropDownItems.Add(placeholder2);
+        preferredNodesDropDown = CreateScrollableNodeDropDown(out preferredNodesListBox, "刷新列表", () => RefreshDisabledNodesMenuAsync(true));
+        preferredNodesMenu.DropDown = preferredNodesDropDown;
         menu.Items.Add(preferredNodesMenu);
+
+        if (disabledNodesListBox != null) {
+            disabledNodesListBox.ItemCheck += (s, e) => {
+                if (suppressDisabledNodesListEvent) return;
+                int idx = e.Index;
+                if (!this.IsHandleCreated) return;
+                this.BeginInvoke((Action)(() => {
+                    try {
+                        if (suppressDisabledNodesListEvent) return;
+                        if (disabledNodesListBox == null) return;
+                        if (idx < 0 || idx >= disabledNodesListBox.Items.Count) return;
+                        NodeListItem it = disabledNodesListBox.Items[idx] as NodeListItem;
+                        if (it == null || string.IsNullOrEmpty(it.RawName)) return;
+                        bool disabled = disabledNodesListBox.GetItemChecked(idx);
+                        SetNodeDisabled(it.RawName, disabled);
+                    } catch (Exception ex) {
+                        Log("禁用名单操作失败: " + ex.Message);
+                    }
+                }));
+            };
+        }
+
+        if (preferredNodesListBox != null) {
+            preferredNodesListBox.ItemCheck += (s, e) => {
+                if (suppressPreferredNodesListEvent) return;
+                int idx = e.Index;
+                if (!this.IsHandleCreated) return;
+                this.BeginInvoke((Action)(() => {
+                    try {
+                        if (suppressPreferredNodesListEvent) return;
+                        if (preferredNodesListBox == null) return;
+                        if (idx < 0 || idx >= preferredNodesListBox.Items.Count) return;
+                        NodeListItem it = preferredNodesListBox.Items[idx] as NodeListItem;
+                        if (it == null || string.IsNullOrEmpty(it.RawName)) return;
+                        bool preferred = preferredNodesListBox.GetItemChecked(idx);
+                        SetNodePreferred(it.RawName, preferred);
+                    } catch (Exception ex) {
+                        Log("偏好节点操作失败: " + ex.Message);
+                    }
+                }));
+            };
+        }
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -234,8 +296,76 @@ public partial class ClashGuardian
         menu.Items.Add("退出", null, delegate { trayIcon.Visible = false; Application.Exit(); });
         trayIcon.ContextMenuStrip = menu;
 
+        if (s_followClashMode) {
+            InitializeFollowExitMonitor();
+        }
+
         // 启动后异步拉取一次节点列表，生成“禁用名单”子菜单
         RefreshDisabledNodesMenuAsync(true);
+    }
+
+    class NodeListItem {
+        public readonly string RawName;
+        public readonly string DisplayName;
+
+        public NodeListItem(string rawName, string displayName) {
+            RawName = rawName ?? "";
+            DisplayName = displayName ?? "";
+        }
+
+        public override string ToString() {
+            return DisplayName;
+        }
+    }
+
+    ToolStripDropDown CreateScrollableNodeDropDown(out CheckedListBox listBox, string refreshText, Action onRefresh) {
+        ToolStripDropDown dd = new ToolStripDropDown();
+        dd.AutoSize = false;
+        dd.Margin = Padding.Empty;
+        dd.Padding = Padding.Empty;
+
+        Panel panel = new Panel();
+        panel.Margin = Padding.Empty;
+        panel.Padding = new Padding(8);
+        panel.Size = new Size(POPUP_WIDTH, POPUP_HEIGHT);
+        panel.BackColor = SystemColors.Window;
+
+        Button refreshBtn = new Button();
+        refreshBtn.Text = string.IsNullOrEmpty(refreshText) ? "刷新列表" : refreshText;
+        refreshBtn.Location = new Point(8, 8);
+        refreshBtn.Size = new Size(POPUP_WIDTH - 16, 26);
+        refreshBtn.FlatStyle = FlatStyle.Flat;
+        refreshBtn.FlatAppearance.BorderSize = 0;
+        refreshBtn.BackColor = COLOR_BTN_BG;
+        refreshBtn.ForeColor = COLOR_BTN_FG;
+        refreshBtn.Cursor = Cursors.Hand;
+        refreshBtn.Click += delegate {
+            try { if (onRefresh != null) onRefresh(); }
+            catch (Exception ex) { Log("刷新列表失败: " + ex.Message); }
+        };
+
+        listBox = new CheckedListBox();
+        listBox.CheckOnClick = true;
+        listBox.IntegralHeight = false;
+        listBox.ScrollAlwaysVisible = true;
+        listBox.HorizontalScrollbar = true;
+        listBox.BorderStyle = BorderStyle.FixedSingle;
+        listBox.Location = new Point(8, 8 + 26 + 6);
+        listBox.Size = new Size(POPUP_WIDTH - 16, POPUP_HEIGHT - (8 + 26 + 6 + 8));
+        try { listBox.Font = new Font("Microsoft YaHei UI", 9); } catch { /* ignore */ }
+
+        panel.Controls.Add(refreshBtn);
+        panel.Controls.Add(listBox);
+
+        ToolStripControlHost host = new ToolStripControlHost(panel);
+        host.Margin = Padding.Empty;
+        host.Padding = Padding.Empty;
+        host.AutoSize = false;
+        host.Size = panel.Size;
+
+        dd.Items.Add(host);
+        dd.Size = panel.Size;
+        return dd;
     }
 
     void RefreshDisabledNodesMenuAsync(bool force) {
@@ -265,75 +395,62 @@ public partial class ClashGuardian
     }
 
     void BuildDisabledNodesMenu(List<string> nodes) {
-        if (disabledNodesMenu == null) return;
+        if (disabledNodesListBox == null) return;
 
-        disabledNodesMenu.DropDownItems.Clear();
-        disabledNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
-        disabledNodesMenu.DropDownItems.Add(new ToolStripSeparator());
+        suppressDisabledNodesListEvent = true;
+        try {
+            disabledNodesListBox.BeginUpdate();
+            disabledNodesListBox.Items.Clear();
 
-        if (nodes == null || nodes.Count == 0) {
-            ToolStripMenuItem empty = new ToolStripMenuItem("无法获取节点列表");
-            empty.Enabled = false;
-            disabledNodesMenu.DropDownItems.Add(empty);
-            return;
-        }
+            if (nodes == null || nodes.Count == 0) {
+                disabledNodesListBox.Enabled = false;
+                disabledNodesListBox.Items.Add(new NodeListItem("", "无法获取节点列表"));
+                return;
+            }
 
-        foreach (string node in nodes) {
-            if (string.IsNullOrEmpty(node)) continue;
-            ToolStripMenuItem mi = new ToolStripMenuItem(TruncateNodeName(SafeNodeName(node)));
-            mi.CheckOnClick = true;
-            mi.Tag = node;
-            mi.Checked = IsNodeDisabledForUi(node);
-            mi.Click += delegate {
-                try {
-                    OnToggleDisabledNode(mi);
-                } catch (Exception ex) {
-                    Log("禁用名单操作失败: " + ex.Message);
-                }
-            };
-            disabledNodesMenu.DropDownItems.Add(mi);
+            disabledNodesListBox.Enabled = true;
+            foreach (string node in nodes) {
+                if (string.IsNullOrEmpty(node)) continue;
+                string dn = SafeNodeName(node);
+                if (string.IsNullOrEmpty(dn)) dn = node;
+                NodeListItem item = new NodeListItem(node, dn);
+                int idx = disabledNodesListBox.Items.Add(item);
+                bool chk = IsNodeDisabledForUi(node);
+                try { disabledNodesListBox.SetItemChecked(idx, chk); } catch { /* ignore */ }
+            }
+        } finally {
+            try { disabledNodesListBox.EndUpdate(); } catch { /* ignore */ }
+            suppressDisabledNodesListEvent = false;
         }
     }
     void BuildPreferredNodesMenu(List<string> nodes) {
-        if (preferredNodesMenu == null) return;
+        if (preferredNodesListBox == null) return;
 
-        preferredNodesMenu.DropDownItems.Clear();
-        preferredNodesMenu.DropDownItems.Add("刷新列表", null, delegate { RefreshDisabledNodesMenuAsync(true); });
-        preferredNodesMenu.DropDownItems.Add(new ToolStripSeparator());
+        suppressPreferredNodesListEvent = true;
+        try {
+            preferredNodesListBox.BeginUpdate();
+            preferredNodesListBox.Items.Clear();
 
-        if (nodes == null || nodes.Count == 0) {
-            ToolStripMenuItem empty = new ToolStripMenuItem("无法获取节点列表");
-            empty.Enabled = false;
-            preferredNodesMenu.DropDownItems.Add(empty);
-            return;
+            if (nodes == null || nodes.Count == 0) {
+                preferredNodesListBox.Enabled = false;
+                preferredNodesListBox.Items.Add(new NodeListItem("", "无法获取节点列表"));
+                return;
+            }
+
+            preferredNodesListBox.Enabled = true;
+            foreach (string node in nodes) {
+                if (string.IsNullOrEmpty(node)) continue;
+                string dn = SafeNodeName(node);
+                if (string.IsNullOrEmpty(dn)) dn = node;
+                NodeListItem item = new NodeListItem(node, dn);
+                int idx = preferredNodesListBox.Items.Add(item);
+                bool chk = IsNodePreferredForUi(node);
+                try { preferredNodesListBox.SetItemChecked(idx, chk); } catch { /* ignore */ }
+            }
+        } finally {
+            try { preferredNodesListBox.EndUpdate(); } catch { /* ignore */ }
+            suppressPreferredNodesListEvent = false;
         }
-
-        foreach (string node in nodes) {
-            if (string.IsNullOrEmpty(node)) continue;
-            ToolStripMenuItem mi = new ToolStripMenuItem(TruncateNodeName(SafeNodeName(node)));
-            mi.CheckOnClick = true;
-            mi.Tag = node;
-            mi.Checked = IsNodePreferredForUi(node);
-            mi.Click += delegate {
-                try {
-                    OnTogglePreferredNode(mi);
-                } catch (Exception ex) {
-                    Log("偏好节点操作失败: " + ex.Message);
-                }
-            };
-            preferredNodesMenu.DropDownItems.Add(mi);
-        }
-    }
-
-    ToolStripMenuItem FindNodeMenuItem(ToolStripMenuItem menu, string nodeName) {
-        if (menu == null || string.IsNullOrEmpty(nodeName)) return null;
-        foreach (ToolStripItem tsi in menu.DropDownItems) {
-            ToolStripMenuItem mi = tsi as ToolStripMenuItem;
-            if (mi == null || mi.Tag == null) continue;
-            string tag = mi.Tag as string;
-            if (!string.IsNullOrEmpty(tag) && string.Equals(tag, nodeName, StringComparison.Ordinal)) return mi;
-        }
-        return null;
     }
 
     bool IsNodePreferredForUi(string nodeName) {
@@ -365,18 +482,53 @@ public partial class ClashGuardian
         return false;
     }
 
-    void OnToggleDisabledNode(ToolStripMenuItem clicked) {
-        if (clicked == null) return;
-        string nodeName = clicked.Tag as string;
+    int FindNodeIndexInList(CheckedListBox listBox, string nodeName) {
+        if (listBox == null || string.IsNullOrEmpty(nodeName)) return -1;
+        for (int i = 0; i < listBox.Items.Count; i++) {
+            NodeListItem it = listBox.Items[i] as NodeListItem;
+            if (it == null) continue;
+            if (string.Equals(it.RawName, nodeName, StringComparison.Ordinal)) return i;
+        }
+        return -1;
+    }
+
+    void SetPreferredListChecked(string nodeName, bool isChecked) {
+        if (preferredNodesListBox == null) return;
+        int idx = FindNodeIndexInList(preferredNodesListBox, nodeName);
+        if (idx < 0) return;
+
+        suppressPreferredNodesListEvent = true;
+        try {
+            bool cur = false;
+            try { cur = preferredNodesListBox.GetItemChecked(idx); } catch { /* ignore */ }
+            if (cur != isChecked) preferredNodesListBox.SetItemChecked(idx, isChecked);
+        } catch { /* ignore */ }
+        finally { suppressPreferredNodesListEvent = false; }
+    }
+
+    void SetDisabledListChecked(string nodeName, bool isChecked) {
+        if (disabledNodesListBox == null) return;
+        int idx = FindNodeIndexInList(disabledNodesListBox, nodeName);
+        if (idx < 0) return;
+
+        suppressDisabledNodesListEvent = true;
+        try {
+            bool cur = false;
+            try { cur = disabledNodesListBox.GetItemChecked(idx); } catch { /* ignore */ }
+            if (cur != isChecked) disabledNodesListBox.SetItemChecked(idx, isChecked);
+        } catch { /* ignore */ }
+        finally { suppressDisabledNodesListEvent = false; }
+    }
+
+    void SetNodeDisabled(string nodeName, bool disabled) {
         if (string.IsNullOrEmpty(nodeName)) return;
 
         // 禁用与偏好互斥：禁用时自动取消偏好
-        if (clicked.Checked) {
+        if (disabled) {
             bool removedPref = false;
             lock (preferredNodesLock) { removedPref = preferredNodes.Remove(nodeName); }
             if (removedPref) ThreadPool.QueueUserWorkItem(_ => SavePreferredNodes());
-            ToolStripMenuItem pm = FindNodeMenuItem(preferredNodesMenu, nodeName);
-            if (pm != null) pm.Checked = false;
+            SetPreferredListChecked(nodeName, false);
         }
 
         // 第一次在 UI 上修改时，将关键字模式“实体化”为显示名单 (disabledNodes)
@@ -384,53 +536,57 @@ public partial class ClashGuardian
             disabledNodesExplicitMode = true;
             lock (disabledNodesLock) {
                 disabledNodes.Clear();
-                foreach (ToolStripItem tsi in disabledNodesMenu.DropDownItems) {
-                    ToolStripMenuItem mi = tsi as ToolStripMenuItem;
-                    if (mi == null || mi.Tag == null) continue;
-                    if (mi.Checked) {
-                        string n = mi.Tag as string;
-                        if (!string.IsNullOrEmpty(n)) disabledNodes.Add(n);
+                if (disabledNodesListBox != null) {
+                    foreach (object obj in disabledNodesListBox.CheckedItems) {
+                        NodeListItem it = obj as NodeListItem;
+                        if (it == null || string.IsNullOrEmpty(it.RawName)) continue;
+                        disabledNodes.Add(it.RawName);
                     }
                 }
             }
+
+            // 明确禁用名单后，确保其不包含偏好节点
+            lock (preferredNodesLock) {
+                lock (disabledNodesLock) {
+                    foreach (string pn in preferredNodes) {
+                        if (!string.IsNullOrEmpty(pn)) disabledNodes.Remove(pn);
+                    }
+                }
+            }
+
             ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
-            Log((clicked.Checked ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
+            Log((disabled ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
             return;
         }
 
         lock (disabledNodesLock) {
-            if (clicked.Checked) disabledNodes.Add(nodeName);
+            if (disabled) disabledNodes.Add(nodeName);
             else disabledNodes.Remove(nodeName);
         }
         ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
-        Log((clicked.Checked ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
+        Log((disabled ? "禁用: " : "取消禁用: ") + SafeNodeName(nodeName));
     }
 
-    void OnTogglePreferredNode(ToolStripMenuItem clicked) {
-        if (clicked == null) return;
-        string nodeName = clicked.Tag as string;
+    void SetNodePreferred(string nodeName, bool preferred) {
         if (string.IsNullOrEmpty(nodeName)) return;
 
         // 偏好与禁用互斥：设置偏好时自动取消禁用（显式禁用则移除；关键字禁用则由偏好覆盖）
-        if (clicked.Checked) {
+        if (preferred && disabledNodesExplicitMode) {
             bool removedDisabled = false;
-            if (disabledNodesExplicitMode) {
-                lock (disabledNodesLock) { removedDisabled = disabledNodes.Remove(nodeName); }
-                if (removedDisabled) ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
-            }
+            lock (disabledNodesLock) { removedDisabled = disabledNodes.Remove(nodeName); }
+            if (removedDisabled) ThreadPool.QueueUserWorkItem(_ => SaveDisabledNodes());
         }
 
         lock (preferredNodesLock) {
-            if (clicked.Checked) preferredNodes.Add(nodeName);
+            if (preferred) preferredNodes.Add(nodeName);
             else preferredNodes.Remove(nodeName);
         }
         ThreadPool.QueueUserWorkItem(_ => SavePreferredNodes());
 
-        // 同步 UI：禁用菜单勾选状态按最新规则刷新
-        ToolStripMenuItem dm = FindNodeMenuItem(disabledNodesMenu, nodeName);
-        if (dm != null) dm.Checked = IsNodeDisabledForUi(nodeName);
+        // 同步 UI：禁用勾选状态按最新规则刷新（关键字模式下偏好可覆盖 excludeRegions）
+        SetDisabledListChecked(nodeName, IsNodeDisabledForUi(nodeName));
 
-        Log((clicked.Checked ? "偏好: " : "取消偏好: " ) + SafeNodeName(nodeName));
+        Log((preferred ? "偏好: " : "取消偏好: " ) + SafeNodeName(nodeName));
     }
 
     void OpenFileInNotepad(string path, string label) {
@@ -443,46 +599,241 @@ public partial class ClashGuardian
         }
     }
 
-    void PauseAutoActionsFor(int minutes) {
-        if (minutes <= 0) return;
-        pauseAutoActionsUntil = DateTime.Now.AddMinutes(minutes);
-        lastSuppressedActionLog = DateTime.MinValue;
-        try { if (timer != null) timer.Interval = normalInterval; } catch { /* ignore */ }
-        Log("已暂停自动操作 " + minutes + "分钟");
+    void ToggleDetectionPause() {
+        try {
+            if (!this.IsHandleCreated) return;
+            if (this.InvokeRequired) {
+                this.BeginInvoke((Action)(() => ToggleDetectionPause()));
+                return;
+            }
+
+            if (_isDetectionPaused) ResumeDetectionUi();
+            else PauseDetectionUi();
+        } catch { /* ignore */ }
     }
 
-    void ResumeAutoActions() {
-        pauseAutoActionsUntil = DateTime.MinValue;
-        lastSuppressedActionLog = DateTime.MinValue;
+    void PauseDetectionUi() {
+        _isDetectionPaused = true;
+        try { if (timer != null) timer.Stop(); } catch { /* ignore */ }
+
+        try { if (pauseBtn != null) pauseBtn.Text = "恢复检测"; } catch { /* ignore */ }
+        try { if (pauseDetectionMenuItem != null) pauseDetectionMenuItem.Text = "恢复检测"; } catch { /* ignore */ }
+
+        try {
+            statusLabel.Text = "● 状态: 暂停检测";
+            statusLabel.ForeColor = COLOR_WARNING;
+        } catch { /* ignore */ }
+
+        try { if (trayIcon != null) trayIcon.Text = "暂停检测"; } catch { /* ignore */ }
+        Log("已暂停检测");
+    }
+
+    void ResumeDetectionUi() {
+        _isDetectionPaused = false;
         failCount = 0;
         consecutiveOK = 0;
+        cooldownCount = 0;
         lastStableTime = DateTime.Now;
-        try { if (timer != null) timer.Interval = normalInterval; } catch { /* ignore */ }
-        Log("已恢复自动操作");
+
+        try {
+            if (timer != null) {
+                timer.Interval = effectiveNormalInterval;
+                timer.Start();
+            }
+        } catch { /* ignore */ }
+
+        try { if (pauseBtn != null) pauseBtn.Text = "暂停检测"; } catch { /* ignore */ }
+        try { if (pauseDetectionMenuItem != null) pauseDetectionMenuItem.Text = "暂停检测"; } catch { /* ignore */ }
+
+        try {
+            statusLabel.Text = "● 状态: 运行中";
+            statusLabel.ForeColor = COLOR_OK;
+        } catch { /* ignore */ }
+
+        try { if (trayIcon != null) trayIcon.Text = "恢复检测"; } catch { /* ignore */ }
+        RefreshNodeDisplay();
+        Log("已恢复检测");
     }
 
-    void ToggleAutoStart() {
-        try {
-            string appPath = Application.ExecutablePath;
-            string keyName = "ClashGuardian";
-            RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true);
+    const string FOLLOW_TASK_NAME = "ClashGuardianFollowClashWatcher";
+    const string FOLLOW_RUN_VALUE = "ClashGuardianFollowClashWatcher";
+    const string LEGACY_RUN_VALUE = "ClashGuardian";
 
-            if (rk.GetValue(keyName) != null) {
-                rk.DeleteValue(keyName, false);
-                Log("已关闭开机自启");
-            } else {
-                rk.SetValue(keyName, "\"" + appPath + "\"");
-                Log("已启用开机自启");
+    string GetFollowClashButtonText() {
+        return IsFollowClashWatcherEnabled() ? "取消跟随" : "跟随 Clash";
+    }
+
+    bool IsFollowClashWatcherEnabled() {
+        return IsScheduledTaskPresent(FOLLOW_TASK_NAME) || IsRunKeyPresent(FOLLOW_RUN_VALUE);
+    }
+
+    bool IsRunKeyPresent(string valueName) {
+        try {
+            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false)) {
+                if (rk == null) return false;
+                return rk.GetValue(valueName) != null;
             }
-            rk.Close();
-        } catch (Exception ex) {
-            Log("自启设置失败: " + ex.Message);
+        } catch { return false; }
+    }
+
+    void RemoveRunKeyValueIfMatches(string valueName, string exePath) {
+        try {
+            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true)) {
+                if (rk == null) return;
+                object v = rk.GetValue(valueName);
+                string sv = v as string;
+                if (v == null) return;
+                if (string.IsNullOrEmpty(exePath)) { rk.DeleteValue(valueName, false); return; }
+                if (!string.IsNullOrEmpty(sv) && sv.IndexOf(exePath, StringComparison.OrdinalIgnoreCase) >= 0) {
+                    rk.DeleteValue(valueName, false);
+                }
+            }
+        } catch { /* ignore */ }
+    }
+
+    bool IsScheduledTaskPresent(string taskName) {
+        try {
+            int code = RunProcessHidden("schtasks.exe", "/Query /TN \"" + taskName + "\"");
+            return code == 0;
+        } catch { return false; }
+    }
+
+    int RunProcessHidden(string fileName, string arguments) {
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo(fileName, arguments);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = System.Text.Encoding.Default;
+            psi.StandardErrorEncoding = System.Text.Encoding.Default;
+
+            using (Process p = Process.Start(psi)) {
+                try { p.WaitForExit(8000); } catch { /* ignore */ }
+                try { if (!p.HasExited) p.Kill(); } catch { /* ignore */ }
+                try { if (!p.HasExited) return -1; } catch { /* ignore */ }
+                return p.ExitCode;
+            }
+        } catch { return -1; }
+    }
+
+    void ToggleFollowClashWatcher() {
+        string exePath = "";
+        try { exePath = Application.ExecutablePath; } catch { exePath = ""; }
+
+        bool enabled = IsFollowClashWatcherEnabled();
+        if (enabled) {
+            // Disable: delete task + remove run key fallback
+            try { RunProcessHidden("schtasks.exe", "/Delete /F /TN \"" + FOLLOW_TASK_NAME + "\""); } catch { /* ignore */ }
+            try { RemoveRunKeyValueIfMatches(FOLLOW_RUN_VALUE, ""); } catch { /* ignore */ }
+            try { RemoveRunKeyValueIfMatches(LEGACY_RUN_VALUE, exePath); } catch { /* ignore */ }
+            try { SignalWatcherStop(); } catch { /* ignore */ }
+            Log("已关闭跟随 Clash");
+        } else {
+            // Enable: prefer scheduled task; fallback to HKCU\\Run
+            bool created = false;
+            try {
+                string runAs = Environment.UserDomainName + "\\" + Environment.UserName;
+                string tr = "\"\\\"" + exePath + "\\\" --watch-clash\"";
+                string args = "/Create /F /SC ONLOGON /RL LIMITED /RU \"" + runAs + "\" /NP /TN \"" + FOLLOW_TASK_NAME + "\" /TR " + tr;
+                created = RunProcessHidden("schtasks.exe", args) == 0;
+            } catch { created = false; }
+
+            if (created) {
+                // Avoid duplicates from legacy autorun keys
+                try { RemoveRunKeyValueIfMatches(FOLLOW_RUN_VALUE, ""); } catch { /* ignore */ }
+                try { RemoveRunKeyValueIfMatches(LEGACY_RUN_VALUE, exePath); } catch { /* ignore */ }
+                Log("已启用跟随 Clash (计划任务)");
+            } else {
+                try {
+                    using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true)) {
+                        if (rk != null) {
+                            rk.SetValue(FOLLOW_RUN_VALUE, "\"" + exePath + "\" --watch-clash");
+                        }
+                    }
+                    try { RemoveRunKeyValueIfMatches(LEGACY_RUN_VALUE, exePath); } catch { /* ignore */ }
+                    Log("已启用跟随 Clash (注册表自启)");
+                } catch (Exception ex) {
+                    Log("跟随 Clash 设置失败: " + ex.Message);
+                }
+            }
+
+            // Make it effective immediately (no need to wait next logon)
+            try { StartWatcherNow(exePath); } catch { /* ignore */ }
         }
+
+        try {
+            if (!this.IsHandleCreated) return;
+            this.BeginInvoke((Action)(() => {
+                try { if (followBtn != null) followBtn.Text = GetFollowClashButtonText(); } catch { /* ignore */ }
+            }));
+        } catch { /* ignore */ }
+    }
+
+    const string WATCHER_STOP_EVENT = "ClashGuardianWatcherStopEvent";
+
+    void SignalWatcherStop() {
+        try {
+            using (EventWaitHandle e = new EventWaitHandle(false, EventResetMode.ManualReset, WATCHER_STOP_EVENT)) {
+                e.Set();
+            }
+        } catch { /* ignore */ }
+    }
+
+    void StartWatcherNow(string exePath) {
+        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo(exePath, "--watch-clash");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.WorkingDirectory = Path.GetDirectoryName(exePath); } catch { /* ignore */ }
+            Process.Start(psi);
+        } catch { /* ignore */ }
+    }
+
+    void InitializeFollowExitMonitor() {
+        try {
+            if (followExitTimer != null) return;
+            followExitTimer = new System.Windows.Forms.Timer();
+            followExitTimer.Interval = 1000;
+            followExitTimer.Tick += delegate {
+                try {
+                    if (_isRestarting) { followMissingSince = DateTime.MinValue; return; }
+                    if (IsAnyClientProcessRunning()) { followMissingSince = DateTime.MinValue; return; }
+
+                    if (followMissingSince == DateTime.MinValue) followMissingSince = DateTime.Now;
+                    if ((DateTime.Now - followMissingSince).TotalSeconds < 5) return;
+
+                    try { if (trayIcon != null) trayIcon.Visible = false; } catch { /* ignore */ }
+                    try { Application.Exit(); } catch { /* ignore */ }
+                } catch { /* ignore */ }
+            };
+            followExitTimer.Start();
+        } catch { /* ignore */ }
+    }
+
+    bool IsAnyClientProcessRunning() {
+        string[] names = (clientProcessNamesExpanded != null && clientProcessNamesExpanded.Length > 0)
+            ? clientProcessNamesExpanded
+            : clientProcessNames;
+        if (names == null || names.Length == 0) return false;
+        foreach (string name in names) {
+            if (string.IsNullOrEmpty(name)) continue;
+            try {
+                Process[] procs = Process.GetProcessesByName(name);
+                if (procs != null && procs.Length > 0) {
+                    foreach (var p in procs) p.Dispose();
+                    return true;
+                }
+                if (procs != null) foreach (var p in procs) p.Dispose();
+            } catch { /* ignore */ }
+        }
+        return false;
     }
 
     // 刷新节点和统计显示（UI 线程调用）
     void RefreshNodeDisplay() {
-        string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "获取中..." : currentNode;
+        string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "获取中..." : SafeNodeName(currentNode);
         int dl = Thread.VolatileRead(ref lastDelay);
         string delayStr = dl > 0 ? dl + "ms" : "--";
         proxyLabel.Text = "代  理:  OK " + delayStr + " | " + TruncateNodeName(nodeDisplay);

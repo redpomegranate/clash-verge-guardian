@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Collections.Generic;
@@ -49,6 +50,22 @@ public partial class ClashGuardian
             File.AppendAllText(dataFile, line);
         } catch { /* 数据日志写入失败不影响程序运行 */ }
     }
+
+    // 周期性采样节流（提速后改为按时间触发，避免频率失控）
+    DateTime lastTcpStatsAt = DateTime.MinValue;
+    DateTime lastDelayTestAt = DateTime.MinValue;
+    DateTime lastNodeRefreshAt = DateTime.MinValue;
+
+    // 应急/激进策略节流与统计（ticks 用于 Interlocked）
+    long lastRestartTicks = 0;
+    long lastEmergencyTicks = 0;
+    long prevProxyTimeoutRestartTicks = 0;
+    long lastProxyTimeoutRestartTicks = 0;
+    int cooldownProxyFailStreak = 0;
+
+    // 禁止自动重启/启动客户端时，用于抑制后续激进行为（避免反复打扰/弹窗风险）
+    volatile bool manualClientInterventionRequired = false;
+    long lastManualInterventionLogTicks = 0;
 
     void CleanOldLogs() {
         try {
@@ -165,6 +182,9 @@ public partial class ClashGuardian
             sb.AppendLine("clashApi=" + clashApi);
             sb.AppendLine("proxyPort=" + proxyPort);
             sb.AppendLine("normalInterval=" + normalInterval);
+            sb.AppendLine("speedFactor=" + speedFactor);
+            sb.AppendLine("effectiveNormalInterval=" + effectiveNormalInterval);
+            sb.AppendLine("effectiveFastInterval=" + effectiveFastInterval);
             sb.AppendLine("memoryWarning=" + memoryWarning);
             sb.AppendLine("memoryThreshold=" + memoryThreshold);
             sb.AppendLine("highDelayThreshold=" + highDelayThreshold);
@@ -186,8 +206,7 @@ public partial class ClashGuardian
             sb.AppendLine("failCount=" + failCount);
             sb.AppendLine("cooldownCount=" + cooldownCount);
             sb.AppendLine("isRestarting=" + _isRestarting);
-            sb.AppendLine("autoActionsPaused=" + IsAutoActionsPaused);
-            if (IsAutoActionsPaused) sb.AppendLine("pauseRemaining=" + FormatTimeSpan(GetAutoActionsPauseRemaining()));
+            sb.AppendLine("detectionPaused=" + _isDetectionPaused);
 
             try { File.WriteAllText(Path.Combine(dir, "summary.txt"), sb.ToString(), Encoding.UTF8); }
             catch { /* summary 写入失败可忽略 */ }
@@ -260,7 +279,7 @@ public partial class ClashGuardian
     }
 
     // ==================== 重启管理 ====================
-    void RestartClash(string reason, bool forceRestartClient = false) {
+    void RestartClash(string reason, bool forceRestartClient = false, string eventName = "") {
         // 防止并发重启（手动+自动 或 多次自动）
         lock (restartLock) {
             if (_isRestarting) return;
@@ -268,6 +287,31 @@ public partial class ClashGuardian
         }
 
         try {
+            if (string.Equals(eventName, "ProxyTimeout", StringComparison.Ordinal)) {
+                long nowTicks = DateTime.Now.Ticks;
+                long prevLast = Interlocked.Exchange(ref lastProxyTimeoutRestartTicks, nowTicks);
+                if (prevLast > 0) Interlocked.Exchange(ref prevProxyTimeoutRestartTicks, prevLast);
+            }
+
+            bool clientRunning = true;
+            try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+            if (!clientRunning) {
+                // 用户主动退出/关闭客户端时，不干涉，不尝试拉起 Clash。
+                manualClientInterventionRequired = false;
+                try {
+                    if (this.IsHandleCreated) {
+                        this.BeginInvoke((Action)(() => {
+                            statusLabel.Text = "● 状态: 等待 Clash...";
+                            statusLabel.ForeColor = COLOR_WARNING;
+                            try { if (trayIcon != null) trayIcon.Text = "等待 Clash"; } catch { /* ignore */ }
+                        }));
+                    }
+                } catch { /* ignore */ }
+                Log("重启被抑制: 未检测到 Clash 客户端");
+                return;
+            }
+
+            Interlocked.Exchange(ref lastRestartTicks, DateTime.Now.Ticks);
             Log("重启: " + reason);
             Interlocked.Increment(ref totalRestarts);
 
@@ -308,53 +352,92 @@ public partial class ClashGuardian
                 } catch { /* 探测失败可忽略 */ }
             }
 
+            bool needRestartClient = forceRestartClient;
             if (coreBack && !forceRestartClient) {
-                Log("内核已自动恢复");
-            } else {
-                // ===== 第 4 步：内核未恢复，或需要强制重启客户端（例如切换订阅后生效） =====
-                if (forceRestartClient) Log("强制重启客户端");
-                else Log("内核未自动恢复，重启客户端");
+                // 仅检测到进程存在并不足以说明网络恢复，增加代理可用性验证
+                if (WaitForProxyRecovery(6000)) {
+                    manualClientInterventionRequired = false;
+                    Log("内核已自动恢复");
+                } else {
+                    Log("内核已自动恢复但代理未恢复，升级为重启客户端");
+                    needRestartClient = true;
+                }
+            }
 
-                // 先终止客户端
-                foreach (string clientName in clientProcessNames) {
+            if (!coreBack || needRestartClient) {
+                if (!allowAutoStartClient) {
+                    // 默认静音策略：禁止自动启动/重启客户端（避免弹出 UI 干扰用户）
+                    manualClientInterventionRequired = true;
+
                     try {
-                        Process[] procs = Process.GetProcessesByName(clientName);
-                        foreach (var p in procs) {
-                            try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); }
-                            catch { /* 进程可能已退出 */ }
-                            p.Dispose();
+                        long nowTicks2 = DateTime.Now.Ticks;
+                        long lastTicks2 = Interlocked.Read(ref lastManualInterventionLogTicks);
+                        if (lastTicks2 <= 0 || (new TimeSpan(nowTicks2 - lastTicks2)).TotalSeconds >= 60) {
+                            Interlocked.Exchange(ref lastManualInterventionLogTicks, nowTicks2);
+                            Log("需要手动重启 Clash 客户端 (allowAutoStartClient=false)");
                         }
-                    } catch { /* 客户端终止失败可忽略 */ }
-                }
+                    } catch { /* ignore */ }
 
-                Thread.Sleep(1000);
+                    try {
+                        if (this.IsHandleCreated) {
+                            this.BeginInvoke((Action)(() => {
+                                statusLabel.Text = "● 状态: 需要手动重启 Clash";
+                                statusLabel.ForeColor = COLOR_ERROR;
+                                try { if (trayIcon != null) trayIcon.Text = "需要手动重启 Clash"; } catch { /* ignore */ }
+                            }));
+                        }
+                    } catch { /* ignore */ }
+                } else {
+                    manualClientInterventionRequired = false;
 
-                // 启动客户端（客户端会自动启动内核）
-                string clientPath = detectedClientPath; // volatile read
-                bool started = false;
+                    // ===== 第 4 步：内核未恢复，或需要强制重启客户端（例如切换订阅后生效） =====
+                    if (needRestartClient) Log("强制重启客户端");
+                    else Log("内核未自动恢复，重启客户端");
 
-                if (!string.IsNullOrEmpty(clientPath) && File.Exists(clientPath)) {
-                    started = StartClientProcess(clientPath);
-                }
+                    // 先终止客户端
+                    string[] killNames = (clientProcessNamesExpanded != null && clientProcessNamesExpanded.Length > 0)
+                        ? clientProcessNamesExpanded
+                        : clientProcessNames;
+                    foreach (string clientName in killNames) {
+                        try {
+                            Process[] procs = Process.GetProcessesByName(clientName);
+                            foreach (var p in procs) {
+                                try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); }
+                                catch { /* 进程可能已退出 */ }
+                                p.Dispose();
+                            }
+                        } catch { /* 客户端终止失败可忽略 */ }
+                    }
 
-                // 如果已知路径无效，尝试默认路径
-                if (!started) {
-                    foreach (string path in clientPaths) {
-                        if (File.Exists(path)) {
-                            started = StartClientProcess(path);
-                            if (started) { detectedClientPath = path; break; }
+                    Thread.Sleep(1000);
+
+                    // 启动客户端（客户端会自动启动内核）
+                    string clientPath = detectedClientPath; // volatile read
+                    bool started = false;
+
+                    if (!string.IsNullOrEmpty(clientPath) && File.Exists(clientPath)) {
+                        started = StartClientProcess(clientPath);
+                    }
+
+                    // 如果已知路径无效，尝试默认路径
+                    if (!started) {
+                        foreach (string path in clientPaths) {
+                            if (File.Exists(path)) {
+                                started = StartClientProcess(path);
+                                if (started) { detectedClientPath = path; break; }
+                            }
                         }
                     }
-                }
 
-                if (!started) {
-                    Log("未找到客户端路径，无法恢复");
-                } else {
-                    // 等待客户端启动内核
-                    Thread.Sleep(5000);
-                }
+                    if (!started) {
+                        Log("未找到客户端路径，无法恢复");
+                    } else {
+                        // 等待客户端启动内核
+                        Thread.Sleep(5000);
+                    }
 
-                DetectRunningCore();
+                    DetectRunningCore();
+                }
             }
 
             // ===== 第 5 步：设置冷却期 =====
@@ -363,11 +446,214 @@ public partial class ClashGuardian
                     failCount = 0;
                     consecutiveOK = 0;
                     cooldownCount = COOLDOWN_COUNT;
-                    timer.Interval = normalInterval;
+                    timer.Interval = effectiveNormalInterval;
                 }));
             }
         } finally {
             _isRestarting = false;
+        }
+    }
+
+    bool WaitForProxyRecovery(int maxWaitMs) {
+        if (maxWaitMs <= 0) return false;
+        int waited = 0;
+        while (waited < maxWaitMs) {
+            bool ok = false;
+            try { TestProxy(out ok, true); } catch { ok = false; }
+            if (ok) return true;
+
+            int sleep = 1000;
+            if (waited + sleep > maxWaitMs) sleep = maxWaitMs - waited;
+            if (sleep <= 0) break;
+            Thread.Sleep(sleep);
+            waited += sleep;
+        }
+        return false;
+    }
+
+    enum EmergencyAction {
+        None,
+        RestartClient,
+        RestartCore,
+        RediscoverApi,
+        ClearBlacklistAndSwitch,
+    }
+
+    struct EmergencySnapshot {
+        public string Trigger;
+        public bool CoreRunning;
+        public bool ApiOk;
+        public bool ProxyOk;
+        public bool ProxyPortOk;
+        public double MemMB;
+        public int Handles;
+        public string SelectorGroup;
+        public string Node;
+    }
+
+    bool IsLocalPortOpen(int port, int timeoutMs) {
+        try {
+            using (TcpClient c = new TcpClient()) {
+                IAsyncResult ar = c.BeginConnect("127.0.0.1", port, null, null);
+                WaitHandle wh = ar.AsyncWaitHandle;
+                try {
+                    if (!wh.WaitOne(timeoutMs)) return false;
+                    try { c.EndConnect(ar); } catch { /* ignore */ }
+                    return c.Connected;
+                } finally {
+                    try { wh.Close(); } catch { /* ignore */ }
+                }
+            }
+        } catch { return false; }
+    }
+
+    EmergencySnapshot TakeEmergencySnapshot(string trigger) {
+        EmergencySnapshot s = new EmergencySnapshot();
+        s.Trigger = trigger ?? "";
+        s.MemMB = 0;
+        s.Handles = 0;
+        s.SelectorGroup = "";
+        s.Node = "";
+
+        try {
+            double mem; int handles;
+            s.CoreRunning = GetMihomoStats(out mem, out handles);
+            s.MemMB = mem;
+            s.Handles = handles;
+        } catch { s.CoreRunning = false; }
+
+        try {
+            string v = ApiRequest("/version", API_TIMEOUT_FAST);
+            s.ApiOk = !string.IsNullOrEmpty(v);
+        } catch { s.ApiOk = false; }
+
+        try { s.ProxyPortOk = IsLocalPortOpen(proxyPort, 200); }
+        catch { s.ProxyPortOk = false; }
+
+        try {
+            bool ok;
+            TestProxy(out ok, true);
+            s.ProxyOk = ok;
+        } catch { s.ProxyOk = false; }
+
+        try {
+            string json = ApiRequest("/proxies", API_TIMEOUT_FAST);
+            if (!string.IsNullOrEmpty(json)) {
+                string group = FindSelectorGroup(json);
+                s.SelectorGroup = group;
+                string node = ResolveActualNode(json, string.IsNullOrEmpty(group) ? "GLOBAL" : group, 0);
+                s.Node = node;
+            }
+        } catch { /* ignore */ }
+
+        return s;
+    }
+
+    EmergencyAction DecideEmergencyAction(EmergencySnapshot s) {
+        if (!s.CoreRunning) return EmergencyAction.None;
+
+        // core 在但 proxyPort 不通：优先重启内核
+        if (!s.ProxyPortOk) return EmergencyAction.RestartCore;
+
+        // API 不可达：先尝试重新发现端口
+        if (!s.ApiOk) return EmergencyAction.RediscoverApi;
+
+        if (!s.ProxyOk) {
+            // 连续重启仍不恢复：尝试清空黑名单+切节点（需要历史延迟）
+            long last = Interlocked.Read(ref lastProxyTimeoutRestartTicks);
+            long prev = Interlocked.Read(ref prevProxyTimeoutRestartTicks);
+            if (last > 0 && prev > 0) {
+                try {
+                    if ((new TimeSpan(last - prev)).TotalMinutes <= 10) {
+                        return EmergencyAction.ClearBlacklistAndSwitch;
+                    }
+                } catch { /* ignore */ }
+            }
+
+            // 刚发生过一次重启仍不恢复：升级为重启客户端
+            long rt = Interlocked.Read(ref lastRestartTicks);
+            if (rt > 0) {
+                try {
+                    if ((DateTime.Now - new DateTime(rt)).TotalMinutes < 2) return EmergencyAction.RestartClient;
+                } catch { /* ignore */ }
+            }
+            return EmergencyAction.RestartCore;
+        }
+
+        return EmergencyAction.None;
+    }
+
+    void RunEmergency(string trigger) {
+        if (_isRestarting) return;
+        if (manualClientInterventionRequired) return;
+
+        // 客户端不在时不干涉（避免误判导致启动/重启 Clash）
+        bool clientRunning = true;
+        try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+        if (!clientRunning) return;
+
+        long nowTicks = DateTime.Now.Ticks;
+        long last = Interlocked.Read(ref lastEmergencyTicks);
+        try {
+            if (last > 0 && (new TimeSpan(nowTicks - last)).TotalSeconds < 60) return;
+        } catch { /* ignore */ }
+        Interlocked.Exchange(ref lastEmergencyTicks, nowTicks);
+
+        EmergencySnapshot s = TakeEmergencySnapshot(trigger);
+        try {
+            Log("应急: trigger=" + s.Trigger +
+                " core=" + (s.CoreRunning ? 1 : 0) +
+                " api=" + (s.ApiOk ? 1 : 0) +
+                " proxyPort=" + (s.ProxyPortOk ? 1 : 0) +
+                " proxyOK=" + (s.ProxyOk ? 1 : 0) +
+                " group=" + SafeNodeName(s.SelectorGroup) +
+                " node=" + SafeNodeName(s.Node));
+        } catch { /* ignore */ }
+
+        EmergencyAction act = DecideEmergencyAction(s);
+        if (act == EmergencyAction.None) return;
+
+        if (!allowAutoStartClient && act == EmergencyAction.RestartClient) {
+            // 默认静音策略：禁止自动重启客户端（可能弹出 UI），降级为 core 级动作。
+            act = EmergencyAction.RestartCore;
+        }
+
+        if (act == EmergencyAction.RediscoverApi) {
+            try {
+                AutoDiscoverApi();
+                string v = ApiRequest("/version", API_TIMEOUT_FAST);
+                if (!string.IsNullOrEmpty(v)) return;
+            } catch { /* ignore */ }
+            act = EmergencyAction.RestartClient;
+        }
+
+        if (!allowAutoStartClient && act == EmergencyAction.RestartClient) {
+            act = EmergencyAction.RestartCore;
+        }
+
+        if (act == EmergencyAction.RestartClient) {
+            ThreadPool.QueueUserWorkItem(_ => RestartClash("应急: 代理未恢复", true));
+            return;
+        }
+
+        if (act == EmergencyAction.RestartCore) {
+            ThreadPool.QueueUserWorkItem(_ => RestartClash("应急: 代理异常"));
+            return;
+        }
+
+        if (act == EmergencyAction.ClearBlacklistAndSwitch) {
+            ThreadPool.QueueUserWorkItem(_ => {
+                try {
+                    ClearBlacklist();
+                    TriggerDelayTest();
+                    if (SwitchToBestNode()) {
+                        this.BeginInvoke((Action)(() => { failCount = 0; RefreshNodeDisplay(); }));
+                    }
+                } catch (Exception ex) {
+                    Log("应急切换异常: " + ex.Message);
+                }
+            });
+            return;
         }
     }
 
@@ -386,20 +672,16 @@ public partial class ClashGuardian
 
     // ==================== 检测循环 ====================
     void AdjustInterval(bool hasIssue) {
-        if (IsAutoActionsPaused) {
-            // 暂停自动操作期间，固定使用 normalInterval，避免异常导致 1s 频率刷屏
-            if (timer.Interval != normalInterval) timer.Interval = normalInterval;
-            return;
-        }
         if (hasIssue) {
-            timer.Interval = fastInterval;
+            timer.Interval = effectiveFastInterval;
             consecutiveOK = 0;
-        } else if (consecutiveOK >= CONSECUTIVE_OK_THRESHOLD && timer.Interval != normalInterval) {
-            timer.Interval = normalInterval;
+        } else if (consecutiveOK >= CONSECUTIVE_OK_THRESHOLD && timer.Interval != effectiveNormalInterval) {
+            timer.Interval = effectiveNormalInterval;
         }
     }
 
     void CheckStatus(object sender, EventArgs e) {
+        if (_isDetectionPaused) return; // 暂停检测期间不运行检查
         if (_isRestarting) return; // 重启进行中，跳过本轮检测
         if (Interlocked.CompareExchange(ref _isChecking, 1, 0) != 0) return;
         if (cooldownCount > 0) {
@@ -419,14 +701,45 @@ public partial class ClashGuardian
     }
 
     void DoCooldownCheck() {
+        if (_isDetectionPaused) return;
         Stopwatch sw = Stopwatch.StartNew();
+
+        // 客户端不在时不干涉（避免误判导致启动/重启 Clash）
+        bool clientRunning = true;
+        try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+        if (!clientRunning) {
+            manualClientInterventionRequired = false;
+            cooldownProxyFailStreak = 0;
+            try {
+                if (this.IsHandleCreated) {
+                    this.BeginInvoke((Action)(() => {
+                        statusLabel.Text = "● 状态: 等待 Clash...";
+                        statusLabel.ForeColor = COLOR_WARNING;
+                        try { if (trayIcon != null) trayIcon.Text = "等待 Clash"; } catch { /* ignore */ }
+                    }));
+                }
+            } catch { /* ignore */ }
+            return;
+        }
         double mem = 0; int handles = 0;
         bool running = GetMihomoStats(out mem, out handles);
 
         bool proxyOK = false;
         int delay = TestProxy(out proxyOK, true);
 
+        // 冷却期：核心已恢复但代理仍不可用时，触发应急策略（节流在 RunEmergency 内）
+        if (running && !proxyOK) {
+            cooldownProxyFailStreak++;
+            if (cooldownProxyFailStreak >= 2) {
+                cooldownProxyFailStreak = 0;
+                ThreadPool.QueueUserWorkItem(_ => RunEmergency("CooldownProxyFail"));
+            }
+        } else {
+            cooldownProxyFailStreak = 0;
+        }
+
         if (running && proxyOK) {
+            manualClientInterventionRequired = false;
             // 内核已恢复，立即结束冷却，回到正常模式
             GetCurrentNode();
             this.BeginInvoke((Action)(() => {
@@ -435,7 +748,7 @@ public partial class ClashGuardian
                 string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "?" : detectedCoreName;
                 memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB  |  句柄: " + handles;
 
-                string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : currentNode;
+                string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : SafeNodeName(currentNode);
                 proxyLabel.Text = "代  理:  OK " + delayStr + " | " + TruncateNodeName(nodeDisplay);
                 proxyLabel.ForeColor = delay > highDelayThreshold ? COLOR_WARNING : COLOR_OK;
 
@@ -456,8 +769,28 @@ public partial class ClashGuardian
     }
 
     void DoCheckInBackground() {
+        if (_isDetectionPaused) return;
         Stopwatch sw = Stopwatch.StartNew();
-        int checks = Interlocked.Increment(ref totalChecks);
+
+        // 客户端不在时不干涉（避免误判导致启动/重启 Clash）
+        bool clientRunning = true;
+        try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+        if (!clientRunning) {
+            manualClientInterventionRequired = false;
+            cooldownProxyFailStreak = 0;
+            try {
+                if (this.IsHandleCreated) {
+                    this.BeginInvoke((Action)(() => {
+                        statusLabel.Text = "● 状态: 等待 Clash...";
+                        statusLabel.ForeColor = COLOR_WARNING;
+                        try { if (trayIcon != null) trayIcon.Text = "等待 Clash"; } catch { /* ignore */ }
+                    }));
+                }
+            } catch { /* ignore */ }
+            return;
+        }
+
+        Interlocked.Increment(ref totalChecks);
 
         double mem = 0; int handles = 0;
         bool running = GetMihomoStats(out mem, out handles);
@@ -466,10 +799,15 @@ public partial class ClashGuardian
         int delay = TestProxy(out proxyOK, true);
         LogPerf("TestProxy", sw.ElapsedMilliseconds);
 
+        DateTime now = DateTime.Now;
+
         int[] tcp = lastTcpStats;
-        if (checks % TCP_CHECK_INTERVAL == 0) { tcp = GetTcpStats(); lastTcpStats = tcp; }
-        if (checks % NODE_UPDATE_INTERVAL == 0) { GetCurrentNode(); }
-        if (checks % DELAY_TEST_INTERVAL == 0) { TriggerDelayTest(); }
+        if ((now - lastTcpStatsAt).TotalSeconds >= 50) { tcp = GetTcpStats(); lastTcpStats = tcp; lastTcpStatsAt = now; }
+
+        int nodeRefreshMs = (!running || !proxyOK || (delay > highDelayThreshold)) ? 1000 : 5000;
+        if ((now - lastNodeRefreshAt).TotalMilliseconds >= nodeRefreshMs) { GetCurrentNode(API_TIMEOUT_FAST); lastNodeRefreshAt = now; }
+
+        if ((now - lastDelayTestAt).TotalMinutes >= 6) { TriggerDelayTest(); lastDelayTestAt = now; }
 
         this.BeginInvoke((Action)(() => UpdateUI(running, mem, handles, proxyOK, delay, tcp)));
         LogPerf("DoCheckInBackground", sw.ElapsedMilliseconds);
@@ -477,10 +815,11 @@ public partial class ClashGuardian
 
     // ==================== UI 更新（仅渲染，不含业务判断） ====================
     void UpdateUI(bool running, double mem, int handles, bool proxyOK, int delay, int[] tcp) {
+        if (_isDetectionPaused) return;
         int tw = tcp[0], est = tcp[1], cw = tcp[2];
         int dl = delay;
-        bool paused = IsAutoActionsPaused;
-        TimeSpan pauseLeft = paused ? GetAutoActionsPauseRemaining() : TimeSpan.Zero;
+
+        // paused detection: no UI update here (handled by PauseDetectionUi)
 
         // 纯逻辑决策（不修改任何 UI 或实例状态）
         StatusDecision decision = EvaluateStatus(running, mem, proxyOK, dl, cw, failCount);
@@ -505,7 +844,7 @@ public partial class ClashGuardian
         string delayStr = dl > 0 ? dl + "ms" : "--";
         string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
         memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB" + (mem > memoryWarning ? "!" : "") + "  |  句柄: " + handles;
-        string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "获取中..." : currentNode;
+        string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "获取中..." : SafeNodeName(currentNode);
         proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + TruncateNodeName(nodeDisplay);
         proxyLabel.ForeColor = !proxyOK ? COLOR_ERROR : (dl > highDelayThreshold ? COLOR_WARNING : COLOR_OK);
         int blCount;
@@ -519,41 +858,45 @@ public partial class ClashGuardian
         // 状态指示
         string cn = currentNode;
         if (!running) {
-            statusLabel.Text = paused
-                ? ("● 状态: 已暂停自动(" + FormatTimeSpan(pauseLeft) + ") | 内核未运行")
-                : "● 状态: 内核未运行";
+            statusLabel.Text = "● 状态: 内核未运行";
             statusLabel.ForeColor = COLOR_ERROR;
         } else if (!proxyOK) {
-            statusLabel.Text = paused
-                ? ("● 状态: 已暂停自动(" + FormatTimeSpan(pauseLeft) + ") | 代理异常(F" + failCount + ")")
-                : ("● 状态: 代理异常(F" + failCount + ")");
+            statusLabel.Text = "● 状态: 代理异常(F" + failCount + ")";
             statusLabel.ForeColor = COLOR_ERROR;
         } else {
-            statusLabel.Text = paused
-                ? ("● 状态: 已暂停自动(" + FormatTimeSpan(pauseLeft) + ") | 运行中")
-                : "● 状态: 运行中";
-            statusLabel.ForeColor = paused ? COLOR_WARNING : COLOR_OK;
+            statusLabel.Text = "● 状态: 运行中";
+            statusLabel.ForeColor = COLOR_OK;
+        }
+
+        if (running && proxyOK) {
+            manualClientInterventionRequired = false;
         }
 
         // 托盘
         string coreDisplay = string.IsNullOrEmpty(detectedCoreName) ? "?" : detectedCoreName;
         string trayText = coreDisplay + " | " + mem.ToString("F0") + "MB | " + (proxyOK ? delayStr : "!");
-        if (paused) {
-            int mleft = (int)Math.Ceiling(pauseLeft.TotalMinutes);
-            if (mleft < 1) mleft = 1;
-            trayText += " | P" + mleft + "m";
-        }
         if (trayText.Length > 63) trayText = trayText.Substring(0, 63);
         trayIcon.Text = trayText;
 
-        // 调整检测频率
-        AdjustInterval(decision.HasIssue);
+        // 调整检测频率（需要手动介入时保持普通频率，避免激进行为打扰用户）
+        if (manualClientInterventionRequired) {
+            try { timer.Interval = effectiveNormalInterval; } catch { /* ignore */ }
+        } else {
+            AdjustInterval(decision.HasIssue);
+        }
 
         // 记录数据
         LogData(proxyOK, dl, mem, handles, tw, est, cw, cn, decision.Event);
 
+        if (manualClientInterventionRequired) {
+            statusLabel.Text = "● 状态: 需要手动重启 Clash";
+            statusLabel.ForeColor = COLOR_ERROR;
+            try { trayIcon.Text = "需要手动重启 Clash"; } catch { /* ignore */ }
+            return;
+        }
+
         // 订阅级自动切换（Clash Verge Rev）：连续成功切换多个节点仍不可用，则切换订阅并强制重启客户端
-        if (!paused && autoSwitchSubscription) {
+        if (autoSwitchSubscription) {
             bool whitelistOk = subscriptionWhitelist != null && subscriptionWhitelist.Length >= 2;
             bool networkBad = running && mem <= memoryWarning && (!proxyOK || (dl > 0 && dl > highDelayThreshold));
             DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
@@ -571,18 +914,16 @@ public partial class ClashGuardian
         }
 
         // 执行决策（在后台线程，避免阻塞 UI）
-        if (paused && (decision.NeedSwitch || decision.NeedRestart)) {
-            if ((DateTime.Now - lastSuppressedActionLog).TotalSeconds > 60) {
-                lastSuppressedActionLog = DateTime.Now;
-                Log("已暂停自动操作，跳过: " + decision.Event);
-            }
-        } else {
-            if (decision.NeedSwitch) {
-                QueueSwitchToBestNode(true);
-            }
-            if (decision.NeedRestart) {
-                ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason));
-            }
+        if (decision.NeedSwitch || decision.NeedRestart) {
+            bool clientRunning = true;
+            try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+            if (!clientRunning) return;
+        }
+        if (decision.NeedSwitch) {
+            QueueSwitchToBestNode(true);
+        }
+        if (decision.NeedRestart) {
+            ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason, false, decision.Event));
         }
     }
 
