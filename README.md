@@ -1,4 +1,4 @@
-﻿# Clash Guardian Pro v1.0.0 - 多内核智能守护进程
+﻿# Clash Guardian Pro v1.0.1 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -24,8 +24,9 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 - **节点名称显示** - 正确解析 Unicode，过滤 emoji 乱码
 
 ### ⚡ 自适应检测
-- **正常状态**：5 秒检测间隔
-- **异常状态**：1 秒快速检测（极速响应）
+- **基础间隔**：`normalInterval`（默认 5 秒）/ `fastInterval`（默认 1 秒）
+- **提速系数**：`speedFactor`（默认 3，范围 1..5），实际检测间隔 = 基础间隔 / `speedFactor`
+- **默认效果**：健康态约 1.6 秒一次检测（>=3x 提速），异常态约 0.33 秒快速检测
 - **连续稳定 3 次后**：自动恢复正常间隔
 
 ### 🧠 智能决策
@@ -50,7 +51,7 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 - **静默运行** - 所有操作静音执行，无弹窗打扰
 
 ### 🧰 控制与诊断
-- **暂停自动操作** - 暂停自动重启/自动切换（仍持续检测与更新 UI）
+- **暂停检测** - 暂停整个检测循环（不检测、不自动切换/重启，UI 进入“暂停检测”状态）
 - **一键导出诊断包** - 自动脱敏 `clashSecret`，便于排障反馈
 - **托盘工具箱** - 快速打开配置/监控数据/异常日志，管理黑名单
 
@@ -94,6 +95,9 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
   "clashSecret": "set-your-secret",
   "proxyPort": 7897,
   "normalInterval": 5000,
+  "fastInterval": 1000,
+  "speedFactor": 3,
+  "allowAutoStartClient": false,
   "memoryThreshold": 150,
   "highDelayThreshold": 400,
   "blacklistMinutes": 20,
@@ -119,6 +123,9 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 | `clashSecret` | API 密钥 | `set-your-secret` |
 | `proxyPort` | 代理端口 | `7897` |
 | `normalInterval` | 正常检测间隔(ms) | `5000` |
+| `fastInterval` | 异常时快速检测间隔(ms) | `1000` |
+| `speedFactor` | 检测提速系数（实际间隔=interval/speedFactor，范围 1..5） | `3` |
+| `allowAutoStartClient` | 是否允许自动启动/重启 Clash 客户端（可能弹出 UI；默认关闭） | `false` |
 | `memoryThreshold` | 内存阈值(MB) | `150` |
 | `highDelayThreshold` | 高延迟阈值(ms) | `400` |
 | `blacklistMinutes` | 黑名单时长(分钟) | `20` |
@@ -169,7 +176,9 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 
 ### 界面操作
 
-程序启动后显示主窗口，包含：
+程序正常启动后显示主窗口；由 Watcher 拉起（`--follow-clash`）时默认不弹出主窗口，仅显示托盘（可从托盘菜单“显示窗口”打开）。
+
+主窗口包含：
 - **状态显示** - 当前运行状态（运行中/重启中/等待内核）
 - **内核信息** - 检测到的内核名称、内存占用、句柄数
 - **代理状态** - 代理连通性、延迟和当前节点名称
@@ -177,24 +186,33 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 - **统计信息** - 问题次数、重启次数、节点切换次数、黑名单数量
 
 **按钮功能：**
-- `立即重启` - 重启 Clash 内核（先杀内核，若不恢复则重启客户端）
-- `查看数据` - 打开当日 CSV 监控数据
+- `立即重启` - 重启 Clash 内核（默认不自动启动/重启客户端；如需允许请设置 `allowAutoStartClient=true`）
+- `暂停检测/恢复检测` - 暂停/恢复整个检测循环
 - `退出` - 完全退出程序
 - `测速` - 手动测试代理延迟并更新状态栏（同时触发 Clash 全节点测速）
 - `切换节点` - 手动切换到最佳节点（立即刷新统计）
-- `开机自启` - 切换开机自启状态
+- `跟随 Clash` - 启用/关闭“跟随 Clash 启动”（登录后后台 Watcher 检测到 Clash 启动会拉起 Guardian）
+
+### 跟随 Clash 启动/退出（推荐）
+
+启用后会在登录时启动一个轻量 Watcher：当检测到 Clash 客户端进程启动后，会自动拉起 ClashGuardian；当 Clash 全部退出后，ClashGuardian 也会自动退出（Watcher 继续等待下一次启动）。
+
+**注意**：Watcher 只负责拉起 ClashGuardian，本身不会启动/重启 Clash 客户端。
+
+命令行参数：
+- `--watch-clash`：Watcher 模式（无 UI/托盘）
+- `--follow-clash`：跟随模式（有托盘，默认不弹主窗口；Clash 退出后自动退出）
 
 ### 系统托盘
 
 最小化后程序进入系统托盘，右键菜单：
 - 显示窗口
-- 暂停自动操作 10/30/60分钟
-- 恢复自动操作
+- 暂停检测 / 恢复检测
 - 立即重启
 - 切换节点
 - 触发测速
-- 禁用名单（勾选即禁用）
-- 偏好节点（勾选即偏好）
+- 禁用名单（固定高度 + 可滚动勾选）
+- 偏好节点（固定高度 + 可滚动勾选）
 - 导出诊断包
 - 打开配置 / 查看监控数据 / 查看异常日志
 - 检查更新
@@ -260,16 +278,18 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 - 特殊分组（自动选择、故障转移、负载均衡）
 - **黑名单节点**（最近 20 分钟内失败的节点）
 
-## 📝 开机自启
+## 📝 跟随 Clash 启动/退出
 
-两种方式：
+启用后会在登录时启动一个轻量 Watcher（无 UI/托盘）：
+- 检测到 Clash 客户端启动：自动拉起 ClashGuardian（`--follow-clash`）
+- 检测到 Clash 全部退出：ClashGuardian 自动退出（Watcher 继续等待下一次启动）
 
 ### 方式 1：程序内置（推荐）
-点击界面上的 `开机自启` 按钮即可切换开机自启状态。
+点击主界面 `跟随 Clash` 按钮即可启用/关闭（优先使用计划任务，失败回退注册表 Run）。
 
 ### 方式 2：手动设置
 1. 按 `Win + R` 输入 `shell:startup` 打开启动文件夹
-2. 创建 `ClashGuardian.exe` 的快捷方式放入该文件夹
+2. 创建 `ClashGuardian.exe --watch-clash` 的快捷方式放入该文件夹
 
 ## ⚠️ 注意事项
 
@@ -279,6 +299,19 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 4. 代理测试端口需与 Clash 客户端设置一致
 
 ## 🔄 更新日志
+
+### v1.0.2 (2026-02-08)
+- **修复：`--watch-clash` 稳定性** - 进程名变体匹配、启用后立即生效、禁用后可停止 Watcher
+- **变更：默认不干涉用户手动退出 Clash** - 客户端不在时仅显示“等待 Clash...”，不触发自动切换/重启策略
+- **新增：静音开关** - `allowAutoStartClient`（默认 `false`），禁止自动启动/重启客户端（避免弹出 UI 干扰）
+- **优化：`--follow-clash` 静默启动** - 默认只显示托盘，不弹出主窗口
+
+### v1.0.1 (2026-02-08)
+- **新增：跟随 Clash 启动/退出** - 登录后 Watcher 监测到 Clash 客户端启动会自动拉起 Guardian；Clash 全部退出后 Guardian 自动退出
+- **变更：暂停检测** - 原“暂停自动操作”改为暂停整个检测循环（Timer 停止），恢复后重置计数避免误触发
+- **新增：检测提速** - `speedFactor`（默认 3），健康态检测频率提升 >=3x；周期任务改为按时间节流
+- **修复：节点显示与刷新** - 切换后测速显示回弹、手动切换不更新、节点名前 emoji 乱码（方块）等
+- **增强：应急机制** - 修复“进程恢复但网络未恢复”的误判，并在冷却期代理持续异常时触发激进自查与恢复策略（节流）
 
 ### v1.0.0 (2026-02-07)
 - **新增：禁用名单（节点级）可配置** - 托盘勾选写入 `disabledNodes`；未配置则按 `excludeRegions` 关键字排除（默认港澳台）

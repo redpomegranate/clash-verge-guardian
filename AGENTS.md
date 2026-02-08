@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v1.0.0
+- **版本**：v1.0.2
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -56,16 +56,16 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 1. **UI 线程安全** - 后台线程操作 UI 必须使用 `this.BeginInvoke((Action)(() => { ... }))`
 2. **跨线程字段** - `currentNode`/`nodeGroup`/`detectedCoreName`/`detectedClientPath` 声明为 `volatile`；计数器使用 `Interlocked.Increment`；`nodeBlacklist` 使用 `blacklistLock`
 3. **日志精简** - 正常情况不记录日志，只记录异常（TestProxy > 5s，其他 > 2s）
-4. **静默运行** - 所有自动操作不要有弹窗/通知（自动更新除外）
+4. **静默运行** - 所有自动操作不要有弹窗/通知（自动更新除外）；默认 `allowAutoStartClient=false`，不自动启动/重启客户端 UI
 5. **节点名称** - 使用 `ExtractJsonString` 解析 Unicode 转义，用 `SafeNodeName` 过滤不可显示字符和 emoji surrogate pair
 6. **代理组切换** - 不要硬编码 GLOBAL，使用 `FindSelectorGroup` 自动发现实际节点所属的 Selector 组
 7. **节点列表获取** - 从 Selector 组的 `all` 数组正向提取节点名（`GetGroupAllNodes`），不要反向扫描 type 字段
 8. **JSON 解析** - 使用 `FindObjectBounds` + `FindFieldValue` 统一入口，避免重复的括号匹配代码
 9. **决策逻辑** - `EvaluateStatus` 是纯函数，返回 `StatusDecision` 结构体，不直接修改实例状态
-10. **重启逻辑** - 杀内核→等5秒→检查自动恢复→未恢复则杀客户端并重启；`restartLock` + `_isRestarting` 防并发
+10. **重启逻辑** - 杀内核→等5秒→检查自动恢复+代理可用验证；仅当 `allowAutoStartClient=true` 才允许自动重启客户端；客户端不在时不干涉（显示“等待 Clash...”）；`restartLock` + `_isRestarting` 防并发
 11. **按钮/菜单** - 耗时操作（重启、切换、更新检查）必须通过 `ThreadPool.QueueUserWorkItem` 在后台执行，禁止阻塞 UI 线程
 12. **客户端路径** - 检测到后持久化到 config.json 的 `clientPath` 字段；搜索优先级：运行进程→config→默认路径→注册表
-13. **暂停自动操作** - 暂停期间仅抑制自动重启/自动切换，检测与 UI 更新仍继续；恢复时重置 failCount/consecutiveOK
+13. **暂停检测** - 暂停期间停止检测循环（Timer 停止），不自动重启/切换；恢复时重置 failCount/consecutiveOK/cooldownCount 并恢复 interval
 14. **诊断导出** - `ExportDiagnostics` 仅用户触发，脱敏 `clashSecret`，导出到 `%LOCALAPPDATA%\\ClashGuardian\\diagnostics_*`
 15. **禁用名单（disabledNodes）** - 托盘勾选后写入 config；一旦存在 `disabledNodes` 将忽略 `excludeRegions`
 16. **偏好节点（preferredNodes）** - 托盘勾选后写入 config；自动切换优先偏好节点（不可用则回退，偏好集合过小可能降低抗风险）
@@ -87,10 +87,10 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 |------|------|
 | `InitializeUI` | 窗口布局和控件创建 |
 | `CreateButton`/`CreateInfoLabel`/`CreateSeparator` | UI 工厂方法 |
-| `InitializeTrayIcon` | 系统托盘菜单（含禁用名单/偏好节点/暂停自动操作/诊断导出/黑名单管理/检查更新） |
+| `InitializeTrayIcon` | 系统托盘菜单（含禁用名单/偏好节点/暂停检测/诊断导出/黑名单管理/检查更新） |
 | `OpenFileInNotepad` | 安全打开配置/数据/日志（try/catch，不崩溃） |
-| `PauseAutoActionsFor`/`ResumeAutoActions` | 暂停/恢复自动操作（仅抑制自动重启/切换） |
-| `ToggleAutoStart` | 开机自启注册表操作 |
+| `ToggleDetectionPause`/`PauseDetectionUi`/`ResumeDetectionUi` | 暂停/恢复检测（停止 Timer） |
+| `ToggleFollowClashWatcher` | 跟随 Clash：开机启动 Watcher，检测到 Clash 启动后拉起 Guardian |
 | `RefreshNodeDisplay` | 刷新节点和统计显示 |
 | `FormatTimeSpan` | 时间格式化 |
 
@@ -114,7 +114,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `Log`/`LogPerf`/`LogData`/`CleanOldLogs` | 日志管理 |
 | `ExportDiagnostics` | 诊断包导出：summary+脱敏配置+日志+监控数据 |
 | `GetTcpStats`/`GetMihomoStats` | 系统状态采集 |
-| `RestartClash` | 重启流程：杀内核→等5秒→检查恢复→未恢复则重启客户端；`_isRestarting` 防并发 |
+| `RestartClash` | 重启流程：杀内核→等5秒→检查恢复+代理验证→必要时重启客户端（默认禁止，需 `allowAutoStartClient=true`）；客户端不在时不干涉；`_isRestarting` 防并发 |
 | `StartClientProcess` | 启动客户端进程（最小化窗口） |
 | `CheckStatus` | Timer 入口，检查 `_isRestarting` 和 `_isChecking` 防重入 |
 | `DoCooldownCheck` | 冷却期检测：内核恢复+代理正常→立即结束冷却 |
@@ -155,7 +155,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `restartLock` | `lock` | 重启门闩原子化（避免并发重启竞态） |
 | `_isChecking` | `Interlocked.CompareExchange` | 防重入 |
 | `_isRestarting` | `volatile bool` | 防止重启期间并发检测 |
-| `pauseAutoActionsUntil`/`lastSuppressedActionLog` | UI 线程专用 | 托盘菜单设置，UpdateUI 读取 |
+| `_isDetectionPaused` | `volatile bool` | 暂停检测开关（跨线程读写） |
 
 ## 🔄 关键修复记录
 
@@ -175,7 +175,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 2. **配置兜底** - 配置数值 `TryParse + Clamp`，异常配置不再导致崩溃（不回写 config）
 3. **JSON 边界加固** - `FindObjectBounds` 忽略字符串内花括号，降低误判
 4. **本地 API 直连** - loopback API 禁用系统代理，避免 PAC/全局代理干扰
-5. **控制与诊断增强** - 托盘支持暂停自动操作、导出诊断包、打开配置/数据/日志、黑名单管理
+5. **控制与诊断增强** - 托盘支持暂停检测、导出诊断包、打开配置/数据/日志、黑名单管理
 
 ### v0.0.7 改进
 1. **客户端路径持久化** - `detectedClientPath` 保存到 config.json，客户端关闭后仍可重启
