@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v1.0.3
+- **版本**：v1.0.4
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -159,6 +159,11 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `_isDetectionPaused` | `volatile bool` | 暂停检测开关（跨线程读写） |
 
 ## 🔄 关键修复记录
+
+### v1.0.4 改进
+1. **自动切换失败风暴保护** - 当出现“延迟过高 5000ms / 无 delay 历史 / API无响应”等导致的切换失败时：自动节流日志、限制切换频率，并在连续失败达到阈值后升级为“订阅切换/重启客户端”，避免无限循环刷屏
+2. **恢复链路提速** - 客户端重启后的“内核+API 就绪等待”合并为单循环并提前触发 `AutoDiscoverApi`；代理恢复检测前 3 秒改为 500ms 轮询；常规 core 重启后的代理验证窗口缩短为 ~4.5s，失败尽快升级为重启客户端
+3. **订阅切换紧急绕过** - 在“客户端重启 + 节点切换仍无效”的恢复阶段，订阅切换允许在严重故障场景下绕过 cooldown（仍有最小间隔保护）
 
 ### v1.0.3 改进
 1. **修复：mihomo/meta 延迟测试接口不兼容** - `TriggerDelayTest` 使用 `/proxies/{name}/delay`，避免 `/group/{name}/delay` 404 导致“请先测速”死循环（影响自动切节点与恢复链路）

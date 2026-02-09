@@ -1,4 +1,4 @@
-﻿# Clash Guardian Pro v1.0.3 - 多内核智能守护进程
+# Clash Guardian Pro v1.0.4 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -311,6 +311,12 @@ flowchart TD
   C -->|NeedRestart| RS[重启管线 RestartClash]
   C -->|No action| UI[仅更新UI/统计]
 
+  SW --> SWR{切换结果?}
+  SWR -->|成功| OK
+  SWR -->|失败: 无可用低延迟节点/延迟超时| NOGOOD[连续失败x3(节流)<br/>尝试订阅切换/重启客户端]
+  NOGOOD --> CR
+  NOGOOD --> SUB2
+ 
   RS --> HM{HighMemoryHighDelay?}
   HM -->|是| HMPIPE[快速内核重置 x2<br/>每次: 刷新测速 -> 切最佳节点 -> 验证代理+延迟]
   HMPIPE -->|恢复| OK[恢复正常]
@@ -329,7 +335,7 @@ flowchart TD
   CHECK -->|恢复| OK
   CHECK -->|仍失败| TRY2[刷新测速并切节点(最多2次)]
   TRY2 -->|恢复| OK
-  TRY2 -->|仍失败| SUB{可切换订阅? <br/>(autoSwitchSubscription & whitelist>=2 & cooldown ok)}
+  TRY2 -->|仍失败| SUB{可切换订阅? <br/>(autoSwitchSubscription & whitelist>=2 & cooldown ok/紧急绕过)}
   SUB -->|否| STOP
   SUB -->|是| SUB2[切换订阅 -> 强制重启客户端]
   SUB2 --> TRY2B[订阅切换后再刷新/切节点(2次)]
@@ -342,6 +348,11 @@ flowchart TD
 - 节点切换在 delay history 不可用时，会回退到 `/proxies/{name}/delay` 的实时探测后再切换，避免“请先测速”的死循环。
 
 ## 🔄 更新日志
+
+### v1.0.4 (2026-02-09)
+- **优化：自动切换失败风暴保护** - 当出现“延迟过高 5000ms / 无 delay 历史 / API无响应”等导致的切换失败时：自动节流日志、限制切换频率，并在连续失败达到阈值后升级为“订阅切换/重启客户端”，避免无限循环刷屏
+- **提速：恢复链路缩短** - 客户端重启后的“内核+API 就绪等待”合并为单循环并提前触发 `AutoDiscoverApi`；代理恢复检测前 3 秒改为 500ms 轮询；常规 core 重启后的代理验证窗口缩短为 ~4.5s，失败尽快升级为重启客户端
+- **增强：订阅切换紧急绕过** - 在“客户端重启 + 节点切换仍无效”的恢复阶段，订阅切换允许在严重故障场景下绕过 cooldown（仍有最小间隔保护），并在客户端重启后立即刷新测速+切最佳节点，提高命中可用节点概率
 
 ### v1.0.3 (2026-02-09)
 - **修复：mihomo/meta 延迟测试接口不兼容** - `TriggerDelayTest` 改为 `/proxies/{name}/delay`，避免 `/group/{name}/delay` 404 导致“请先测速”死循环（影响自动切节点与恢复链路）

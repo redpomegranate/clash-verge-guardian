@@ -474,25 +474,62 @@ public partial class ClashGuardian
         return result;
     }
 
+    enum NodeSwitchOutcome {
+        Switched,
+        NoBetterNode,
+        NoDelayHistory,
+        DelayTooHigh,
+        ApiNoResponse,
+        PutFailed,
+        Exception,
+    }
+
+    struct NodeSwitchReport {
+        public NodeSwitchOutcome Outcome;
+        public string Group;
+        public string BestNode;
+        public int BestDelay;
+        public int AllNodesCount;
+        public int CandidatesTotal;
+        public int DelaySamples;
+        public bool ForceDelayRefresh;
+    }
+
+    NodeSwitchReport SwitchToBestNodeReport(bool forceDelayRefresh, bool logFailures) {
+        return SwitchToBestNodeInternal(forceDelayRefresh, logFailures);
+    }
+
     bool SwitchToBestNodeRefreshed() {
-        return SwitchToBestNodeInternal(true);
+        return SwitchToBestNodeInternal(true, true).Outcome == NodeSwitchOutcome.Switched;
     }
 
     bool SwitchToBestNode() {
-        return SwitchToBestNodeInternal(false);
+        return SwitchToBestNodeInternal(false, true).Outcome == NodeSwitchOutcome.Switched;
     }
 
-    bool SwitchToBestNodeInternal(bool forceDelayRefresh) {
+    NodeSwitchReport SwitchToBestNodeInternal(bool forceDelayRefresh, bool logFailures) {
+        NodeSwitchReport r = new NodeSwitchReport();
+        r.Outcome = NodeSwitchOutcome.Exception;
+        r.Group = "";
+        r.BestNode = "";
+        r.BestDelay = 0;
+        r.AllNodesCount = 0;
+        r.CandidatesTotal = 0;
+        r.DelaySamples = 0;
+        r.ForceDelayRefresh = forceDelayRefresh;
+
         CleanBlacklist();
         try {
             string json = ApiRequest("/proxies");
             if (string.IsNullOrEmpty(json)) {
-                Log("切换失败: API无响应");
-                return false;
+                if (logFailures) Log("切换失败: API无响应");
+                r.Outcome = NodeSwitchOutcome.ApiNoResponse;
+                return r;
             }
 
             string group = FindSelectorGroup(json);
             nodeGroup = group;
+            r.Group = group;
 
             if (forceDelayRefresh) {
                 // Seed delay info quickly; group delay endpoints are not portable across cores.
@@ -510,6 +547,7 @@ public partial class ClashGuardian
 
             for (;;) {
                 List<string> allNodes = GetGroupAllNodes(json, group);
+                r.AllNodesCount = allNodes != null ? allNodes.Count : 0;
 
                 HashSet<string> preferredSnapshot = null;
                 lock (preferredNodesLock) {
@@ -575,6 +613,8 @@ public partial class ClashGuardian
                 preferredWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
                 normalWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
                 int delaySamples = preferredWithDelay.Count + normalWithDelay.Count;
+                r.CandidatesTotal = candidatesTotal;
+                r.DelaySamples = delaySamples;
                 string bestNode = null;
                 int bestDelay = int.MaxValue;
                 bool bestPreferred = false;
@@ -675,25 +715,40 @@ public partial class ClashGuardian
                         currentNode = bestNode;
                         Interlocked.Exchange(ref lastDelay, bestDelay);
                         Interlocked.Increment(ref totalSwitches);
-                        return true;
+                        r.Outcome = NodeSwitchOutcome.Switched;
+                        r.BestNode = bestNode;
+                        r.BestDelay = bestDelay;
+                        return r;
                     } else {
-                        Log("切换失败: PUT " + group + " node=" + SafeNodeName(bestNode));
+                        if (logFailures) Log("切换失败: PUT " + group + " node=" + SafeNodeName(bestNode));
+                        r.Outcome = NodeSwitchOutcome.PutFailed;
+                        r.BestNode = bestNode;
+                        r.BestDelay = bestDelay;
                     }
                 } else if (bestNode == null) {
                     if (candidatesTotal > 0 && delaySamples == 0)
-                        Log("切换失败: 无可用节点(请先测速) group=" + group + " allCount=" + allNodes.Count);
+                        if (logFailures) Log("切换失败: 无可用节点(请先测速) group=" + group + " allCount=" + allNodes.Count);
                     else
-                        Log("切换失败: 无更优节点");
+                        if (logFailures) Log("切换失败: 无更优节点");
+
+                    r.Outcome = (candidatesTotal > 0 && delaySamples == 0)
+                        ? NodeSwitchOutcome.NoDelayHistory
+                        : NodeSwitchOutcome.NoBetterNode;
                 } else {
-                    Log("切换失败: 延迟过高 " + bestDelay + "ms");
+                    if (logFailures) Log("切换失败: 延迟过高 " + bestDelay + "ms");
+                    r.Outcome = NodeSwitchOutcome.DelayTooHigh;
+                    r.BestNode = bestNode;
+                    r.BestDelay = bestDelay;
                 }
 
-                return false;
+                return r;
             }
         } catch (Exception ex) {
-            Log("切换异常: " + ex.Message);
+            if (logFailures) Log("切换异常: " + ex.Message);
         }
-        return false;
+
+        r.Outcome = NodeSwitchOutcome.Exception;
+        return r;
     }
 
 

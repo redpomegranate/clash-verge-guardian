@@ -466,21 +466,44 @@ public partial class ClashGuardian
             return false;
         }
 
-        // 等待客户端启动内核 + API 可用
-        WaitForCoreBack(CORE_RECOVERY_MAX_WAIT_MS + 6000);
-        if (!WaitForApiReady(6000)) {
+        // 等待客户端启动内核 + API 可用（合并等待：API ready 即表示 core ready）
+        int maxWait = CORE_RECOVERY_MAX_WAIT_MS + 6000;
+        bool apiReady = false;
+        try {
+            Stopwatch sw = Stopwatch.StartNew();
+            bool discovered = false;
+            while (sw.ElapsedMilliseconds < maxWait) {
+                try {
+                    string v = ApiRequest("/version", API_TIMEOUT_FAST);
+                    if (!string.IsNullOrEmpty(v)) { apiReady = true; break; }
+                } catch { /* ignore */ }
+
+                // 尝试在启动早期自动发现 API 端口，避免串行等待导致链路变长
+                if (!discovered && sw.ElapsedMilliseconds >= 2000) {
+                    discovered = true;
+                    try { AutoDiscoverApi(); } catch { /* ignore */ }
+                }
+
+                try { Thread.Sleep(300); } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+
+        if (!apiReady) {
             try { AutoDiscoverApi(); } catch { /* ignore */ }
-            WaitForApiReady(3000);
+            apiReady = WaitForApiReady(3000);
         }
+
         DetectRunningCore();
 
-        // 刷新测速并切节点（用于高延迟恢复管线）
+        // 客户端重启后：立即刷新测速并尽量切到可用低延迟节点（提高恢复速度/避免卡在坏节点）
+        TryRefreshDelayAndSwitchBestNode();
+
+        int waitMs = requireGoodDelay ? PROXY_RECOVERY_MAX_WAIT_MS : Math.Min(PROXY_RECOVERY_MAX_WAIT_MS, 6000);
         if (requireGoodDelay) {
-            TryRefreshDelayAndSwitchBestNode();
-            return WaitForProxyRecoveryAndDelay(PROXY_RECOVERY_MAX_WAIT_MS, highDelayThreshold);
+            return WaitForProxyRecoveryAndDelay(waitMs, highDelayThreshold);
         }
 
-        return WaitForProxyRecovery(PROXY_RECOVERY_MAX_WAIT_MS);
+        return WaitForProxyRecovery(waitMs);
     }
 
     bool ValidateRecovery(bool requireGoodDelay) {
@@ -488,7 +511,7 @@ public partial class ClashGuardian
         return WaitForProxyRecovery(PROXY_RECOVERY_MAX_WAIT_MS);
     }
 
-    bool TrySwitchSubscriptionForRecovery(string reasonEvent, out string oldName, out string newName) {
+    bool TrySwitchSubscriptionForRecovery(string reasonEvent, out string oldName, out string newName, bool bypassCooldown = false) {
         oldName = "";
         newName = "";
 
@@ -496,7 +519,19 @@ public partial class ClashGuardian
         if (subscriptionWhitelist == null || subscriptionWhitelist.Length < 2) return false;
 
         DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
-        if ((DateTime.Now - lastSub).TotalMinutes < subscriptionSwitchCooldownMinutes) return false;
+        bool bypassed = false;
+        try {
+            TimeSpan since = DateTime.Now - lastSub;
+            if (since.TotalMinutes < subscriptionSwitchCooldownMinutes) {
+                if (!bypassCooldown) return false;
+                // Emergency bypass: still enforce a minimal interval to avoid rapid thrashing.
+                if (since.TotalSeconds < SUB_SWITCH_EMERGENCY_MIN_INTERVAL_SECONDS) return false;
+                bypassed = true;
+            }
+        } catch {
+            if (!bypassCooldown) return false;
+            bypassed = true;
+        }
 
         lock (subscriptionLock) {
             if (_isSwitchingSubscription) return false;
@@ -507,7 +542,8 @@ public partial class ClashGuardian
             if (!TrySwitchClashVergeRevSubscription(subscriptionWhitelist, out oldName, out newName)) return false;
 
             Interlocked.Exchange(ref lastSubscriptionSwitchTicks, DateTime.Now.Ticks);
-            Log("订阅切换: " + oldName + " -> " + newName + " (reason=" + (reasonEvent ?? "") + ")");
+            Log("订阅切换: " + oldName + " -> " + newName +
+                " (reason=" + (reasonEvent ?? "") + (bypassed ? ", bypass=1" : "") + ")");
             return true;
         } catch (Exception ex) {
             Log("订阅切换异常: " + ex.Message);
@@ -613,8 +649,8 @@ public partial class ClashGuardian
                         continue;
                     }
 
-                    // 常规恢复：只要代理恢复即可
-                    if (WaitForProxyRecovery(PROXY_RECOVERY_MAX_WAIT_MS)) {
+                    // 常规恢复：只要代理恢复即可（失败场景尽快升级，缩短链路耗时）
+                    if (WaitForProxyRecovery(PROXY_RECOVERY_FAST_WAIT_MS)) {
                         manualClientInterventionRequired = false;
                         Log("内核已自动恢复");
                     } else {
@@ -672,7 +708,8 @@ public partial class ClashGuardian
 
                         if (!ok) {
                             string oldName, newName;
-                            if (TrySwitchSubscriptionForRecovery(eventName, out oldName, out newName)) {
+                            // 客户端重启 + 节点切换仍无效：允许紧急绕过订阅 cooldown（但仍有最小间隔保护）。
+                            if (TrySwitchSubscriptionForRecovery(eventName, out oldName, out newName, true)) {
                                 Log("强制重启客户端(订阅切换后生效)");
                                 ok = RestartClientOnce(requireGoodDelay);
                                 if (!ok) Log("订阅切换后代理/延迟仍未恢复");
@@ -728,7 +765,7 @@ public partial class ClashGuardian
             try { TestProxy(out ok, true); } catch { ok = false; }
             if (ok) return true;
 
-            int sleep = 1000;
+            int sleep = waited < 3000 ? 500 : 1000;
             if (waited + sleep > maxWaitMs) sleep = maxWaitMs - waited;
             if (sleep <= 0) break;
             Thread.Sleep(sleep);
@@ -749,7 +786,7 @@ public partial class ClashGuardian
                 if (d > 0 && d <= maxDelayMs) return true;
             }
 
-            int sleep = 1000;
+            int sleep = waited < 3000 ? 500 : 1000;
             if (waited + sleep > maxWaitMs) sleep = maxWaitMs - waited;
             if (sleep <= 0) break;
             Thread.Sleep(sleep);
@@ -1159,6 +1196,7 @@ public partial class ClashGuardian
 
         if (running && proxyOK) {
             manualClientInterventionRequired = false;
+            Interlocked.Exchange(ref autoSwitchNoGoodNodeStreak, 0);
         }
 
         // 托盘
@@ -1220,19 +1258,135 @@ public partial class ClashGuardian
     }
 
     void QueueSwitchToBestNode(bool isAuto) {
+        if (manualClientInterventionRequired) return;
+        if (_isRestarting) return;
+
+        // 自动切换：节流 + 防并发，避免 1s/2s 级切换风暴刷屏
+        if (isAuto) {
+            long nowTicks = DateTime.Now.Ticks;
+            long lastTicks = Interlocked.Read(ref lastAutoSwitchTicks);
+            try {
+                if (lastTicks > 0 && (new TimeSpan(nowTicks - lastTicks)).TotalMilliseconds < AUTO_SWITCH_MIN_INTERVAL_MS) return;
+            } catch { /* ignore */ }
+
+            if (Interlocked.CompareExchange(ref _isSwitchingNode, 1, 0) != 0) return;
+            Interlocked.Exchange(ref lastAutoSwitchTicks, nowTicks);
+        }
+
         ThreadPool.QueueUserWorkItem(_ => {
             try {
-                if (SwitchToBestNode()) {
-                    this.BeginInvoke((Action)(() => {
-                        failCount = 0;
-                        RefreshNodeDisplay();
-                        if (isAuto) consecutiveSuccessfulAutoSwitchesWithoutRecovery++;
-                    }));
+                if (manualClientInterventionRequired) return;
+                if (_isRestarting) return;
+
+                // 自动切换失败时不要反复打印内部日志（外部统一节流并做升级决策）
+                NodeSwitchReport r = SwitchToBestNodeReport(false, !isAuto);
+                if (r.Outcome == NodeSwitchOutcome.Switched) {
+                    Interlocked.Exchange(ref autoSwitchNoGoodNodeStreak, 0);
+                    if (this.IsHandleCreated) {
+                        this.BeginInvoke((Action)(() => {
+                            failCount = 0;
+                            RefreshNodeDisplay();
+                            if (isAuto) consecutiveSuccessfulAutoSwitchesWithoutRecovery++;
+                        }));
+                    }
+                } else if (isAuto) {
+                    HandleAutoSwitchFailure(r);
                 }
             } catch (Exception ex) {
                 Log("切换节点异常: " + ex.Message);
+            } finally {
+                if (isAuto) Interlocked.Exchange(ref _isSwitchingNode, 0);
             }
         });
+    }
+
+    void HandleAutoSwitchFailure(NodeSwitchReport r) {
+        // Only handle "no good node" class failures; other outcomes are non-fatal.
+        bool noGoodNode =
+            r.Outcome == NodeSwitchOutcome.DelayTooHigh ||
+            r.Outcome == NodeSwitchOutcome.NoDelayHistory ||
+            r.Outcome == NodeSwitchOutcome.ApiNoResponse ||
+            r.Outcome == NodeSwitchOutcome.PutFailed;
+        if (!noGoodNode) return;
+
+        if (r.Outcome == NodeSwitchOutcome.NoDelayHistory) {
+            // Try to seed delay history when the core has none (async, cheap).
+            try { TriggerDelayTest(); } catch { /* ignore */ }
+        }
+
+        long nowTicks = DateTime.Now.Ticks;
+        long lastFailTicks = Interlocked.Read(ref lastAutoSwitchNoGoodNodeTicks);
+        try {
+            if (lastFailTicks > 0 && (new TimeSpan(nowTicks - lastFailTicks)).TotalSeconds > AUTO_SWITCH_NO_GOOD_NODE_WINDOW_SECONDS) {
+                Interlocked.Exchange(ref autoSwitchNoGoodNodeStreak, 0);
+            }
+        } catch {
+            Interlocked.Exchange(ref autoSwitchNoGoodNodeStreak, 0);
+        }
+        Interlocked.Exchange(ref lastAutoSwitchNoGoodNodeTicks, nowTicks);
+
+        int streak = Interlocked.Increment(ref autoSwitchNoGoodNodeStreak);
+
+        // Throttled failure log (avoid spamming every tick).
+        bool canLog = false;
+        long lastLogTicks = Interlocked.Read(ref lastAutoSwitchNoGoodNodeLogTicks);
+        try {
+            if (lastLogTicks <= 0 || (new TimeSpan(nowTicks - lastLogTicks)).TotalSeconds >= AUTO_SWITCH_NO_GOOD_NODE_LOG_THROTTLE_SECONDS) canLog = true;
+        } catch { canLog = true; }
+        if (canLog) {
+            Interlocked.Exchange(ref lastAutoSwitchNoGoodNodeLogTicks, nowTicks);
+            try {
+                if (r.Outcome == NodeSwitchOutcome.DelayTooHigh) {
+                    Log("切换失败: 延迟过高 " + r.BestDelay + "ms (x" + streak + ")");
+                } else if (r.Outcome == NodeSwitchOutcome.NoDelayHistory) {
+                    Log("切换失败: 无可用节点(请先测速) group=" + SafeNodeName(r.Group) + " allCount=" + r.AllNodesCount + " (x" + streak + ")");
+                } else if (r.Outcome == NodeSwitchOutcome.ApiNoResponse) {
+                    Log("切换失败: API无响应 (x" + streak + ")");
+                } else if (r.Outcome == NodeSwitchOutcome.PutFailed) {
+                    Log("切换失败: PUT " + SafeNodeName(r.Group) + " node=" + SafeNodeName(r.BestNode) + " (x" + streak + ")");
+                }
+            } catch { /* ignore */ }
+        }
+
+        if (streak < AUTO_SWITCH_NO_GOOD_NODE_STREAK_THRESHOLD) return;
+
+        // Escalation throttling
+        bool canEscalate = false;
+        long lastEscTicks = Interlocked.Read(ref lastAutoSwitchNoGoodNodeEscalateTicks);
+        try {
+            if (lastEscTicks <= 0 || (new TimeSpan(nowTicks - lastEscTicks)).TotalSeconds >= AUTO_SWITCH_NO_GOOD_NODE_ESCALATE_THROTTLE_SECONDS) canEscalate = true;
+        } catch { canEscalate = true; }
+        if (!canEscalate) return;
+
+        Interlocked.Exchange(ref lastAutoSwitchNoGoodNodeEscalateTicks, nowTicks);
+        Interlocked.Exchange(ref autoSwitchNoGoodNodeStreak, 0);
+
+        ThreadPool.QueueUserWorkItem(_ => RecoverFromNoGoodNode(r));
+    }
+
+    void RecoverFromNoGoodNode(NodeSwitchReport r) {
+        if (_isRestarting) return;
+        if (manualClientInterventionRequired) return;
+
+        // 客户端不在时不干涉（避免误判导致启动/重启 Clash）
+        bool clientRunning = true;
+        try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+        if (!clientRunning) return;
+
+        // If delay tests are timing out (close to timeout), it's likely a profile/egress issue; try subscription switch first.
+        bool severe = r.Outcome == NodeSwitchOutcome.DelayTooHigh && r.BestDelay >= SEVERE_DELAY_MS;
+        bool bypassCooldown = severe || r.Outcome == NodeSwitchOutcome.NoDelayHistory || r.Outcome == NodeSwitchOutcome.ApiNoResponse;
+
+        try { Log("升级: 无可用低延迟节点，尝试订阅切换/重启客户端"); } catch { /* ignore */ }
+
+        string oldName, newName;
+        if (TrySwitchSubscriptionForRecovery("NoGoodNode", out oldName, out newName, bypassCooldown)) {
+            RestartClash("订阅切换: " + oldName + " -> " + newName, true, "NoGoodNode");
+            return;
+        }
+
+        // Fallback: restart the whole client stack (core + background) to mimic "manual exit & re-enter".
+        RestartClash("无可用低延迟节点，重启客户端", true, "NoGoodNode");
     }
 
     void SwitchSubscriptionAndRestart(string reasonEvent, int switches) {
