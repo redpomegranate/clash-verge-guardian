@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v1.0.4
+- **版本**：v1.0.5
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -106,6 +106,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `GetGroupAllNodes`/`GetNodeDelay`/`FindSelectorGroup` | 节点组管理 |
 | `SwitchToBestNode`/`CleanBlacklist` | 节点切换和黑名单 |
 | `ClearBlacklist`/`RemoveCurrentNodeFromBlacklist` | 黑名单管理（托盘操作） |
+| `TryGetRecentSubscriptionProbe`/`RunSubscriptionHealthProbeWorker` | **订阅健康探测**：抽样 delay probe 判断订阅整体可用性（异常态触发，后台并行） |
 | `TriggerDelayTest`/`TestProxy` | 延迟测试和代理测试 |
 
 ### ClashGuardian.Monitor.cs
@@ -119,6 +120,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `CheckStatus` | Timer 入口，检查 `_isRestarting` 和 `_isChecking` 防重入 |
 | `DoCooldownCheck` | 冷却期检测：内核恢复+代理正常→立即结束冷却 |
 | `DoCheckInBackground` | 正常检测循环 |
+| `MaybeStartSubscriptionHealthProbe`/`TryHandleSubscriptionProbeDown` | **订阅健康探测**：异常首次出现时启动探测；确认订阅整体不可用时快速降级为“订阅切换/提示更换提供商” |
 | `UpdateUI` | UI 渲染（调用 EvaluateStatus 获取决策，应用状态，更新界面） |
 | `EvaluateStatus` | **纯决策函数**：输入当前状态，输出 `StatusDecision`，不修改实例 |
 

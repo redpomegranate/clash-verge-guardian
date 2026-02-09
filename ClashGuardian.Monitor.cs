@@ -66,7 +66,11 @@ public partial class ClashGuardian
 
     // 禁止自动重启/启动客户端时，用于抑制后续激进行为（避免反复打扰/弹窗风险）
     volatile bool manualClientInterventionRequired = false;
+    // 需要手动介入时给用户的提示（UI/托盘展示）。后台线程写，UI 线程读。
+    volatile string manualInterventionMessage = "";
+    int _isProbeDownEscalating = 0; // 0=空闲 1=已排队 probe-driven 恢复（防止 UI tick 重复排队）
     long lastManualInterventionLogTicks = 0;
+    long lastAllNodesDownLogTicks = 0;
 
     void CleanOldLogs() {
         try {
@@ -725,17 +729,20 @@ public partial class ClashGuardian
                                 if (!ok) {
                                     // 订阅切换 + 客户端重启 + 节点切换仍失败：避免无限循环打扰用户，降级为手动介入。
                                     manualClientInterventionRequired = true;
+                                    manualInterventionMessage = "订阅切换后仍未恢复，请手动检查 Clash/订阅";
                                     Log("订阅切换后仍未恢复，建议手动检查 Clash/订阅");
                                 }
                             } else if (!hasUsableNodes) {
                                 // 已明确无可用节点且无法切换订阅：停止激进行为，避免无限循环打扰用户。
                                 manualClientInterventionRequired = true;
+                                manualInterventionMessage = "所有节点不可用，请更换节点提供商";
                                 Log("无可用节点且订阅不可切换，建议手动检查 Clash/订阅");
                             }
 
                             if (!ok && autoSwitchSubscription && allowAutoStartClient && hasUsableNodes) {
                                 // 有节点可切换但仍未恢复：避免无限重启风暴，降级为需要手动介入。
                                 manualClientInterventionRequired = true;
+                                manualInterventionMessage = "多次恢复仍未成功，请手动检查 Clash/订阅";
                                 Log("多次恢复仍未成功，建议手动检查 Clash/订阅");
                             }
                         }
@@ -1085,10 +1092,14 @@ public partial class ClashGuardian
                 consecutiveOK++;
             }));
         } else {
-            this.BeginInvoke((Action)(() => {
-                statusLabel.Text = "● 状态: 等待内核...";
-                statusLabel.ForeColor = COLOR_WARNING;
-            }));
+            try {
+                if (this.IsHandleCreated) {
+                    this.BeginInvoke((Action)(() => {
+                        statusLabel.Text = "● 状态: 等待内核...";
+                        statusLabel.ForeColor = COLOR_WARNING;
+                    }));
+                }
+            } catch { /* ignore */ }
         }
 
         LogPerf("DoCooldownCheck", sw.ElapsedMilliseconds);
@@ -1125,6 +1136,11 @@ public partial class ClashGuardian
         int delay = TestProxy(out proxyOK, true);
         LogPerf("TestProxy", sw.ElapsedMilliseconds);
 
+        // 异常首次出现时：启动订阅健康探测（后台并行，不阻塞恢复管线）
+        if (running && (!proxyOK || (delay > highDelayThreshold))) {
+            MaybeStartSubscriptionHealthProbe("Tick", proxyOK, delay);
+        }
+
         DateTime now = DateTime.Now;
 
         int[] tcp = lastTcpStats;
@@ -1135,8 +1151,57 @@ public partial class ClashGuardian
 
         if ((now - lastDelayTestAt).TotalMinutes >= 6) { TriggerDelayTest(); lastDelayTestAt = now; }
 
-        this.BeginInvoke((Action)(() => UpdateUI(running, mem, handles, proxyOK, delay, tcp)));
+        try {
+            if (this.IsHandleCreated) {
+                this.BeginInvoke((Action)(() => UpdateUI(running, mem, handles, proxyOK, delay, tcp)));
+            }
+        } catch { /* ignore */ }
         LogPerf("DoCheckInBackground", sw.ElapsedMilliseconds);
+    }
+
+    void MaybeStartSubscriptionHealthProbe(string trigger, bool proxyOK, int delay) {
+        // 仅在异常态触发；后台并行，不阻塞主恢复管线
+        try {
+            if (_isDetectionPaused) return;
+            if (_isRestarting) return;
+            if (manualClientInterventionRequired) return;
+
+            long nowTicks = DateTime.Now.Ticks;
+            long lastStart = Interlocked.Read(ref lastSubscriptionProbeStartTicks);
+            try {
+                if (lastStart > 0 && (new TimeSpan(nowTicks - lastStart)).TotalMilliseconds < SUB_PROBE_MIN_INTERVAL_MS) return;
+            } catch { /* ignore */ }
+
+            if (Interlocked.CompareExchange(ref _isSubscriptionProbeRunning, 1, 0) != 0) return;
+
+            // Double-check throttle after gate acquired
+            lastStart = Interlocked.Read(ref lastSubscriptionProbeStartTicks);
+            try {
+                if (lastStart > 0 && (new TimeSpan(nowTicks - lastStart)).TotalMilliseconds < SUB_PROBE_MIN_INTERVAL_MS) {
+                    Interlocked.Exchange(ref _isSubscriptionProbeRunning, 0);
+                    return;
+                }
+            } catch { /* ignore */ }
+
+            Interlocked.Exchange(ref lastSubscriptionProbeStartTicks, nowTicks);
+
+            long pid = Interlocked.Increment(ref subscriptionProbeId);
+            long subSwitchSnapshot = Interlocked.Read(ref lastSubscriptionSwitchTicks);
+
+            Interlocked.Exchange(ref subscriptionProbeSubSwitchTicks, subSwitchSnapshot);
+            Interlocked.Exchange(ref subscriptionProbeProbed, 0);
+            Interlocked.Exchange(ref subscriptionProbeReachable, 0);
+            Interlocked.Exchange(ref subscriptionProbeBestDelay, 0);
+            subscriptionProbeGroup = "";
+            subscriptionProbeBestNode = "";
+            Interlocked.Exchange(ref subscriptionProbeUpdatedTicks, nowTicks);
+            Interlocked.Exchange(ref subscriptionProbeVerdict, (int)SubscriptionProbeVerdict.Running);
+
+            ThreadPool.QueueUserWorkItem(_ => RunSubscriptionHealthProbeWorker(pid, subSwitchSnapshot, trigger ?? ""));
+        } catch {
+            // Ensure gate won't get stuck on unexpected exceptions
+            try { Interlocked.Exchange(ref _isSubscriptionProbeRunning, 0); } catch { /* ignore */ }
+        }
     }
 
     // ==================== UI 更新（仅渲染，不含业务判断） ====================
@@ -1196,6 +1261,8 @@ public partial class ClashGuardian
 
         if (running && proxyOK) {
             manualClientInterventionRequired = false;
+            manualInterventionMessage = "";
+            Interlocked.Exchange(ref _isProbeDownEscalating, 0);
             Interlocked.Exchange(ref autoSwitchNoGoodNodeStreak, 0);
         }
 
@@ -1216,10 +1283,23 @@ public partial class ClashGuardian
         LogData(proxyOK, dl, mem, handles, tw, est, cw, cn, decision.Event);
 
         if (manualClientInterventionRequired) {
-            statusLabel.Text = "● 状态: 需要手动重启 Clash";
+            string msg = string.IsNullOrEmpty(manualInterventionMessage)
+                ? "需要手动重启 Clash"
+                : manualInterventionMessage;
+
+            statusLabel.Text = "● 状态: " + msg;
             statusLabel.ForeColor = COLOR_ERROR;
-            try { trayIcon.Text = "需要手动重启 Clash"; } catch { /* ignore */ }
+            try {
+                string tray = msg;
+                if (tray.Length > 63) tray = tray.Substring(0, 63);
+                trayIcon.Text = tray;
+            } catch { /* ignore */ }
             return;
+        }
+
+        // 订阅健康探测：若确认当前订阅整体不可用，则尽早切换订阅（或提示更换节点提供商）以缩短链路耗时。
+        if (running && !proxyOK) {
+            if (TryHandleSubscriptionProbeDown(decision.Event)) return;
         }
 
         // 订阅级自动切换（Clash Verge Rev）：连续成功切换多个节点仍不可用，则切换订阅并强制重启客户端
@@ -1298,6 +1378,82 @@ public partial class ClashGuardian
                 if (isAuto) Interlocked.Exchange(ref _isSwitchingNode, 0);
             }
         });
+    }
+
+    bool TryHandleSubscriptionProbeDown(string fallbackReasonEvent) {
+        if (manualClientInterventionRequired) return false;
+        if (_isRestarting) return false;
+
+        try {
+            bool clientRunning = IsAnyClientProcessRunning();
+            if (!clientRunning) return false;
+        } catch {
+            // Ignore and continue with conservative checks below.
+        }
+
+        SubscriptionProbeVerdict verdict;
+        int reachable, probed, bestDelay, ageSec;
+        string group, bestNode;
+        if (!TryGetRecentSubscriptionProbe(out verdict, out reachable, out probed, out group, out bestNode, out bestDelay, out ageSec)) return false;
+        if (verdict != SubscriptionProbeVerdict.ConfirmedDown) return false;
+        if (probed <= 0) return false;
+
+        string reasonEvent = string.IsNullOrEmpty(fallbackReasonEvent) ? "ProbeDown" : fallbackReasonEvent;
+
+        // 有可切换订阅：优先切订阅并强制重启客户端（比继续循环重启/切节点更快收敛）。
+        if (autoSwitchSubscription && allowAutoStartClient && subscriptionWhitelist != null && subscriptionWhitelist.Length >= 2) {
+            // Avoid thrashing: if we just switched recently, let the normal pipeline run.
+            try {
+                long lastTicks = Interlocked.Read(ref lastSubscriptionSwitchTicks);
+                if (lastTicks > 0) {
+                    double since = (DateTime.Now - new DateTime(lastTicks)).TotalSeconds;
+                    if (since < SUB_SWITCH_EMERGENCY_MIN_INTERVAL_SECONDS) return false;
+                }
+            } catch { /* ignore */ }
+
+            // 防止 UI tick 重复排队导致线程池风暴
+            if (Interlocked.CompareExchange(ref _isProbeDownEscalating, 1, 0) != 0) return true;
+
+            ThreadPool.QueueUserWorkItem(_ => {
+                try {
+                    if (_isRestarting) return;
+                    if (manualClientInterventionRequired) return;
+
+                    string oldName, newName;
+                    if (TrySwitchSubscriptionForRecovery(reasonEvent, out oldName, out newName, true)) {
+                        try { ClearBlacklist(); } catch { /* ignore */ }
+                        RestartClash("订阅切换: " + oldName + " -> " + newName, true, "ProbeDown");
+                    }
+                } catch (Exception ex) {
+                    Log("探测降级恢复异常: " + ex.Message);
+                } finally {
+                    try { Interlocked.Exchange(ref _isProbeDownEscalating, 0); } catch { /* ignore */ }
+                }
+            });
+
+            return true;
+        }
+
+        // 无可切换订阅：进入手动介入模式，停止自动循环并给出明确提示。
+        if (!autoSwitchSubscription || subscriptionWhitelist == null || subscriptionWhitelist.Length < 2) {
+            manualClientInterventionRequired = true;
+            manualInterventionMessage = "所有节点不可用，请更换节点提供商";
+
+            long nowTicks = DateTime.Now.Ticks;
+            long last = Interlocked.Read(ref lastAllNodesDownLogTicks);
+            bool canLog = false;
+            try {
+                if (last <= 0 || (new TimeSpan(nowTicks - last)).TotalSeconds >= 60) canLog = true;
+            } catch { canLog = true; }
+
+            if (canLog) {
+                Interlocked.Exchange(ref lastAllNodesDownLogTicks, nowTicks);
+                Log("探测结论: 当前订阅节点整体不可用，且无可切换订阅，请更换节点提供商");
+            }
+            return true;
+        }
+
+        return false;
     }
 
     void HandleAutoSwitchFailure(NodeSwitchReport r) {

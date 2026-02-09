@@ -57,8 +57,18 @@ public partial class ClashGuardian : Form
     private const int SUB_SWITCH_EMERGENCY_MIN_INTERVAL_SECONDS = 60;  // 紧急订阅切换最小间隔（绕过 cooldown 时）
     private const int PROXY_RECOVERY_FAST_WAIT_MS = 4500;              // 非 HMHD 恢复阶段的快速验证窗口（失败则尽快升级）
 
+    // 订阅健康探测（并行后台任务）：用于快速识别“当前订阅整体不可用”并升级为切换订阅
+    private const int SUB_PROBE_MIN_INTERVAL_MS = 60000;               // 探测最小间隔（避免频繁全局探测）
+    private const int SUB_PROBE_API_WAIT_MS = 16000;                   // 等待 API 就绪的最大时间（覆盖 core/client 重启窗口）
+    private const int SUB_PROBE_SAMPLE_A = 8;                          // 第一阶段抽样节点数（快速判断）
+    private const int SUB_PROBE_SAMPLE_B = 12;                         // 第二阶段抽样节点数（确认判断）
+    private const int SUB_PROBE_TIMEOUT_A = 3500;                      // 第一阶段单节点 delay timeout
+    private const int SUB_PROBE_TIMEOUT_B = 5000;                      // 第二阶段单节点 delay timeout
+    private const int SUB_PROBE_CONCURRENCY = 6;                       // 探测并发度（避免压垮 API）
+    private const int SUB_PROBE_RESULT_MAX_AGE_SECONDS = 60;           // 探测结果有效期（过期则视为未知）
+
     // 自动更新配置
-    private const string APP_VERSION = "1.0.4";
+    private const string APP_VERSION = "1.0.5";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -205,6 +215,20 @@ public partial class ClashGuardian : Form
     private long lastAutoSwitchNoGoodNodeTicks = 0;          // 上次失败时间（用于窗口重置）
     private long lastAutoSwitchNoGoodNodeLogTicks = 0;       // 日志节流
     private long lastAutoSwitchNoGoodNodeEscalateTicks = 0;  // 升级节流
+
+    // 订阅健康探测（跨线程：用 Interlocked / volatile）
+    private int _isSubscriptionProbeRunning = 0;             // 0=空闲 1=探测中
+    private long lastSubscriptionProbeStartTicks = 0;        // DateTime.Ticks (Interlocked 读写)
+    private long subscriptionProbeId = 0;                    // 探测任务递增 ID
+    private int subscriptionProbeVerdict = 0;                // SubscriptionProbeVerdict (int) (Interlocked 读写)
+    private long subscriptionProbeUpdatedTicks = 0;          // 最近更新时间（用于 age 判断）
+    private long subscriptionProbeSubSwitchTicks = 0;        // 启动探测时的 lastSubscriptionSwitchTicks 快照
+    private int subscriptionProbeProbed = 0;                 // 已探测节点数
+    private int subscriptionProbeReachable = 0;              // 可达节点数（delay>0 且 <SEVERE_DELAY_MS）
+    private int subscriptionProbeBestDelay = 0;              // 最佳 delay（Interlocked 更新）
+    private volatile string subscriptionProbeGroup = "";     // 探测时的 selector group
+    private volatile string subscriptionProbeBestNode = "";  // 最佳节点名
+    private int subscriptionProbeCursor = 0;                 // round-robin cursor（候选节点轮转）
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
     private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
 

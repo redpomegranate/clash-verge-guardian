@@ -484,6 +484,14 @@ public partial class ClashGuardian
         Exception,
     }
 
+    enum SubscriptionProbeVerdict {
+        Unknown = 0,
+        Running = 1,
+        HasReachableNodes = 2,
+        SuspectDown = 3,
+        ConfirmedDown = 4,
+    }
+
     struct NodeSwitchReport {
         public NodeSwitchOutcome Outcome;
         public string Group;
@@ -749,6 +757,281 @@ public partial class ClashGuardian
 
         r.Outcome = NodeSwitchOutcome.Exception;
         return r;
+    }
+
+    bool TryGetRecentSubscriptionProbe(out SubscriptionProbeVerdict verdict, out int reachable, out int probed,
+        out string group, out string bestNode, out int bestDelay, out int ageSeconds) {
+
+        verdict = SubscriptionProbeVerdict.Unknown;
+        reachable = 0;
+        probed = 0;
+        group = "";
+        bestNode = "";
+        bestDelay = 0;
+        ageSeconds = 0;
+
+        long updated = Interlocked.Read(ref subscriptionProbeUpdatedTicks);
+        if (updated <= 0) return false;
+
+        try {
+            ageSeconds = (int)(DateTime.Now - new DateTime(updated)).TotalSeconds;
+        } catch {
+            return false;
+        }
+
+        if (ageSeconds < 0) ageSeconds = 0;
+        if (ageSeconds > SUB_PROBE_RESULT_MAX_AGE_SECONDS) return false;
+
+        long snap = Interlocked.Read(ref subscriptionProbeSubSwitchTicks);
+        long cur = Interlocked.Read(ref lastSubscriptionSwitchTicks);
+        if (snap != 0 && cur != 0 && cur != snap) return false; // subscription changed after probe started
+
+        try {
+            verdict = (SubscriptionProbeVerdict)subscriptionProbeVerdict;
+        } catch {
+            verdict = SubscriptionProbeVerdict.Unknown;
+        }
+
+        reachable = Interlocked.CompareExchange(ref subscriptionProbeReachable, 0, 0);
+        probed = Interlocked.CompareExchange(ref subscriptionProbeProbed, 0, 0);
+        bestDelay = Interlocked.CompareExchange(ref subscriptionProbeBestDelay, 0, 0);
+        group = subscriptionProbeGroup ?? "";
+        bestNode = subscriptionProbeBestNode ?? "";
+        return true;
+    }
+
+    void SetSubscriptionProbeVerdict(SubscriptionProbeVerdict v) {
+        try {
+            Interlocked.Exchange(ref subscriptionProbeVerdict, (int)v);
+            Interlocked.Exchange(ref subscriptionProbeUpdatedTicks, DateTime.Now.Ticks);
+        } catch { /* ignore */ }
+    }
+
+    List<string> BuildProbeCandidates(string json, string group, HashSet<string> preferredSnapshot, HashSet<string> alreadyPicked, int desired,
+        out List<string> picked, out int allCount) {
+
+        picked = new List<string>();
+        allCount = 0;
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(group) || desired <= 0) return picked;
+
+        List<string> allNodes = GetGroupAllNodes(json, group);
+        allCount = allNodes != null ? allNodes.Count : 0;
+        if (allNodes == null || allNodes.Count == 0) return picked;
+
+        // Build eligible candidates (ignore blacklist to avoid false "down" due to past failures)
+        List<string> preferred = new List<string>();
+        List<string> normal = new List<string>();
+        string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
+
+        foreach (string nodeName in allNodes) {
+            if (string.IsNullOrEmpty(nodeName) || nodeName.Length > MAX_NODE_NAME_LENGTH) continue;
+
+            bool skip = false;
+            foreach (string sg in SKIP_GROUPS) { if (nodeName == sg) { skip = true; break; } }
+            if (skip) continue;
+
+            string nodeType = FindProxyType(json, nodeName);
+            foreach (string st in skipTypes) { if (nodeType == st) { skip = true; break; } }
+            if (skip) continue;
+
+            bool isPreferred = preferredSnapshot != null && preferredSnapshot.Contains(nodeName);
+
+            bool excluded = false;
+            if (disabledNodesExplicitMode) {
+                lock (disabledNodesLock) { excluded = disabledNodes.Contains(nodeName); }
+            } else if (excludeRegions != null && !isPreferred) {
+                foreach (string region in excludeRegions) {
+                    if (!string.IsNullOrEmpty(region) && nodeName.Contains(region)) { excluded = true; break; }
+                }
+            }
+            if (excluded) continue;
+
+            if (alreadyPicked != null && alreadyPicked.Contains(nodeName)) continue;
+
+            if (isPreferred) preferred.Add(nodeName);
+            else normal.Add(nodeName);
+        }
+
+        if (preferred.Count == 0 && normal.Count == 0) return picked;
+
+        // Prefer nodes with delay history first (fast win), then round-robin fill.
+        List<KeyValuePair<string, int>> withDelay = new List<KeyValuePair<string, int>>();
+        foreach (string n in preferred) {
+            int d = GetNodeDelay(json, n);
+            if (d > 0) withDelay.Add(new KeyValuePair<string, int>(n, d));
+        }
+        foreach (string n in normal) {
+            int d = GetNodeDelay(json, n);
+            if (d > 0) withDelay.Add(new KeyValuePair<string, int>(n, d));
+        }
+        withDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
+
+        foreach (var kv in withDelay) {
+            if (picked.Count >= desired) break;
+            picked.Add(kv.Key);
+        }
+
+        if (picked.Count < desired) {
+            int cursor = 0;
+            try { cursor = Interlocked.Increment(ref subscriptionProbeCursor); } catch { cursor = 0; }
+
+            int start = 0;
+            if (normal.Count > 0) {
+                try { start = (int)((long)(cursor * desired) % normal.Count); } catch { start = 0; }
+                if (start < 0) start = 0;
+            }
+
+            // Add preferred first (rotate too), but don't exceed desired
+            if (preferred.Count > 0 && picked.Count < desired) {
+                int pStart = 0;
+                try { pStart = (int)((long)(cursor * desired) % preferred.Count); } catch { pStart = 0; }
+                if (pStart < 0) pStart = 0;
+                for (int i = 0; i < preferred.Count && picked.Count < desired; i++) {
+                    string n = preferred[(pStart + i) % preferred.Count];
+                    if (!picked.Contains(n)) picked.Add(n);
+                }
+            }
+
+            for (int i = 0; i < normal.Count && picked.Count < desired; i++) {
+                string n = normal[(start + i) % normal.Count];
+                if (!picked.Contains(n)) picked.Add(n);
+            }
+        }
+
+        if (alreadyPicked != null) {
+            foreach (string n in picked) alreadyPicked.Add(n);
+        }
+
+        return picked;
+    }
+
+    void RunSubscriptionHealthProbeWorker(long probeId, long subSwitchSnapshot, string trigger) {
+        try {
+            // Abort if subscription has already changed
+            long cur = Interlocked.Read(ref lastSubscriptionSwitchTicks);
+            if (subSwitchSnapshot != 0 && cur != 0 && cur != subSwitchSnapshot) return;
+
+            SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.Running);
+
+            HashSet<string> preferredSnapshot = null;
+            lock (preferredNodesLock) {
+                if (preferredNodes != null && preferredNodes.Count > 0) preferredSnapshot = new HashSet<string>(preferredNodes);
+            }
+
+            HashSet<string> picked = new HashSet<string>();
+
+            bool anyReachable = false;
+            int bestDelay = int.MaxValue;
+            string bestNode = "";
+            string bestGroup = "";
+
+            // Return:  1=found reachable, 0=no reachable (API ok), -1=API/proxies/candidates unavailable (treat as Unknown)
+            Func<int, int, int> phase = (sampleCount, timeoutMs) => {
+                if (anyReachable) return 1;
+
+                // Wait for API ready (covers core/client restart windows). Do not count API down as node failure.
+                if (!WaitForApiReady(SUB_PROBE_API_WAIT_MS)) return -1;
+
+                string json = null;
+                for (int i = 0; i < 3 && string.IsNullOrEmpty(json); i++) {
+                    json = ApiRequest("/proxies", API_TIMEOUT_NORMAL);
+                    if (string.IsNullOrEmpty(json)) { try { Thread.Sleep(400); } catch { /* ignore */ } }
+                }
+                if (string.IsNullOrEmpty(json)) return -1;
+
+                string group = FindSelectorGroup(json);
+                if (string.IsNullOrEmpty(group)) return -1;
+
+                subscriptionProbeGroup = group;
+                bestGroup = group;
+
+                List<string> nodes;
+                int allCount;
+                BuildProbeCandidates(json, group, preferredSnapshot, picked, sampleCount, out nodes, out allCount);
+                if (nodes == null || nodes.Count == 0) return -1;
+
+                object bestLock = new object();
+                int found = 0; // 0=not found, 1=found (use Interlocked for cross-thread visibility)
+
+                using (SemaphoreSlim sem = new SemaphoreSlim(SUB_PROBE_CONCURRENCY, SUB_PROBE_CONCURRENCY))
+                using (CountdownEvent done = new CountdownEvent(nodes.Count)) {
+                    foreach (string node in nodes) {
+                        ThreadPool.QueueUserWorkItem(_ => {
+                            try {
+                                if (Interlocked.CompareExchange(ref found, 0, 0) != 0) return;
+                                sem.Wait();
+                                try {
+                                    if (Interlocked.CompareExchange(ref found, 0, 0) != 0) return;
+                                    int d = 0;
+                                    try { d = GetProxyDelayLive(node, timeoutMs); } catch { d = 0; }
+
+                                    Interlocked.Increment(ref subscriptionProbeProbed);
+
+                                    // Treat near-timeout delays as unreachable for "overall down" judgement.
+                                    if (d > 0 && d < SEVERE_DELAY_MS) {
+                                        Interlocked.Increment(ref subscriptionProbeReachable);
+                                        lock (bestLock) {
+                                            if (d < bestDelay) { bestDelay = d; bestNode = node; }
+                                        }
+                                        Interlocked.Exchange(ref found, 1);
+                                        anyReachable = true;
+                                    }
+                                } finally {
+                                    try { sem.Release(); } catch { /* ignore */ }
+                                }
+                            } catch { /* ignore */ }
+                            finally { try { done.Signal(); } catch { /* ignore */ } }
+                        });
+                    }
+
+                    try { done.Wait(); } catch { /* ignore */ }
+                }
+
+                if (anyReachable && bestDelay != int.MaxValue && !string.IsNullOrEmpty(bestNode)) {
+                    Interlocked.Exchange(ref subscriptionProbeBestDelay, bestDelay);
+                    subscriptionProbeBestNode = bestNode;
+                }
+
+                return anyReachable ? 1 : 0;
+            };
+
+            // Phase A: quick sample
+            int rA = phase(SUB_PROBE_SAMPLE_A, SUB_PROBE_TIMEOUT_A);
+            if (rA < 0) { SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.Unknown); return; }
+            if (rA > 0) {
+                SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.HasReachableNodes);
+                return;
+            }
+
+            SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.SuspectDown);
+
+            // Phase B: confirm sample
+            int rB = phase(SUB_PROBE_SAMPLE_B, SUB_PROBE_TIMEOUT_B);
+            if (rB < 0) { SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.Unknown); return; }
+            if (rB > 0) {
+                SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.HasReachableNodes);
+                return;
+            }
+
+            // If we couldn't probe anything, don't claim "down".
+            try {
+                int probed = Interlocked.CompareExchange(ref subscriptionProbeProbed, 0, 0);
+                if (probed <= 0) { SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.Unknown); return; }
+            } catch {
+                SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.Unknown);
+                return;
+            }
+
+            SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.ConfirmedDown);
+
+            // Persist best group even if down (helps logs/diagnostics)
+            if (!string.IsNullOrEmpty(bestGroup)) subscriptionProbeGroup = bestGroup;
+        } catch {
+            SetSubscriptionProbeVerdict(SubscriptionProbeVerdict.Unknown);
+        } finally {
+            try { Interlocked.Exchange(ref subscriptionProbeUpdatedTicks, DateTime.Now.Ticks); } catch { /* ignore */ }
+            try { Interlocked.Exchange(ref _isSubscriptionProbeRunning, 0); } catch { /* ignore */ }
+        }
     }
 
 
