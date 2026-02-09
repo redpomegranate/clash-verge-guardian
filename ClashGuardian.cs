@@ -40,8 +40,15 @@ public partial class ClashGuardian : Form
     private const int PROCESS_KILL_TIMEOUT = 3000;         // 终止进程等待超时 (ms)
     private const int MAX_LOG_SIZE = 1048576;              // 日志文件最大大小 (1MB)
 
+    // 恢复管线（高内存+高延迟）相关参数
+    private const int HMHD_CORE_RESET_ATTEMPTS = 2;        // 内核快速重置次数（每次后会刷新测速并切节点）
+    private const int HMHD_COOLDOWN_SECONDS = 60;          // 触发节流：避免短时间内反复重入恢复管线
+    private const int CORE_RECOVERY_MAX_WAIT_MS = 8000;    // Kill core 后等待 core 自动恢复的最大时间
+    private const int PROXY_RECOVERY_MAX_WAIT_MS = 8000;   // 等待代理恢复的最大时间（含重启/切换后验证）
+    private const int DELAY_REFRESH_MAX_WAIT_MS = 6000;    // 切节点前等待延迟历史可用的最大时间（触发 delay test 后轮询）
+
     // 自动更新配置
-    private const string APP_VERSION = "1.0.2";
+    private const string APP_VERSION = "1.0.3";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 

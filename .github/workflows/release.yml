@@ -1,0 +1,78 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+      - name: Prepare Release Notes + Hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.ref_name }}"
+
+          $exe = Join-Path $PWD "dist\ClashGuardian.exe"
+          if (-not (Test-Path $exe)) { throw "Missing artifact: $exe" }
+
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          $shaFile = Join-Path $PWD "dist\ClashGuardian.exe.sha256"
+          "$hash  ClashGuardian.exe" | Out-File -Encoding ascii -FilePath $shaFile
+
+          $readme = Join-Path $PWD "README.md"
+          if (-not (Test-Path $readme)) { throw "Missing README.md" }
+
+          # Extract the changelog section for this tag from README.md.
+          $text = Get-Content -Raw -Encoding utf8 $readme
+          $lines = $text -split "`r?`n"
+          $start = -1
+          for ($i = 0; $i -lt $lines.Length; $i++) {
+            if ($lines[$i] -match ("^###\\s+" + [regex]::Escape($tag) + "\\b")) { $start = $i; break }
+          }
+          if ($start -lt 0) { throw "Changelog section not found in README.md: ### $tag" }
+
+          $end = $lines.Length - 1
+          for ($i = $start + 1; $i -lt $lines.Length; $i++) {
+            if ($lines[$i] -match "^###\\s+v\\d+\\.\\d+\\.\\d+\\b") { $end = $i - 1; break }
+          }
+
+          $out = @()
+          $out += "# Clash Guardian Pro $tag"
+          $out += ""
+          $out += "## 更新日志（摘自 README.md）"
+          $out += ""
+          $out += $lines[$start..$end]
+          $out += ""
+          $out += "## 校验"
+          $out += ""
+          $out += "```text"
+          $out += "$hash  ClashGuardian.exe"
+          $out += "```"
+
+          $bodyPath = Join-Path $PWD "release_body.md"
+          $out | Out-File -Encoding utf8 -FilePath $bodyPath
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Clash Guardian Pro ${{ github.ref_name }}
+          body_path: release_body.md
+          files: |
+            dist/ClashGuardian.exe
+            dist/ClashGuardian.exe.sha256
+          fail_on_unmatched_files: true

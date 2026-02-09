@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v1.0.2
+- **版本**：v1.0.3
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -137,6 +137,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | 进程不存在 | 重启 | `ProcessDown` |
 | 内存 > 150MB | 无条件重启 | `CriticalMemory` |
 | 内存 > 70MB + 代理异常 | 重启 | `HighMemoryNoProxy` |
+| 内存 > 70MB + 代理正常 + 延迟 > 400ms | 重启（快速恢复管线） | `HighMemoryHighDelay` |
 | CloseWait > 20 + 代理异常 | 重启 | `CloseWaitLeak` |
 | 代理连续 2 次无响应 | 切换节点 | `NodeSwitch` |
 | 代理连续 4 次无响应 | 重启 | `ProxyTimeout` |
@@ -158,6 +159,11 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `_isDetectionPaused` | `volatile bool` | 暂停检测开关（跨线程读写） |
 
 ## 🔄 关键修复记录
+
+### v1.0.3 改进
+1. **修复：mihomo/meta 延迟测试接口不兼容** - `TriggerDelayTest` 使用 `/proxies/{name}/delay`，避免 `/group/{name}/delay` 404 导致“请先测速”死循环（影响自动切节点与恢复链路）
+2. **增强：无 delay 历史时的实时探测** - 自动切节点在 delay history 不可用时，对候选节点做实时 delay probe 后再切换（有限并发、轮转覆盖）
+3. **优化：恢复链路升级** - “内核恢复但代理未恢复”时：强制重启客户端（尽量模拟手动退出重进，包含后台进程）→刷新/切换低延迟节点（最多 2 次）→订阅切换+强制重启→再次刷新/切换（2 次）→再失败则停止继续自动循环（需要人工介入）
 
 ### v1.0.0 改进
 1. **禁用名单可配置** - 托盘“禁用名单”勾选节点，写入 `disabledNodes`，并覆盖 `excludeRegions`

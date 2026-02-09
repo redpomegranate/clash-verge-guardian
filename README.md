@@ -1,4 +1,4 @@
-﻿# Clash Guardian Pro v1.0.1 - 多内核智能守护进程
+﻿# Clash Guardian Pro v1.0.3 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -149,11 +149,12 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 | 进程不存在 | - | 立即重启 |
 | 内存极高 | > 150 MB | 无条件重启 |
 | 内存较高 + 代理无响应 | > 70 MB | 立即重启 |
+| 内存较高 + 延迟过高 | > 70 MB 且延迟 > 400ms | 快速恢复：重置内核(最多2次)→刷新测速→切节点；无效则升级重启客户端；仍无效可切订阅（Clash Verge Rev，可选） |
 | 连接泄漏 + 代理无响应 | CLOSE_WAIT > 20 | 立即重启 |
 | 代理无响应 | 连续 2 次 | 切换节点（加入黑名单） |
 | 代理无响应 | 连续 4 次 | 重启程序 |
 | 延迟过高 | > 400ms 连续 2 次 | 切换节点 |
-| 内存较高但代理正常 | > 70 MB | 仅记录，不重启 |
+| 内存较高但代理正常 | > 70 MB 且延迟正常 | 仅记录，不重启 |
 
 ## 🚀 使用方法
 
@@ -257,6 +258,7 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 | `ProcessDown` | 进程不存在 |
 | `CriticalMemory` | 内存极高 (>150MB) |
 | `HighMemoryNoProxy` | 内存高+代理无响应 |
+| `HighMemoryHighDelay` | 内存较高 + 延迟过高（快速恢复管线） |
 | `CloseWaitLeak` | 连接泄漏 |
 | `ProxyFail` | 代理无响应 |
 | `NodeSwitch` | 触发节点切换 |
@@ -298,7 +300,53 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 3. 程序需要管理员权限来终止和启动进程
 4. 代理测试端口需与 Clash 客户端设置一致
 
+## 🧭 自动恢复流程（流程图）
+
+```mermaid
+flowchart TD
+  A[Timer CheckStatus] --> B[DoCheckInBackground]
+  B --> C[EvaluateStatus -> StatusDecision]
+
+  C -->|NeedSwitch| SW[切换节点]
+  C -->|NeedRestart| RS[重启管线 RestartClash]
+  C -->|No action| UI[仅更新UI/统计]
+
+  RS --> HM{HighMemoryHighDelay?}
+  HM -->|是| HMPIPE[快速内核重置 x2<br/>每次: 刷新测速 -> 切最佳节点 -> 验证代理+延迟]
+  HMPIPE -->|恢复| OK[恢复正常]
+  HMPIPE -->|仍失败| UP[升级: 重启客户端]
+
+  HM -->|否| NORMAL[常规: 杀内核 -> 等待自动恢复(<=8s) -> 验证代理]
+  NORMAL -->|恢复| OK
+  NORMAL -->|代理未恢复| UP
+
+  UP --> AUTO{allowAutoStartClient=true?}
+  AUTO -->|否| STOP[停止自动操作<br/>提示手动介入]
+
+  AUTO -->|是| CR[强制重启客户端(含后台进程)]
+  CR --> READY[等待内核+API就绪]
+  READY --> CHECK{代理/延迟恢复?}
+  CHECK -->|恢复| OK
+  CHECK -->|仍失败| TRY2[刷新测速并切节点(最多2次)]
+  TRY2 -->|恢复| OK
+  TRY2 -->|仍失败| SUB{可切换订阅? <br/>(autoSwitchSubscription & whitelist>=2 & cooldown ok)}
+  SUB -->|否| STOP
+  SUB -->|是| SUB2[切换订阅 -> 强制重启客户端]
+  SUB2 --> TRY2B[订阅切换后再刷新/切节点(2次)]
+  TRY2B -->|恢复| OK
+  TRY2B -->|仍失败| STOP
+```
+
+补充说明：
+- 当进入 `STOP`（需要手动介入）后，Guardian 会**停止继续自动重启/自动切换/自动订阅切换**，避免无限循环干扰；当代理恢复正常后会自动退出该状态。
+- 节点切换在 delay history 不可用时，会回退到 `/proxies/{name}/delay` 的实时探测后再切换，避免“请先测速”的死循环。
+
 ## 🔄 更新日志
+
+### v1.0.3 (2026-02-09)
+- **修复：mihomo/meta 延迟测试接口不兼容** - `TriggerDelayTest` 改为 `/proxies/{name}/delay`，避免 `/group/{name}/delay` 404 导致“请先测速”死循环（影响自动切节点与恢复链路）
+- **增强：无 delay 历史时的实时探测** - 自动切节点在 delay history 不可用时，会对候选节点做实时 delay probe（有限并发、轮转覆盖）后再切换，避免重启后“无可用节点”
+- **优化：客户端重启后恢复链路** - 客户端重启后若仍不恢复：立即刷新低延迟节点并尝试切换（最多 2 次）；仍无效且启用 `autoSwitchSubscription` 时切换订阅并强制重启客户端；订阅切换后再次刷新并切换 2 次；再失败则停止继续自动循环（需要人工介入）
 
 ### v1.0.2 (2026-02-08)
 - **修复：`--watch-clash` 稳定性** - 进程名变体匹配、启用后立即生效、禁用后可停止 Watcher
@@ -370,7 +418,3 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 ## 📄 License
 
 MIT License
-
-
-
-

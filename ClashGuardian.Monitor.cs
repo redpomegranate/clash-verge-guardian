@@ -59,6 +59,7 @@ public partial class ClashGuardian
     // 应急/激进策略节流与统计（ticks 用于 Interlocked）
     long lastRestartTicks = 0;
     long lastEmergencyTicks = 0;
+    long lastHighMemHighDelayTicks = 0;
     long prevProxyTimeoutRestartTicks = 0;
     long lastProxyTimeoutRestartTicks = 0;
     int cooldownProxyFailStreak = 0;
@@ -279,6 +280,243 @@ public partial class ClashGuardian
     }
 
     // ==================== 重启管理 ====================
+    bool WaitForApiReady(int maxWaitMs) {
+        if (maxWaitMs <= 0) return false;
+        int waited = 0;
+        while (waited < maxWaitMs) {
+            try {
+                string v = ApiRequest("/version", API_TIMEOUT_FAST);
+                if (!string.IsNullOrEmpty(v)) return true;
+            } catch { /* ignore */ }
+
+            int sleep = 500;
+            if (waited + sleep > maxWaitMs) sleep = maxWaitMs - waited;
+            if (sleep <= 0) break;
+            Thread.Sleep(sleep);
+            waited += sleep;
+        }
+        return false;
+    }
+
+    void KillCoreProcessesOnce() {
+        if (coreProcessNames == null || coreProcessNames.Length == 0) return;
+        foreach (string name in coreProcessNames) {
+            if (string.IsNullOrEmpty(name)) continue;
+            try {
+                Process[] procs = Process.GetProcessesByName(name);
+                foreach (var p in procs) {
+                    try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); }
+                    catch { /* 进程可能已退出 */ }
+                    try { p.Dispose(); } catch { /* ignore */ }
+                }
+            } catch { /* 终止失败可忽略 */ }
+        }
+    }
+
+    bool WaitForCoreBack(int maxWaitMs) {
+        if (maxWaitMs <= 0) maxWaitMs = CORE_RECOVERY_MAX_WAIT_MS;
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < maxWaitMs) {
+            if (coreProcessNames != null) {
+                foreach (string name in coreProcessNames) {
+                    if (string.IsNullOrEmpty(name)) continue;
+                    try {
+                        Process[] procs = Process.GetProcessesByName(name);
+                        if (procs != null && procs.Length > 0) {
+                            detectedCoreName = name;
+                            foreach (var p in procs) { try { p.Dispose(); } catch { /* ignore */ } }
+                            return true;
+                        }
+                        if (procs != null) foreach (var p in procs) { try { p.Dispose(); } catch { /* ignore */ } }
+                    } catch { /* 探测失败可忽略 */ }
+                }
+            }
+            Thread.Sleep(250);
+        }
+        return false;
+    }
+
+    bool TryTaskKillPidTree(int pid) {
+        if (pid <= 0) return false;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo("taskkill", "/PID " + pid + " /T /F");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process p = Process.Start(psi)) {
+                if (p != null) {
+                    try { p.WaitForExit(PROCESS_KILL_TIMEOUT + 5000); } catch { /* ignore */ }
+                }
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    void KillClientProcessesAggressively() {
+        try {
+            HashSet<int> pids = new HashSet<int>();
+            string[] killNames = (clientProcessNamesExpanded != null && clientProcessNamesExpanded.Length > 0)
+                ? clientProcessNamesExpanded
+                : clientProcessNames;
+
+            if (killNames != null) {
+                foreach (string clientName in killNames) {
+                    if (string.IsNullOrEmpty(clientName)) continue;
+                    try {
+                        Process[] procs = Process.GetProcessesByName(clientName);
+                        foreach (var p in procs) {
+                            try { pids.Add(p.Id); } catch { /* ignore */ }
+                            try { p.Dispose(); } catch { /* ignore */ }
+                        }
+                    } catch { /* ignore */ }
+                }
+            }
+
+            // Extra safety: also kill any process that matches the detected client exe path.
+            string clientPath = detectedClientPath; // volatile read
+            if (!string.IsNullOrEmpty(clientPath)) {
+                try {
+                    Process[] all = Process.GetProcesses();
+                    foreach (var p in all) {
+                        try {
+                            string fp = "";
+                            try { fp = p.MainModule.FileName; } catch { fp = ""; }
+                            if (!string.IsNullOrEmpty(fp) && string.Equals(fp, clientPath, StringComparison.OrdinalIgnoreCase)) {
+                                try { pids.Add(p.Id); } catch { /* ignore */ }
+                            }
+                        } catch { /* ignore */ }
+                        finally { try { p.Dispose(); } catch { /* ignore */ } }
+                    }
+                } catch { /* ignore */ }
+            }
+
+            foreach (int pid in pids) {
+                try {
+                    if (!TryTaskKillPidTree(pid)) {
+                        try {
+                            Process p = Process.GetProcessById(pid);
+                            try { p.Kill(); } catch { /* ignore */ }
+                            try { p.WaitForExit(PROCESS_KILL_TIMEOUT); } catch { /* ignore */ }
+                            try { p.Dispose(); } catch { /* ignore */ }
+                        } catch { /* ignore */ }
+                    }
+                } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+    }
+
+    bool TryRefreshDelayAndSwitchBestNode() {
+        try {
+            if (!WaitForApiReady(2000)) {
+                try { AutoDiscoverApi(); } catch { /* ignore */ }
+                if (!WaitForApiReady(2000)) return false;
+            }
+            bool ok = false;
+            try { ok = SwitchToBestNodeRefreshed(); } catch { ok = false; }
+            if (ok) {
+                try {
+                    if (this.IsHandleCreated) {
+                        this.BeginInvoke((Action)(() => { failCount = 0; RefreshNodeDisplay(); }));
+                    }
+                } catch { /* ignore */ }
+            }
+            return ok;
+        } catch {
+            return false;
+        }
+    }
+
+    bool RestartClientOnce(bool requireGoodDelay) {
+        // Full "exit and re-enter" effect as much as possible: kill core + kill client tree + start client.
+        try {
+            KillCoreProcessesOnce();
+        } catch { /* ignore */ }
+
+        try { Thread.Sleep(300); } catch { /* ignore */ }
+
+        try {
+            KillClientProcessesAggressively();
+        } catch { /* ignore */ }
+
+        try { Thread.Sleep(1000); } catch { /* ignore */ }
+
+        // 启动客户端（客户端会自动启动内核）
+        string clientPath = detectedClientPath; // volatile read
+        bool started = false;
+
+        if (!string.IsNullOrEmpty(clientPath) && File.Exists(clientPath)) {
+            started = StartClientProcess(clientPath);
+        }
+
+        // 如果已知路径无效，尝试默认路径
+        if (!started) {
+            foreach (string path in clientPaths) {
+                if (File.Exists(path)) {
+                    started = StartClientProcess(path);
+                    if (started) { detectedClientPath = path; break; }
+                }
+            }
+        }
+
+        if (!started) {
+            Log("未找到客户端路径，无法恢复");
+            return false;
+        }
+
+        // 等待客户端启动内核 + API 可用
+        WaitForCoreBack(CORE_RECOVERY_MAX_WAIT_MS + 6000);
+        if (!WaitForApiReady(6000)) {
+            try { AutoDiscoverApi(); } catch { /* ignore */ }
+            WaitForApiReady(3000);
+        }
+        DetectRunningCore();
+
+        // 刷新测速并切节点（用于高延迟恢复管线）
+        if (requireGoodDelay) {
+            TryRefreshDelayAndSwitchBestNode();
+            return WaitForProxyRecoveryAndDelay(PROXY_RECOVERY_MAX_WAIT_MS, highDelayThreshold);
+        }
+
+        return WaitForProxyRecovery(PROXY_RECOVERY_MAX_WAIT_MS);
+    }
+
+    bool ValidateRecovery(bool requireGoodDelay) {
+        if (requireGoodDelay) return WaitForProxyRecoveryAndDelay(PROXY_RECOVERY_MAX_WAIT_MS, highDelayThreshold);
+        return WaitForProxyRecovery(PROXY_RECOVERY_MAX_WAIT_MS);
+    }
+
+    bool TrySwitchSubscriptionForRecovery(string reasonEvent, out string oldName, out string newName) {
+        oldName = "";
+        newName = "";
+
+        if (!autoSwitchSubscription) return false;
+        if (subscriptionWhitelist == null || subscriptionWhitelist.Length < 2) return false;
+
+        DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
+        if ((DateTime.Now - lastSub).TotalMinutes < subscriptionSwitchCooldownMinutes) return false;
+
+        lock (subscriptionLock) {
+            if (_isSwitchingSubscription) return false;
+            _isSwitchingSubscription = true;
+        }
+
+        try {
+            if (!TrySwitchClashVergeRevSubscription(subscriptionWhitelist, out oldName, out newName)) return false;
+
+            Interlocked.Exchange(ref lastSubscriptionSwitchTicks, DateTime.Now.Ticks);
+            Log("订阅切换: " + oldName + " -> " + newName + " (reason=" + (reasonEvent ?? "") + ")");
+            return true;
+        } catch (Exception ex) {
+            Log("订阅切换异常: " + ex.Message);
+            return false;
+        } finally {
+            _isSwitchingSubscription = false;
+        }
+    }
+
     void RestartClash(string reason, bool forceRestartClient = false, string eventName = "") {
         // 防止并发重启（手动+自动 或 多次自动）
         lock (restartLock) {
@@ -287,6 +525,25 @@ public partial class ClashGuardian
         }
 
         try {
+            bool requireGoodDelay = string.Equals(eventName, "HighMemoryHighDelay", StringComparison.Ordinal);
+
+            // 高内存+高延迟：节流，避免短时间反复重置内核/重启客户端
+            if (requireGoodDelay) {
+                long nowTicks0 = DateTime.Now.Ticks;
+                long lastTicks0 = Interlocked.Read(ref lastHighMemHighDelayTicks);
+                bool throttled = false;
+                try {
+                    if (lastTicks0 > 0 && (new TimeSpan(nowTicks0 - lastTicks0)).TotalSeconds < HMHD_COOLDOWN_SECONDS) throttled = true;
+                } catch { throttled = false; }
+
+                if (throttled) {
+                    Log("节流: 内存高+延迟过高，刷新测速并切节点");
+                    TryRefreshDelayAndSwitchBestNode();
+                    return;
+                }
+                Interlocked.Exchange(ref lastHighMemHighDelayTicks, nowTicks0);
+            }
+
             if (string.Equals(eventName, "ProxyTimeout", StringComparison.Ordinal)) {
                 long nowTicks = DateTime.Now.Ticks;
                 long prevLast = Interlocked.Exchange(ref lastProxyTimeoutRestartTicks, nowTicks);
@@ -322,45 +579,49 @@ public partial class ClashGuardian
                 }));
             }
 
-            // ===== 第 1 步：终止所有内核进程 =====
-            foreach (string name in coreProcessNames) {
-                try {
-                    Process[] procs = Process.GetProcessesByName(name);
-                    foreach (var p in procs) {
-                        try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); }
-                        catch { /* 进程可能已退出 */ }
-                        p.Dispose();
-                    }
-                } catch { /* 终止失败：进程可能已退出 */ }
-            }
-
-            // ===== 第 2 步：等待客户端自动重启内核（5 秒） =====
-            Thread.Sleep(5000);
-
-            // ===== 第 3 步：检查内核是否已自动恢复 =====
+            // ===== 恢复管线：Kill core -> 等待恢复 -> (可选)刷新测速+切节点 -> 验证 =====
             bool coreBack = false;
-            foreach (string name in coreProcessNames) {
-                try {
-                    Process[] procs = Process.GetProcessesByName(name);
-                    if (procs.Length > 0) {
-                        coreBack = true;
-                        detectedCoreName = name;
-                        foreach (var p in procs) p.Dispose();
+            bool needRestartClient = forceRestartClient;
+
+            if (!needRestartClient) {
+                int attempts = requireGoodDelay ? HMHD_CORE_RESET_ATTEMPTS : 1;
+                for (int i = 1; i <= attempts; i++) {
+                    if (requireGoodDelay && attempts > 1) {
+                        Log("快速重置内核: " + i + "/" + attempts);
+                    }
+
+                    KillCoreProcessesOnce();
+                    coreBack = WaitForCoreBack(CORE_RECOVERY_MAX_WAIT_MS);
+
+                    if (!coreBack) {
+                        needRestartClient = true;
                         break;
                     }
-                    foreach (var p in procs) p.Dispose();
-                } catch { /* 探测失败可忽略 */ }
-            }
 
-            bool needRestartClient = forceRestartClient;
-            if (coreBack && !forceRestartClient) {
-                // 仅检测到进程存在并不足以说明网络恢复，增加代理可用性验证
-                if (WaitForProxyRecovery(6000)) {
-                    manualClientInterventionRequired = false;
-                    Log("内核已自动恢复");
-                } else {
-                    Log("内核已自动恢复但代理未恢复，升级为重启客户端");
-                    needRestartClient = true;
+                    // 每次重置内核后：刷新延迟历史 -> 切到当前可用低延迟节点
+                    if (requireGoodDelay) {
+                        TryRefreshDelayAndSwitchBestNode();
+                        if (WaitForProxyRecoveryAndDelay(PROXY_RECOVERY_MAX_WAIT_MS, highDelayThreshold)) {
+                            manualClientInterventionRequired = false;
+                            Log("内核已自动恢复");
+                            break;
+                        }
+                        if (i >= attempts) {
+                            Log("内核已恢复但代理/延迟未恢复，升级为重启客户端");
+                            needRestartClient = true;
+                        }
+                        continue;
+                    }
+
+                    // 常规恢复：只要代理恢复即可
+                    if (WaitForProxyRecovery(PROXY_RECOVERY_MAX_WAIT_MS)) {
+                        manualClientInterventionRequired = false;
+                        Log("内核已自动恢复");
+                    } else {
+                        Log("内核已自动恢复但代理未恢复，升级为重启客户端");
+                        needRestartClient = true;
+                    }
+                    break;
                 }
             }
 
@@ -390,53 +651,58 @@ public partial class ClashGuardian
                 } else {
                     manualClientInterventionRequired = false;
 
-                    // ===== 第 4 步：内核未恢复，或需要强制重启客户端（例如切换订阅后生效） =====
+                    // ===== 客户端级恢复：尽量做到“手动退出重进”的效果 =====
                     if (needRestartClient) Log("强制重启客户端");
                     else Log("内核未自动恢复，重启客户端");
 
-                    // 先终止客户端
-                    string[] killNames = (clientProcessNamesExpanded != null && clientProcessNamesExpanded.Length > 0)
-                        ? clientProcessNamesExpanded
-                        : clientProcessNames;
-                    foreach (string clientName in killNames) {
-                        try {
-                            Process[] procs = Process.GetProcessesByName(clientName);
-                            foreach (var p in procs) {
-                                try { p.Kill(); p.WaitForExit(PROCESS_KILL_TIMEOUT); }
-                                catch { /* 进程可能已退出 */ }
-                                p.Dispose();
+                    bool ok = RestartClientOnce(requireGoodDelay);
+                    if (!ok) Log("客户端重启后代理/延迟仍未恢复");
+
+                    // 客户端重启仍无效：先尝试检测可用节点并切换（最多 2 次）。
+                    // 若无可用节点（无 delay 历史/无法测速），或切换两次仍不恢复，则进入订阅切换（如已启用）。
+                    if (!ok) {
+                        bool hasUsableNodes = true;
+                        for (int i = 1; i <= 2; i++) {
+                            if (!TryRefreshDelayAndSwitchBestNode()) {
+                                hasUsableNodes = false;
+                                break;
                             }
-                        } catch { /* 客户端终止失败可忽略 */ }
-                    }
+                            if (ValidateRecovery(requireGoodDelay)) { ok = true; break; }
+                        }
 
-                    Thread.Sleep(1000);
+                        if (!ok) {
+                            string oldName, newName;
+                            if (TrySwitchSubscriptionForRecovery(eventName, out oldName, out newName)) {
+                                Log("强制重启客户端(订阅切换后生效)");
+                                ok = RestartClientOnce(requireGoodDelay);
+                                if (!ok) Log("订阅切换后代理/延迟仍未恢复");
 
-                    // 启动客户端（客户端会自动启动内核）
-                    string clientPath = detectedClientPath; // volatile read
-                    bool started = false;
+                                // 切换订阅后再尝试切换节点（最多 2 次），给新订阅一次机会。
+                                if (!ok) {
+                                    for (int i = 1; i <= 2; i++) {
+                                        if (!TryRefreshDelayAndSwitchBestNode()) break;
+                                        if (ValidateRecovery(requireGoodDelay)) { ok = true; break; }
+                                    }
+                                }
 
-                    if (!string.IsNullOrEmpty(clientPath) && File.Exists(clientPath)) {
-                        started = StartClientProcess(clientPath);
-                    }
+                                if (!ok) {
+                                    // 订阅切换 + 客户端重启 + 节点切换仍失败：避免无限循环打扰用户，降级为手动介入。
+                                    manualClientInterventionRequired = true;
+                                    Log("订阅切换后仍未恢复，建议手动检查 Clash/订阅");
+                                }
+                            } else if (!hasUsableNodes) {
+                                // 已明确无可用节点且无法切换订阅：停止激进行为，避免无限循环打扰用户。
+                                manualClientInterventionRequired = true;
+                                Log("无可用节点且订阅不可切换，建议手动检查 Clash/订阅");
+                            }
 
-                    // 如果已知路径无效，尝试默认路径
-                    if (!started) {
-                        foreach (string path in clientPaths) {
-                            if (File.Exists(path)) {
-                                started = StartClientProcess(path);
-                                if (started) { detectedClientPath = path; break; }
+                            if (!ok && autoSwitchSubscription && allowAutoStartClient && hasUsableNodes) {
+                                // 有节点可切换但仍未恢复：避免无限重启风暴，降级为需要手动介入。
+                                manualClientInterventionRequired = true;
+                                Log("多次恢复仍未成功，建议手动检查 Clash/订阅");
                             }
                         }
                     }
-
-                    if (!started) {
-                        Log("未找到客户端路径，无法恢复");
-                    } else {
-                        // 等待客户端启动内核
-                        Thread.Sleep(5000);
-                    }
-
-                    DetectRunningCore();
                 }
             }
 
@@ -461,6 +727,27 @@ public partial class ClashGuardian
             bool ok = false;
             try { TestProxy(out ok, true); } catch { ok = false; }
             if (ok) return true;
+
+            int sleep = 1000;
+            if (waited + sleep > maxWaitMs) sleep = maxWaitMs - waited;
+            if (sleep <= 0) break;
+            Thread.Sleep(sleep);
+            waited += sleep;
+        }
+        return false;
+    }
+
+    bool WaitForProxyRecoveryAndDelay(int maxWaitMs, int maxDelayMs) {
+        if (maxWaitMs <= 0) return false;
+        int waited = 0;
+        while (waited < maxWaitMs) {
+            bool ok = false;
+            int d = 0;
+            try { d = TestProxy(out ok, true); } catch { ok = false; d = 0; }
+            if (ok) {
+                if (maxDelayMs <= 0) return true;
+                if (d > 0 && d <= maxDelayMs) return true;
+            }
 
             int sleep = 1000;
             if (waited + sleep > maxWaitMs) sleep = maxWaitMs - waited;
@@ -660,7 +947,9 @@ public partial class ClashGuardian
     bool StartClientProcess(string path) {
         try {
             ProcessStartInfo psi = new ProcessStartInfo(path);
+            try { psi.WorkingDirectory = Path.GetDirectoryName(path); } catch { /* ignore */ }
             psi.WindowStyle = ProcessWindowStyle.Minimized;
+            psi.UseShellExecute = true;
             Process.Start(psi);
             Log("客户端已启动: " + path);
             return true;
@@ -914,16 +1203,19 @@ public partial class ClashGuardian
         }
 
         // 执行决策（在后台线程，避免阻塞 UI）
-        if (decision.NeedSwitch || decision.NeedRestart) {
+        // 注意：若需要重启，则不并行触发切节点，避免重启与切换并发导致竞态。
+        if (decision.NeedRestart) {
             bool clientRunning = true;
             try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
             if (!clientRunning) return;
+            ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason, false, decision.Event));
+            return;
         }
         if (decision.NeedSwitch) {
+            bool clientRunning = true;
+            try { clientRunning = IsAnyClientProcessRunning(); } catch { clientRunning = true; }
+            if (!clientRunning) return;
             QueueSwitchToBestNode(true);
-        }
-        if (decision.NeedRestart) {
-            ThreadPool.QueueUserWorkItem(_ => RestartClash(decision.Reason, false, decision.Event));
         }
     }
 
@@ -1122,6 +1414,15 @@ public partial class ClashGuardian
             d.Reason = "内存高+无响应";
             d.Event = "HighMemoryNoProxy";
             d.HasIssue = true;
+        }
+        else if (mem > memoryWarning && proxyOK && delay > highDelayThreshold) {
+            // 从第一次检测到“内存高+高延迟”就触发快速恢复管线（重置内核->刷新测速->切节点...）
+            d.NeedRestart = true;
+            d.Reason = "内存高+延迟过高" + delay + "ms";
+            d.Event = "HighMemoryHighDelay";
+            d.HasIssue = true;
+            d.ResetConsecutiveOK = true;
+            d.ResetStableTime = true;
         }
         else if (cw > CLOSE_WAIT_THRESHOLD && !proxyOK) {
             d.NeedRestart = true;

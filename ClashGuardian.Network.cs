@@ -197,6 +197,9 @@ public partial class ClashGuardian
         "🚀 节点选择", "♻️ 自动选择", "🎯 全球直连", "🛑 全球拦截"
     };
 
+    // Used to rotate live delay probes across large node sets (avoid probing the same few nodes every time).
+    int delayProbeCursor = 0;
+
     void GetCurrentNode(int timeout = API_TIMEOUT_NORMAL) {
         try {
             string json = ApiRequest("/proxies", timeout);
@@ -358,7 +361,128 @@ public partial class ClashGuardian
         return candidates;
     }
 
+    bool HasAnyDelayHistoryInGroup(string proxiesJson, string selectorGroup) {
+        if (string.IsNullOrEmpty(proxiesJson) || string.IsNullOrEmpty(selectorGroup)) return false;
+        try {
+            List<string> allNodes = GetGroupAllNodes(proxiesJson, selectorGroup);
+            if (allNodes == null || allNodes.Count == 0) return false;
+            string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
+            foreach (string nodeName in allNodes) {
+                if (string.IsNullOrEmpty(nodeName) || nodeName.Length > MAX_NODE_NAME_LENGTH) continue;
+
+                bool skip = false;
+                foreach (string sg in SKIP_GROUPS) { if (nodeName == sg) { skip = true; break; } }
+                if (skip) continue;
+
+                string nodeType = FindProxyType(proxiesJson, nodeName);
+                foreach (string st in skipTypes) { if (nodeType == st) { skip = true; break; } }
+                if (skip) continue;
+
+                int delay = GetNodeDelay(proxiesJson, nodeName);
+                if (delay > 0) return true;
+            }
+        } catch { /* ignore */ }
+        return false;
+    }
+
+    string RefreshProxiesDelayHistory(string selectorGroup, int maxWaitMs) {
+        // Trigger delay test, then poll /proxies until some history.delay becomes available.
+        if (maxWaitMs <= 0) maxWaitMs = DELAY_REFRESH_MAX_WAIT_MS;
+        try {
+            nodeGroup = selectorGroup;
+            TriggerDelayTest();
+
+            Stopwatch sw = Stopwatch.StartNew();
+            string lastJson = null;
+            while (sw.ElapsedMilliseconds < maxWaitMs) {
+                Thread.Sleep(500);
+                lastJson = ApiRequest("/proxies", API_TIMEOUT_FAST);
+                if (string.IsNullOrEmpty(lastJson)) continue;
+
+                // Group may change after restart; keep it fresh.
+                string g2 = FindSelectorGroup(lastJson);
+                if (!string.IsNullOrEmpty(g2)) {
+                    selectorGroup = g2;
+                    nodeGroup = g2;
+                }
+
+                if (HasAnyDelayHistoryInGroup(lastJson, selectorGroup)) return lastJson;
+            }
+            return lastJson;
+        } catch {
+            return null;
+        }
+    }
+
+    int ParseDelayValue(string json) {
+        if (string.IsNullOrEmpty(json)) return 0;
+        int idx = json.IndexOf("\"delay\":", StringComparison.Ordinal);
+        if (idx < 0) return 0;
+        int start = idx + 8;
+        while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) start++;
+        int end = start;
+        while (end < json.Length && json[end] >= '0' && json[end] <= '9') end++;
+        if (end <= start) return 0;
+        int d;
+        if (int.TryParse(json.Substring(start, end - start), out d) && d > 0) return d;
+        return 0;
+    }
+
+    int GetProxyDelayLive(string proxyName, int timeoutMs) {
+        if (string.IsNullOrEmpty(proxyName)) return 0;
+        if (timeoutMs <= 0) timeoutMs = 5000;
+
+        // mihomo/meta portable delay endpoint: /proxies/{name}/delay
+        string urlEnc = Uri.EscapeDataString("http://www.gstatic.com/generate_204");
+        string path = "/proxies/" + Uri.EscapeDataString(proxyName) + "/delay?url=" + urlEnc + "&timeout=" + timeoutMs;
+        int apiTimeout = Math.Max(2000, timeoutMs + 1500);
+        string json = ApiRequest(path, apiTimeout);
+        return ParseDelayValue(json);
+    }
+
+    Dictionary<string, int> ProbeDelaysLive(List<string> nodes, int timeoutMs, int maxConcurrency) {
+        Dictionary<string, int> result = new Dictionary<string, int>();
+        if (nodes == null || nodes.Count == 0) return result;
+        if (timeoutMs <= 0) timeoutMs = 5000;
+        if (maxConcurrency <= 0) maxConcurrency = 4;
+        if (maxConcurrency > nodes.Count) maxConcurrency = nodes.Count;
+        if (maxConcurrency < 1) maxConcurrency = 1;
+
+        object lockObj = new object();
+        using (SemaphoreSlim sem = new SemaphoreSlim(maxConcurrency, maxConcurrency))
+        using (CountdownEvent done = new CountdownEvent(nodes.Count)) {
+            foreach (string node in nodes) {
+                ThreadPool.QueueUserWorkItem(_ => {
+                    try {
+                        sem.Wait();
+                        int d = GetProxyDelayLive(node, timeoutMs);
+                        if (d > 0) {
+                            lock (lockObj) { result[node] = d; }
+                        }
+                    } catch { /* ignore */ }
+                    finally {
+                        try { sem.Release(); } catch { /* ignore */ }
+                        try { done.Signal(); } catch { /* ignore */ }
+                    }
+                });
+            }
+
+            // Wait for all delay probes to finish; API timeouts bound the total wait time.
+            try { done.Wait(); } catch { /* ignore */ }
+        }
+
+        return result;
+    }
+
+    bool SwitchToBestNodeRefreshed() {
+        return SwitchToBestNodeInternal(true);
+    }
+
     bool SwitchToBestNode() {
+        return SwitchToBestNodeInternal(false);
+    }
+
+    bool SwitchToBestNodeInternal(bool forceDelayRefresh) {
         CleanBlacklist();
         try {
             string json = ApiRequest("/proxies");
@@ -370,110 +494,201 @@ public partial class ClashGuardian
             string group = FindSelectorGroup(json);
             nodeGroup = group;
 
-            List<string> allNodes = GetGroupAllNodes(json, group);
-
-            HashSet<string> preferredSnapshot = null;
-            lock (preferredNodesLock) {
-                if (preferredNodes != null && preferredNodes.Count > 0) {
-                    preferredSnapshot = new HashSet<string>(preferredNodes);
-                }
+            if (forceDelayRefresh) {
+                // Seed delay info quickly; group delay endpoints are not portable across cores.
+                try { nodeGroup = group; TriggerDelayTest(); } catch { /* ignore */ }
+                try { Thread.Sleep(500); } catch { /* ignore */ }
+                try {
+                    string refreshed = ApiRequest("/proxies", API_TIMEOUT_FAST);
+                    if (!string.IsNullOrEmpty(refreshed)) {
+                        json = refreshed;
+                        group = FindSelectorGroup(json);
+                        nodeGroup = group;
+                    }
+                } catch { /* ignore */ }
             }
 
-            List<KeyValuePair<string, int>> preferredWithDelay = new List<KeyValuePair<string, int>>();
-            List<KeyValuePair<string, int>> normalWithDelay = new List<KeyValuePair<string, int>>();
-            string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
+            for (;;) {
+                List<string> allNodes = GetGroupAllNodes(json, group);
 
-            foreach (string nodeName in allNodes) {
-                if (string.IsNullOrEmpty(nodeName) || nodeName.Length > MAX_NODE_NAME_LENGTH) continue;
-
-                // 跳过策略组
-                bool skip = false;
-                foreach (string sg in SKIP_GROUPS) { if (nodeName == sg) { skip = true; break; } }
-                if (skip) continue;
-
-                // 跳过策略组类型
-                string nodeType = FindProxyType(json, nodeName);
-                foreach (string st in skipTypes) { if (nodeType == st) { skip = true; break; } }
-                if (skip) continue;
-
-                bool isPreferred = preferredSnapshot != null && preferredSnapshot.Contains(nodeName);
-
-                // 排除可配置的地区节点（关键字模式下：偏好节点可覆盖关键字排除）
-                bool excluded = false;
-                if (disabledNodesExplicitMode) {
-                    lock (disabledNodesLock) { excluded = disabledNodes.Contains(nodeName); }
-                } else if (excludeRegions != null && !isPreferred) {
-                    foreach (string region in excludeRegions) {
-                        if (!string.IsNullOrEmpty(region) && nodeName.Contains(region)) { excluded = true; break; }
+                HashSet<string> preferredSnapshot = null;
+                lock (preferredNodesLock) {
+                    if (preferredNodes != null && preferredNodes.Count > 0) {
+                        preferredSnapshot = new HashSet<string>(preferredNodes);
                     }
                 }
-                if (excluded) continue;
 
-                bool isBlacklisted;
-                lock (blacklistLock) { isBlacklisted = nodeBlacklist.ContainsKey(nodeName); }
-                if (isBlacklisted) continue;
+                List<KeyValuePair<string, int>> preferredWithDelay = new List<KeyValuePair<string, int>>();
+                List<KeyValuePair<string, int>> normalWithDelay = new List<KeyValuePair<string, int>>();
+                List<string> preferredCandidates = new List<string>();
+                List<string> normalCandidates = new List<string>();
+                string[] skipTypes = new string[] { "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject" };
+                int candidatesTotal = 0;
 
-                int delay = GetNodeDelay(json, nodeName);
-                if (delay > 0) {
-                    if (isPreferred) preferredWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
-                    else normalWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
+                string cn = currentNode; // volatile read
+
+                foreach (string nodeName in allNodes) {
+                    if (string.IsNullOrEmpty(nodeName) || nodeName.Length > MAX_NODE_NAME_LENGTH) continue;
+
+                    // 跳过策略组
+                    bool skip = false;
+                    foreach (string sg in SKIP_GROUPS) { if (nodeName == sg) { skip = true; break; } }
+                    if (skip) continue;
+
+                    // 跳过策略组类型
+                    string nodeType = FindProxyType(json, nodeName);
+                    foreach (string st in skipTypes) { if (nodeType == st) { skip = true; break; } }
+                    if (skip) continue;
+
+                    bool isPreferred = preferredSnapshot != null && preferredSnapshot.Contains(nodeName);
+
+                    // 排除可配置的地区节点（关键字模式下：偏好节点可覆盖关键字排除）
+                    bool excluded = false;
+                    if (disabledNodesExplicitMode) {
+                        lock (disabledNodesLock) { excluded = disabledNodes.Contains(nodeName); }
+                    } else if (excludeRegions != null && !isPreferred) {
+                        foreach (string region in excludeRegions) {
+                            if (!string.IsNullOrEmpty(region) && nodeName.Contains(region)) { excluded = true; break; }
+                        }
+                    }
+                    if (excluded) continue;
+
+                    bool isBlacklisted;
+                    lock (blacklistLock) { isBlacklisted = nodeBlacklist.ContainsKey(nodeName); }
+                    if (isBlacklisted) continue;
+
+                    candidatesTotal++;
+
+                    int delay = GetNodeDelay(json, nodeName);
+                    if (delay > 0) {
+                        if (isPreferred) preferredWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
+                        else normalWithDelay.Add(new KeyValuePair<string, int>(nodeName, delay));
+                    }
+
+                    // Candidate list for live probing when delay history is missing (prefer switching away from current node)
+                    if (nodeName != cn) {
+                        if (isPreferred) preferredCandidates.Add(nodeName);
+                        else normalCandidates.Add(nodeName);
+                    }
                 }
-            }
 
-            if (preferredWithDelay.Count + normalWithDelay.Count == 0) {
-                Log("切换失败: 无可用节点(请先测速) group=" + group + " allCount=" + allNodes.Count);
-                return false;
-            }
+                preferredWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
+                normalWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
+                int delaySamples = preferredWithDelay.Count + normalWithDelay.Count;
+                string bestNode = null;
+                int bestDelay = int.MaxValue;
+                bool bestPreferred = false;
 
-            preferredWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
-            normalWithDelay.Sort((a, b) => a.Value.CompareTo(b.Value));
-
-            string cn = currentNode; // volatile read
-            string bestNode = null;
-            int bestDelay = int.MaxValue;
-            bool bestPreferred = false;
-
-            foreach (var kv in preferredWithDelay) {
-                if (kv.Key != cn) {
-                    bestNode = kv.Key;
-                    bestDelay = kv.Value;
-                    bestPreferred = true;
-                    break;
-                }
-            }
-
-            // 偏好节点不可用或延迟不可接受时，回退到非偏好节点
-            if (bestNode == null || bestDelay >= MAX_ACCEPTABLE_DELAY) {
-                foreach (var kv in normalWithDelay) {
+                foreach (var kv in preferredWithDelay) {
                     if (kv.Key != cn) {
                         bestNode = kv.Key;
                         bestDelay = kv.Value;
-                        bestPreferred = false;
+                        bestPreferred = true;
                         break;
                     }
                 }
-            }
 
-            if (bestNode != null && bestDelay < MAX_ACCEPTABLE_DELAY) {
-                if (!string.IsNullOrEmpty(cn)) {
-                    lock (blacklistLock) { nodeBlacklist[cn] = DateTime.Now; }
+                // 偏好节点不可用或延迟不可接受时，回退到非偏好节点
+                if (bestNode == null || bestDelay >= MAX_ACCEPTABLE_DELAY) {
+                    foreach (var kv in normalWithDelay) {
+                        if (kv.Key != cn) {
+                            bestNode = kv.Key;
+                            bestDelay = kv.Value;
+                            bestPreferred = false;
+                            break;
+                        }
+                    }
                 }
 
-                string url = "/proxies/" + Uri.EscapeDataString(group);
-                if (ApiPut(url, "{\"name\":\"" + bestNode + "\"}")) {
-                    string prefMark = bestPreferred ? " [偏好]" : "";
-                    Log("切换: " + SafeNodeName(bestNode) + " (" + bestDelay + "ms) @" + group + prefMark);
-                    currentNode = bestNode;
-                    Interlocked.Exchange(ref lastDelay, bestDelay);
-                    Interlocked.Increment(ref totalSwitches);
-                    return true;
+                // If delay history is missing/insufficient, probe a subset live to avoid "请先测速" loops.
+                bool shouldProbe = false;
+                if (candidatesTotal > 0 && (bestNode == null || bestDelay >= MAX_ACCEPTABLE_DELAY)) {
+                    if (forceDelayRefresh) shouldProbe = true;
+                    else if (delaySamples == 0) shouldProbe = true;
+                    else if (bestNode == null && delaySamples <= 1) shouldProbe = true;
+                }
+
+                if (shouldProbe) {
+                    HashSet<string> seen = new HashSet<string>();
+                    List<string> probeList = new List<string>();
+
+                    int preferredMax = 4;
+                    foreach (string n in preferredCandidates) {
+                        if (probeList.Count >= preferredMax) break;
+                        if (seen.Add(n)) probeList.Add(n);
+                    }
+
+                    int maxProbe = 10;
+                    int need = maxProbe - probeList.Count;
+                    if (need > 0 && normalCandidates.Count > 0) {
+                        int start = 0;
+                        try {
+                            int c = Interlocked.Increment(ref delayProbeCursor);
+                            start = (int)((long)(c * maxProbe) % normalCandidates.Count);
+                            if (start < 0) start = 0;
+                        } catch { start = 0; }
+
+                        for (int i = 0; i < normalCandidates.Count && need > 0; i++) {
+                            string n = normalCandidates[(start + i) % normalCandidates.Count];
+                            if (seen.Add(n)) { probeList.Add(n); need--; }
+                        }
+                    }
+
+                    if (probeList.Count > 0) {
+                        Dictionary<string, int> live = ProbeDelaysLive(probeList, 5000, 4);
+                        if (live != null && live.Count > 0) {
+                            List<KeyValuePair<string, int>> preferredLive = new List<KeyValuePair<string, int>>();
+                            List<KeyValuePair<string, int>> normalLive = new List<KeyValuePair<string, int>>();
+                            foreach (var kv in live) {
+                                bool isPreferred = preferredSnapshot != null && preferredSnapshot.Contains(kv.Key);
+                                if (isPreferred) preferredLive.Add(kv);
+                                else normalLive.Add(kv);
+                            }
+                            preferredLive.Sort((a, b) => a.Value.CompareTo(b.Value));
+                            normalLive.Sort((a, b) => a.Value.CompareTo(b.Value));
+
+                            bestNode = null;
+                            bestDelay = int.MaxValue;
+                            bestPreferred = false;
+
+                            foreach (var kv in preferredLive) {
+                                if (kv.Key != cn) { bestNode = kv.Key; bestDelay = kv.Value; bestPreferred = true; break; }
+                            }
+                            if (bestNode == null || bestDelay >= MAX_ACCEPTABLE_DELAY) {
+                                foreach (var kv in normalLive) {
+                                    if (kv.Key != cn) { bestNode = kv.Key; bestDelay = kv.Value; bestPreferred = false; break; }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (bestNode != null && bestDelay < MAX_ACCEPTABLE_DELAY) {
+                    if (!string.IsNullOrEmpty(cn)) {
+                        lock (blacklistLock) { nodeBlacklist[cn] = DateTime.Now; }
+                    }
+
+                    string url = "/proxies/" + Uri.EscapeDataString(group);
+                    if (ApiPut(url, "{\"name\":\"" + bestNode + "\"}")) {
+                        string prefMark = bestPreferred ? " [偏好]" : "";
+                        Log("切换: " + SafeNodeName(bestNode) + " (" + bestDelay + "ms) @" + group + prefMark);
+                        currentNode = bestNode;
+                        Interlocked.Exchange(ref lastDelay, bestDelay);
+                        Interlocked.Increment(ref totalSwitches);
+                        return true;
+                    } else {
+                        Log("切换失败: PUT " + group + " node=" + SafeNodeName(bestNode));
+                    }
+                } else if (bestNode == null) {
+                    if (candidatesTotal > 0 && delaySamples == 0)
+                        Log("切换失败: 无可用节点(请先测速) group=" + group + " allCount=" + allNodes.Count);
+                    else
+                        Log("切换失败: 无更优节点");
                 } else {
-                    Log("切换失败: PUT " + group + " node=" + SafeNodeName(bestNode));
+                    Log("切换失败: 延迟过高 " + bestDelay + "ms");
                 }
-            } else if (bestNode == null) {
-                Log("切换失败: 无更优节点");
-            } else {
-                Log("切换失败: 延迟过高 " + bestDelay + "ms");
+
+                return false;
             }
         } catch (Exception ex) {
             Log("切换异常: " + ex.Message);
@@ -486,10 +701,13 @@ public partial class ClashGuardian
     void TriggerDelayTest() {
         string group = string.IsNullOrEmpty(nodeGroup) ? "GLOBAL" : nodeGroup;
         try {
-            HttpWebRequest req = WebRequest.Create(clashApi + "/group/" + Uri.EscapeDataString(group) + "/delay?url=http://www.gstatic.com/generate_204&timeout=5000") as HttpWebRequest;
+            // mihomo/meta: /proxies/{name}/delay is the portable delay endpoint (group delay endpoint may not exist)
+            HttpWebRequest req = WebRequest.Create(clashApi + "/proxies/" + Uri.EscapeDataString(group) + "/delay?url=http://www.gstatic.com/generate_204&timeout=5000") as HttpWebRequest;
             req.Method = "GET";
             req.Headers.Add("Authorization", "Bearer " + clashSecret);
-            req.Timeout = 2000;
+            // 异步测速：不阻塞主流程，但也不要因为超时过短导致测速尚未完成就中断请求
+            req.Timeout = 7000;
+            req.ReadWriteTimeout = 7000;
             // 本地 API 不应走系统代理
             try { if (req.RequestUri != null && req.RequestUri.IsLoopback) req.Proxy = null; } catch { /* ignore */ }
             req.BeginGetResponse(ar => { try { req.EndGetResponse(ar).Close(); } catch { /* 测速异步回调异常可忽略 */ } }, null);
@@ -528,4 +746,3 @@ public partial class ClashGuardian
         return result;
     }
 }
-

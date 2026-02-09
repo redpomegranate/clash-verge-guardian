@@ -2,6 +2,9 @@ $ErrorActionPreference = "Stop"
 
 $csc = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe"
 if (-not (Test-Path $csc)) {
+  $csc = "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"
+}
+if (-not (Test-Path $csc)) {
   throw "csc.exe not found: $csc"
 }
 
@@ -20,5 +23,9 @@ if (-not (Test-Path $icon)) {
   "$PSScriptRoot\\ClashGuardian.Network.cs" `
   "$PSScriptRoot\\ClashGuardian.Monitor.cs" `
   "$PSScriptRoot\\ClashGuardian.Update.cs"
+
+if ($LASTEXITCODE -ne 0) {
+  throw "Build failed (csc exit code: $LASTEXITCODE)"
+}
 
 Write-Host "Built: $outExe"
