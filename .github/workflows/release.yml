@@ -34,31 +34,11 @@ jobs:
           $shaFile = Join-Path $PWD "dist\ClashGuardian.exe.sha256"
           "$hash  ClashGuardian.exe" | Out-File -Encoding ascii -FilePath $shaFile
 
-          $readme = Join-Path $PWD "README.md"
-          if (-not (Test-Path $readme)) { throw "Missing README.md" }
-
-          # Extract the changelog section for this tag from README.md.
-          $text = Get-Content -Raw -Encoding utf8 $readme
-          $lines = $text -split "`r?`n"
-          $header = "### " + $tag
-          $start = -1
-          for ($i = 0; $i -lt $lines.Length; $i++) {
-            if ($lines[$i].TrimStart().StartsWith($header)) { $start = $i; break }
-          }
-          if ($start -lt 0) { throw "Changelog section not found in README.md: $header" }
-
-          $end = $lines.Length - 1
-          for ($i = $start + 1; $i -lt $lines.Length; $i++) {
-            $t = $lines[$i].TrimStart()
-            if ($t.StartsWith("### v") -and (-not $t.StartsWith($header))) { $end = $i - 1; break }
-          }
-
+          # Keep release notes simple and robust: point to README changelog section.
           $out = @()
           $out += "# Clash Guardian Pro $tag"
           $out += ""
-          $out += "## 更新日志（摘自 README.md）"
-          $out += ""
-          $out += $lines[$start..$end]
+          $out += "更新日志：请查看 README.md 中的 `### $tag` 段落。"
           $out += ""
           $out += "## 校验"
           $out += ""
