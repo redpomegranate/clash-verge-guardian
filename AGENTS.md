@@ -5,11 +5,11 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v1.0.5
+- **版本**：v1.0.6
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
-- **架构**：5 个 partial class 文件，按职责拆分
+- **架构**：7 个 partial class 文件，按职责拆分
 
 ## 📁 项目结构
 
@@ -20,6 +20,8 @@ ClashGuardian\
 ├── ClashGuardian.Network.cs
 ├── ClashGuardian.Monitor.cs
 ├── ClashGuardian.Update.cs
+├── ClashGuardian.Connectivity.cs
+├── ClashGuardian.ConfigBackfill.cs
 ├── assets\
 │   ├── icon-source.png        # icon 源图
 │   └── ClashGuardian.ico      # 编译用 win32 icon
@@ -46,7 +48,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 # 或手动编译（需指定 win32 icon）
 mkdir dist -Force | Out-Null
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\ClashGuardian.ico /out:dist\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+$sources = Get-ChildItem -Filter *.cs | Sort-Object Name | ForEach-Object { $_.FullName }
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\ClashGuardian.ico /out:dist\ClashGuardian.exe $sources
 ```
 
 编译成功标志：无 error 输出（warning 可忽略）
@@ -70,6 +73,9 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 15. **禁用名单（disabledNodes）** - 托盘勾选后写入 config；一旦存在 `disabledNodes` 将忽略 `excludeRegions`
 16. **偏好节点（preferredNodes）** - 托盘勾选后写入 config；自动切换优先偏好节点（不可用则回退，偏好集合过小可能降低抗风险）
 17. **订阅级自动切换（Clash Verge Rev）** - 默认关闭；通过修改 `%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\profiles.yaml` 的 `current:` 并强制重启客户端生效；严禁日志输出订阅 URL/token
+18. **延迟指标区分** - `TestProxy` RTT（`lastDelay`）与节点 `histDelay/liveDelay` 必须分离；UI 只展示前者
+19. **配置补全策略** - 仅补全安全 key（如 `fastInterval/speedFactor/connectivity*`）；不要自动补 `disabledNodes`
+20. **订阅切换前置条件** - 所有自动订阅切换路径必须要求 `allowAutoStartClient=true`
 
 ## 🏗️ 代码模块（按文件）
 
@@ -132,6 +138,18 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `ExtractAssetUrl` | 从 Release JSON 提取 .exe 下载链接 |
 | `DownloadAndUpdate` | 下载 + 热替换 + 回滚保护 |
 
+### ClashGuardian.Connectivity.cs
+| 方法 | 说明 |
+|------|------|
+| `MaybeStartConnectivityProbe` | 异常态触发连接性探测（节流 + 防重入） |
+| `RunConnectivityProbeWorker` | 对配置 URL 列表做代理连通性探测 |
+| `TryGetRecentConnectivity` | 获取有效期内的探测快照（Unknown/Ok/Slow/Down） |
+
+### ClashGuardian.ConfigBackfill.cs
+| 方法 | 说明 |
+|------|------|
+| `BackfillConfigIfMissing` | 启动时安全补全缺失 key（不引入语义变化字段） |
+
 ## 📊 决策逻辑（EvaluateStatus）
 
 | 条件 | 动作 | Event |
@@ -152,15 +170,25 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `currentNode`/`nodeGroup` | `volatile` | 后台写，UI 读 |
 | `detectedCoreName`/`detectedClientPath` | `volatile` | 后台写，UI 读 |
 | `lastDelay` | `Interlocked.Exchange` | 后台写，UI 读 |
+| `lastNodeDelay`/`lastNodeDelayKind` | `Interlocked + volatile` | 节点 history/live delay（仅诊断/日志） |
 | `totalIssues`/`totalChecks`/`totalRestarts`/`totalSwitches` | `Interlocked.Increment` | 后台写，UI 读 |
 | `failCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
+| `autoSwitchEpisodeAttempts`/`pendingSwitchVerification` | UI 线程专用 | 订阅切换 episode 计数 |
 | `nodeBlacklist` | `blacklistLock` | 多线程读写 |
 | `restartLock` | `lock` | 重启门闩原子化（避免并发重启竞态） |
 | `_isChecking` | `Interlocked.CompareExchange` | 防重入 |
 | `_isRestarting` | `volatile bool` | 防止重启期间并发检测 |
 | `_isDetectionPaused` | `volatile bool` | 暂停检测开关（跨线程读写） |
+| `connectivity*` 快照字段 | `Interlocked` | 连接性探测结果跨线程读写 |
 
 ## 🔄 关键修复记录
+
+### v1.0.6 改进
+1. **修复：首次检测句柄竞态** - 首次检测改为句柄创建后触发，避免 “在创建窗口句柄之前调用 BeginInvoke”
+2. **修复：延迟指标混用** - 节点切换日志改为 `histDelay/liveDelay`，不再覆盖 `lastDelay`
+3. **新增：连接性探测** - 高延迟场景增加真实网站连通性探测，用于订阅切换前综合判断
+4. **优化：订阅切换策略** - 触发条件改为 `proxyFail` 或 `highDelay + conn(Slow/Down)`，并采用 episode 计数
+5. **新增：配置安全补全** - 自动补齐 `fastInterval/speedFactor/proxyTestTimeoutMs/connectivity*`，不自动补 `disabledNodes`
 
 ### v1.0.4 改进
 1. **自动切换失败风暴保护** - 当出现“延迟过高 5000ms / 无 delay 历史 / API无响应”等导致的切换失败时：自动节流日志、限制切换频率，并在连续失败达到阈值后升级为“订阅切换/重启客户端”，避免无限循环刷屏

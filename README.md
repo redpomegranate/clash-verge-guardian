@@ -1,4 +1,4 @@
-# Clash Guardian Pro v1.0.5 - 多内核智能守护进程
+# Clash Guardian Pro v1.0.6 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -99,8 +99,16 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
   "speedFactor": 3,
   "allowAutoStartClient": false,
   "memoryThreshold": 150,
+  "memoryWarning": 70,
   "highDelayThreshold": 400,
   "blacklistMinutes": 20,
+  "proxyTestTimeoutMs": 900,
+  "connectivityTestUrls": ["http://www.gstatic.com/generate_204", "http://cp.cloudflare.com/generate_204", "http://www.msftconnecttest.com/connecttest.txt"],
+  "connectivityProbeTimeoutMs": 3000,
+  "connectivityProbeMinSuccessCount": 1,
+  "connectivitySlowThresholdMs": 800,
+  "connectivityProbeMinIntervalSeconds": 15,
+  "connectivityResultMaxAgeSeconds": 30,
   "coreProcessNames": ["verge-mihomo", "mihomo", "clash-meta", "clash-rs", "clash", "clash-win64"],
   "clientProcessNames": ["Clash Verge", "clash-verge", "Clash Nyanpasu", "mihomo-party", "Clash for Windows"],
 
@@ -127,8 +135,16 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 | `speedFactor` | 检测提速系数（实际间隔=interval/speedFactor，范围 1..5） | `3` |
 | `allowAutoStartClient` | 是否允许自动启动/重启 Clash 客户端（可能弹出 UI；默认关闭） | `false` |
 | `memoryThreshold` | 内存阈值(MB) | `150` |
+| `memoryWarning` | 内存预警阈值(MB) | `70` |
 | `highDelayThreshold` | 高延迟阈值(ms) | `400` |
 | `blacklistMinutes` | 黑名单时长(分钟) | `20` |
+| `proxyTestTimeoutMs` | 快速代理探测超时(ms) | `900` |
+| `connectivityTestUrls` | 连接性探测 URL 列表（通过本地代理访问） | gstatic/cf/msftconnecttest |
+| `connectivityProbeTimeoutMs` | 单 URL 连接性探测超时(ms) | `3000` |
+| `connectivityProbeMinSuccessCount` | 判定“可用”所需最小成功数 | `1` |
+| `connectivitySlowThresholdMs` | 连接性“极慢”阈值(ms) | `800` |
+| `connectivityProbeMinIntervalSeconds` | 连接性探测最小间隔(秒) | `15` |
+| `connectivityResultMaxAgeSeconds` | 连接性探测结果最大有效期(秒) | `30` |
 | `coreProcessNames` | 内核进程名列表（按优先级） | 见上方示例 |
 | `clientProcessNames` | 客户端进程名列表 | 见上方示例 |
 | `excludeRegions` | 节点排除关键词 | `HK,香港,TW,台湾,MO,澳门` |
@@ -149,7 +165,7 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 | 进程不存在 | - | 立即重启 |
 | 内存极高 | > 150 MB | 无条件重启 |
 | 内存较高 + 代理无响应 | > 70 MB | 立即重启 |
-| 内存较高 + 延迟过高 | > 70 MB 且延迟 > 400ms | 快速恢复：重置内核(最多2次)→刷新测速→切节点；无效则升级重启客户端；仍无效可切订阅（Clash Verge Rev，可选） |
+| 内存较高 + 延迟过高 | > 70 MB 且延迟 > 400ms | 快速恢复：重置内核(最多2次)→刷新测速→切节点；订阅切换需结合连接性探测（Slow/Down） |
 | 连接泄漏 + 代理无响应 | CLOSE_WAIT > 20 | 立即重启 |
 | 代理无响应 | 连续 2 次 | 切换节点（加入黑名单） |
 | 代理无响应 | 连续 4 次 | 重启程序 |
@@ -168,9 +184,10 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 # 推荐：一键编译（含 icon）
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 
-# 或手动编译（需指定 win32 icon）
+# 或手动编译（自动包含当前目录所有 *.cs）
 mkdir dist -Force | Out-Null
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\\ClashGuardian.ico /out:dist\\ClashGuardian.exe ClashGuardian.cs ClashGuardian.UI.cs ClashGuardian.Network.cs ClashGuardian.Monitor.cs ClashGuardian.Update.cs
+$sources = Get-ChildItem -Filter *.cs | Sort-Object Name | ForEach-Object { $_.FullName }
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\\ClashGuardian.ico /out:dist\\ClashGuardian.exe $sources
 ```
 
 编译产物输出到 `dist\\ClashGuardian.exe`。
@@ -229,6 +246,8 @@ ClashGuardian\
 ├── ClashGuardian.Network.cs
 ├── ClashGuardian.Monitor.cs
 ├── ClashGuardian.Update.cs
+├── ClashGuardian.Connectivity.cs
+├── ClashGuardian.ConfigBackfill.cs
 ├── assets\
 │   ├── icon-source.png
 │   └── ClashGuardian.ico
@@ -348,7 +367,20 @@ flowchart TD
 - 节点切换在 delay history 不可用时，会回退到 `/proxies/{name}/delay` 的实时探测后再切换，避免“请先测速”的死循环。
 - 异常首次出现时会启动“订阅健康探测”（后台并行），用于更快判断当前订阅是否整体不可用并决定是否需要订阅切换。
 
+## 🧪 Troubleshooting
+
+- `guardian.log` 中 `切换: 节点 (histDelay=xxms / liveDelay=xxms)` 不是 `TestProxy()` 的代理 RTT，仅表示节点历史/实时测速结果。
+- 自动决策使用的是 `monitor_YYYYMMDD.csv` 的 `Delay` 列（`TestProxy` 结果）。这两个值含义不同，不能混看。
+- 一旦触发“强制重启客户端”，TUN/虚拟网卡会重建，Windows 网络会出现短暂断流；这通常表现为“VPN 断网体感被放大”。
+
 ## 🔄 更新日志
+
+### v1.0.6 (2026-02-11)
+- **修复：首次检测句柄竞态** - 首次检测改为句柄创建后执行，避免 “在创建窗口句柄之前调用 BeginInvoke”
+- **修复：延迟指标混用** - 节点切换不再污染 `lastDelay`；日志明确区分 `histDelay/liveDelay`，UI 延迟只展示代理 RTT
+- **新增：连接性探测** - 高延迟场景会额外探测真实网站连通性，并将结果写入监控 CSV
+- **优化：订阅切换决策** - 由“切换成功次数”改为“切换后未恢复 episode 次数”，并要求 `allowAutoStartClient=true`
+- **新增：配置安全补全** - 启动时自动补齐 `fastInterval/speedFactor` 与连接性相关 key，不引入 `disabledNodes` 语义变更字段
 
 ### v1.0.5 (2026-02-09)
 - **新增：订阅健康探测（异步并行）** - 异常首次出现时后台抽样 delay probe；若确认“当前订阅整体不可用”，优先切换订阅并强制重启客户端，缩短“无可用节点”链路耗时

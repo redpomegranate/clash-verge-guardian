@@ -44,9 +44,28 @@ public partial class ClashGuardian
     void LogData(bool proxyOK, int delay, double mem, int handles, int tw, int est, int cw, string node, string evt) {
         try {
             string time = DateTime.Now.ToString("HH:mm:ss");
-            string line = string.Format("{0},{1},{2},{3},{4},{5},{6},{7},{8},{9}\n",
-                time, proxyOK ? 1 : 0, delay, mem.ToString("F1"), handles, tw, est, cw,
-                string.IsNullOrEmpty(node) ? "" : SafeNodeName(node), evt);
+
+            ConnectivityVerdict cv = ConnectivityVerdict.Unknown;
+            int connBest = 0, connAge = 0, connOk = 0, connAttempts = 0;
+            if (!TryGetRecentConnectivity(out cv, out connBest, out connAge, out connOk, out connAttempts)) {
+                cv = ConnectivityVerdict.Unknown;
+                connBest = 0;
+                connAge = 0;
+                connOk = 0;
+                connAttempts = 0;
+            }
+
+            string line;
+            if (monitorHasConnectivityColumns) {
+                line = string.Format("{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14}\n",
+                    time, proxyOK ? 1 : 0, delay, mem.ToString("F1"), handles, tw, est, cw,
+                    string.IsNullOrEmpty(node) ? "" : SafeNodeName(node), evt,
+                    ConnectivityVerdictToString(cv), connBest, connAge, connOk, connAttempts);
+            } else {
+                line = string.Format("{0},{1},{2},{3},{4},{5},{6},{7},{8},{9}\n",
+                    time, proxyOK ? 1 : 0, delay, mem.ToString("F1"), handles, tw, est, cw,
+                    string.IsNullOrEmpty(node) ? "" : SafeNodeName(node), evt);
+            }
             File.AppendAllText(dataFile, line);
         } catch { /* 数据日志写入失败不影响程序运行 */ }
     }
@@ -203,6 +222,8 @@ public partial class ClashGuardian
             sb.AppendLine("currentNode=" + currentNode);
             sb.AppendLine("nodeGroup=" + nodeGroup);
             sb.AppendLine("lastDelay=" + Thread.VolatileRead(ref lastDelay));
+            sb.AppendLine("lastNodeDelay=" + Thread.VolatileRead(ref lastNodeDelay));
+            sb.AppendLine("lastNodeDelayKind=" + (lastNodeDelayKind ?? ""));
             sb.AppendLine("blacklistCount=" + blCount);
             sb.AppendLine("totalChecks=" + totalChecks);
             sb.AppendLine("totalIssues=" + totalIssues);
@@ -212,6 +233,22 @@ public partial class ClashGuardian
             sb.AppendLine("cooldownCount=" + cooldownCount);
             sb.AppendLine("isRestarting=" + _isRestarting);
             sb.AppendLine("detectionPaused=" + _isDetectionPaused);
+
+            ConnectivityVerdict cv;
+            int connBest, connAge, connOk, connAttempts;
+            if (TryGetRecentConnectivity(out cv, out connBest, out connAge, out connOk, out connAttempts)) {
+                sb.AppendLine("connectivityVerdict=" + ConnectivityVerdictToString(cv));
+                sb.AppendLine("connectivityBestRttMs=" + connBest);
+                sb.AppendLine("connectivityAgeSec=" + connAge);
+                sb.AppendLine("connectivitySuccess=" + connOk);
+                sb.AppendLine("connectivityAttempts=" + connAttempts);
+            } else {
+                sb.AppendLine("connectivityVerdict=Unknown");
+                sb.AppendLine("connectivityBestRttMs=0");
+                sb.AppendLine("connectivityAgeSec=0");
+                sb.AppendLine("connectivitySuccess=0");
+                sb.AppendLine("connectivityAttempts=0");
+            }
 
             try { File.WriteAllText(Path.Combine(dir, "summary.txt"), sb.ToString(), Encoding.UTF8); }
             catch { /* summary 写入失败可忽略 */ }
@@ -520,6 +557,7 @@ public partial class ClashGuardian
         newName = "";
 
         if (!autoSwitchSubscription) return false;
+        if (!allowAutoStartClient) return false;
         if (subscriptionWhitelist == null || subscriptionWhitelist.Length < 2) return false;
 
         DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
@@ -1135,6 +1173,7 @@ public partial class ClashGuardian
         bool proxyOK = false;
         int delay = TestProxy(out proxyOK, true);
         LogPerf("TestProxy", sw.ElapsedMilliseconds);
+        MaybeStartConnectivityProbe("Tick", running, proxyOK, delay);
 
         // 异常首次出现时：启动订阅健康探测（后台并行，不阻塞恢复管线）
         if (running && (!proxyOK || (delay > highDelayThreshold))) {
@@ -1226,9 +1265,26 @@ public partial class ClashGuardian
         if (decision.HasIssue && !lastHadIssue) totalIssues++;
         lastHadIssue = decision.HasIssue;
 
-        // 健康时清零“连续成功切换节点次数”（用于订阅级自动切换触发）
+        ConnectivityVerdict connVerdict;
+        int connBestRtt, connAgeSec, connSuccess, connAttempts;
+        bool hasConn = TryGetRecentConnectivity(out connVerdict, out connBestRtt, out connAgeSec, out connSuccess, out connAttempts);
+        if (!hasConn) connVerdict = ConnectivityVerdict.Unknown;
+
+        bool proxyBad = !proxyOK;
+        bool delayBad = dl > highDelayThreshold;
+        bool connBad = connVerdict == ConnectivityVerdict.Slow || connVerdict == ConnectivityVerdict.Down;
+        bool networkBadForSubSwitch = running && (proxyBad || (delayBad && connBad));
+
+        // 健康时清零 episode（用于订阅级自动切换触发）
         if (running && proxyOK && dl > 0 && dl <= highDelayThreshold) {
-            consecutiveSuccessfulAutoSwitchesWithoutRecovery = 0;
+            autoSwitchEpisodeAttempts = 0;
+            pendingSwitchVerification = false;
+            pendingVerifyAt = DateTime.MinValue;
+        } else if (pendingSwitchVerification && DateTime.Now >= pendingVerifyAt) {
+            if (networkBadForSubSwitch) autoSwitchEpisodeAttempts++;
+            else autoSwitchEpisodeAttempts = 0;
+            pendingSwitchVerification = false;
+            pendingVerifyAt = DateTime.MinValue;
         }
 
         // 渲染 UI
@@ -1304,17 +1360,17 @@ public partial class ClashGuardian
 
         // 订阅级自动切换（Clash Verge Rev）：连续成功切换多个节点仍不可用，则切换订阅并强制重启客户端
         if (autoSwitchSubscription) {
+            bool canAutoRestartClient = allowAutoStartClient;
             bool whitelistOk = subscriptionWhitelist != null && subscriptionWhitelist.Length >= 2;
-            bool networkBad = running && mem <= memoryWarning && (!proxyOK || (dl > 0 && dl > highDelayThreshold));
             DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));
             bool cooldownOk = (DateTime.Now - lastSub).TotalMinutes >= subscriptionSwitchCooldownMinutes;
             bool switchingOk = !_isRestarting && !_isSwitchingSubscription;
 
-            if (switchingOk && whitelistOk && cooldownOk && networkBad &&
-                consecutiveSuccessfulAutoSwitchesWithoutRecovery >= subscriptionSwitchThreshold) {
+            if (switchingOk && canAutoRestartClient && whitelistOk && cooldownOk && networkBadForSubSwitch &&
+                autoSwitchEpisodeAttempts >= subscriptionSwitchThreshold) {
 
-                int switches = consecutiveSuccessfulAutoSwitchesWithoutRecovery;
-                consecutiveSuccessfulAutoSwitchesWithoutRecovery = 0;
+                int switches = autoSwitchEpisodeAttempts;
+                autoSwitchEpisodeAttempts = 0;
                 ThreadPool.QueueUserWorkItem(_ => SwitchSubscriptionAndRestart(decision.Event, switches));
                 return;
             }
@@ -1366,7 +1422,10 @@ public partial class ClashGuardian
                         this.BeginInvoke((Action)(() => {
                             failCount = 0;
                             RefreshNodeDisplay();
-                            if (isAuto) consecutiveSuccessfulAutoSwitchesWithoutRecovery++;
+                            if (isAuto) {
+                                pendingSwitchVerification = true;
+                                pendingVerifyAt = DateTime.Now.AddMilliseconds(1500);
+                            }
                         }));
                     }
                 } else if (isAuto) {
@@ -1554,6 +1613,7 @@ public partial class ClashGuardian
 
         try {
             if (!autoSwitchSubscription) return;
+            if (!allowAutoStartClient) return;
             if (subscriptionWhitelist == null || subscriptionWhitelist.Length < 2) return;
 
             DateTime lastSub = new DateTime(Interlocked.Read(ref lastSubscriptionSwitchTicks));

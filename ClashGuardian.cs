@@ -68,7 +68,7 @@ public partial class ClashGuardian : Form
     private const int SUB_PROBE_RESULT_MAX_AGE_SECONDS = 60;           // 探测结果有效期（过期则视为未知）
 
     // 自动更新配置
-    private const string APP_VERSION = "1.0.5";
+    private const string APP_VERSION = "1.0.6";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -135,6 +135,15 @@ public partial class ClashGuardian : Form
     private int memoryWarning;
     private int highDelayThreshold;
     private int blacklistMinutes;
+    private int proxyTestTimeoutMs;              // TestProxy 超时（ms）
+
+    // 连接性探测（用于区分“高延迟但可用” vs “高延迟且不可用/极慢”）
+    private string[] connectivityTestUrls;
+    private int connectivityProbeTimeoutMs;
+    private int connectivityProbeMinSuccessCount;
+    private int connectivitySlowThresholdMs;
+    private int connectivityProbeMinIntervalSeconds;
+    private int connectivityResultMaxAgeSeconds;
 
     private string[] coreProcessNames;
     private string[] clientProcessNames;
@@ -183,7 +192,9 @@ public partial class ClashGuardian : Form
     private int totalIssues = 0; // 只统计“问题段落次数”（正常->异常记1次）
     private int consecutiveOK = 0;
     private int cooldownCount = 0;
-    private int consecutiveSuccessfulAutoSwitchesWithoutRecovery = 0; // 连续自动切换节点成功次数（未恢复期间）
+    private int autoSwitchEpisodeAttempts = 0;              // 订阅切换 episode：切换后仍未恢复的次数（UI 线程）
+    private bool pendingSwitchVerification = false;         // 切换后延迟验证挂起（UI 线程）
+    private DateTime pendingVerifyAt = DateTime.MinValue;   // 计划验证时间（UI 线程）
     private bool lastHadIssue = false;
     private DateTime lastStableTime;
     private DateTime startTime;
@@ -194,6 +205,8 @@ public partial class ClashGuardian : Form
 
     // 跨线程数值字段（使用 Interlocked 读写）
     private int lastDelay = 0;
+    private int lastNodeDelay = 0; // 节点延迟（history/live），仅用于辅助展示/诊断
+    private volatile string lastNodeDelayKind = ""; // "histDelay"/"liveDelay"
 
     private Dictionary<string, DateTime> nodeBlacklist = new Dictionary<string, DateTime>();
     private int[] lastTcpStats = new int[] { 0, 0, 0 };
@@ -231,6 +244,9 @@ public partial class ClashGuardian : Form
     private int subscriptionProbeCursor = 0;                 // round-robin cursor（候选节点轮转）
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
     private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
+    private int _didFirstCheck = 0;                        // 防止 HandleCreated 多次触发导致重复首次检测
+
+    private bool monitorHasConnectivityColumns = false;    // 仅对新生成的 monitor_YYYYMMDD.csv 为 true
 
     // ==================== 控制：暂停检测 ====================
     // 暂停整个检测循环（Timer 停止），不会再自动切换/重启；手动操作仍可执行
@@ -255,8 +271,19 @@ public partial class ClashGuardian : Form
 
         ThreadPool.QueueUserWorkItem(_ => CleanOldLogs());
 
-        if (!File.Exists(dataFile))
-            File.WriteAllText(dataFile, "Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event\n");
+        // 新版本的监控 CSV 会追加连接性列；旧文件不强制升级头部，保持兼容
+        if (!File.Exists(dataFile)) {
+            File.WriteAllText(dataFile, "Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event,ConnVerdict,ConnBestRttMs,ConnAgeSec,ConnSuccess,ConnAttempts\n");
+            monitorHasConnectivityColumns = true;
+        } else {
+            monitorHasConnectivityColumns = false;
+            try {
+                using (StreamReader sr = new StreamReader(dataFile, Encoding.UTF8, true)) {
+                    string header = sr.ReadLine() ?? "";
+                    if (header.IndexOf("ConnVerdict", StringComparison.OrdinalIgnoreCase) >= 0) monitorHasConnectivityColumns = true;
+                }
+            } catch { /* ignore */ }
+        }
 
         InitializeUI();
         InitializeTrayIcon();
@@ -268,7 +295,20 @@ public partial class ClashGuardian : Form
 
         Log("守护启动 Pro");
 
-        ThreadPool.QueueUserWorkItem(_ => DoFirstCheck());
+        // 配置安全补全（不阻塞启动；不会引入 disabledNodes 等语义改变字段）
+        ThreadPool.QueueUserWorkItem(_ => BackfillConfigIfMissing());
+
+        // 首次检测：等句柄创建后再执行，避免 BeginInvoke 句柄未创建异常
+        this.HandleCreated += (s, e) => {
+            if (Interlocked.CompareExchange(ref _didFirstCheck, 1, 0) != 0) return;
+            ThreadPool.QueueUserWorkItem(_ => DoFirstCheck());
+        };
+        // 极少数情况下句柄可能已创建（例如被某些组件提前触发）；此时直接触发一次
+        if (this.IsHandleCreated) {
+            if (Interlocked.CompareExchange(ref _didFirstCheck, 1, 0) == 0) {
+                ThreadPool.QueueUserWorkItem(_ => DoFirstCheck());
+            }
+        }
     }
 
     // ==================== 运行时目录规划（运行数据与源码/可执行分离） ====================
@@ -385,26 +425,28 @@ public partial class ClashGuardian : Form
 
             GetCurrentNode();
 
-            this.BeginInvoke((Action)(() => {
-                string delayStr = delay > 0 ? delay + "ms" : "--";
-                string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
-                memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB  |  句柄: " + handles;
+            if (this.IsHandleCreated) {
+                this.BeginInvoke((Action)(() => {
+                    string delayStr = delay > 0 ? delay + "ms" : "--";
+                    string coreShort = string.IsNullOrEmpty(detectedCoreName) ? "未检测" : detectedCoreName;
+                    memLabel.Text = "内  核:  " + coreShort + "  |  " + mem.ToString("F1") + "MB  |  句柄: " + handles;
 
-                string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : SafeNodeName(currentNode);
-                string nodeShort = TruncateNodeName(nodeDisplay);
-                proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
-                proxyLabel.ForeColor = proxyOK ? COLOR_OK : COLOR_ERROR;
+                    string nodeDisplay = string.IsNullOrEmpty(currentNode) ? "--" : SafeNodeName(currentNode);
+                    string nodeShort = TruncateNodeName(nodeDisplay);
+                    proxyLabel.Text = "代  理:  " + (proxyOK ? "OK" : "X") + " " + delayStr + " | " + nodeShort;
+                    proxyLabel.ForeColor = proxyOK ? COLOR_OK : COLOR_ERROR;
 
-                statusLabel.Text = "● 状态: 运行中";
-                statusLabel.ForeColor = COLOR_OK;
+                    statusLabel.Text = "● 状态: 运行中";
+                    statusLabel.ForeColor = COLOR_OK;
 
-                checkLabel.Text = "统  计:  问题 0  |  重启 0  |  切换 0  |  黑名单 0";
-                stableLabel.Text = "稳定性:  连续 0s  |  运行 0s  |  问题 0";
+                    checkLabel.Text = "统  计:  问题 0  |  重启 0  |  切换 0  |  黑名单 0";
+                    stableLabel.Text = "稳定性:  连续 0s  |  运行 0s  |  问题 0";
 
-                if (!string.IsNullOrEmpty(detectedCoreName)) {
-                    Log("检测到内核: " + detectedCoreName);
-                }
-            }));
+                    if (!string.IsNullOrEmpty(detectedCoreName)) {
+                        Log("检测到内核: " + detectedCoreName);
+                    }
+                }));
+            }
 
             CheckForUpdate(true);
             Interlocked.Exchange(ref totalChecks, 1);
@@ -448,6 +490,18 @@ public partial class ClashGuardian : Form
         memoryWarning = DEFAULT_MEMORY_WARNING;
         highDelayThreshold = DEFAULT_HIGH_DELAY;
         blacklistMinutes = DEFAULT_BLACKLIST_MINUTES;
+        proxyTestTimeoutMs = PROXY_TEST_TIMEOUT;
+
+        connectivityTestUrls = new string[] {
+            "http://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt"
+        };
+        connectivityProbeTimeoutMs = 3000;
+        connectivityProbeMinSuccessCount = 1;
+        connectivitySlowThresholdMs = 800;
+        connectivityProbeMinIntervalSeconds = 15;
+        connectivityResultMaxAgeSeconds = 30;
 
         coreProcessNames = DEFAULT_CORE_NAMES;
         clientProcessNames = DEFAULT_CLIENT_NAMES;
@@ -500,6 +554,12 @@ public partial class ClashGuardian : Form
                 if (!parsed || memoryThresholdFixed != memoryThresholdParsed) Log("配置修正: memoryThreshold " + rawMemoryThreshold + " -> " + memoryThresholdFixed);
                 memoryThreshold = memoryThresholdFixed;
 
+                string rawMemoryWarning = GetJsonValue(json, "memoryWarning", memoryWarning.ToString());
+                int memoryWarningParsed = TryParseInt(rawMemoryWarning, memoryWarning, out parsed);
+                int memoryWarningFixed = ClampInt(memoryWarningParsed, 10, 4096);
+                if (!parsed || memoryWarningFixed != memoryWarningParsed) Log("配置修正: memoryWarning " + rawMemoryWarning + " -> " + memoryWarningFixed);
+                memoryWarning = memoryWarningFixed;
+
                 string rawHighDelay = GetJsonValue(json, "highDelayThreshold", highDelayThreshold.ToString());
                 int highDelayParsed = TryParseInt(rawHighDelay, highDelayThreshold, out parsed);
                 int highDelayFixed = ClampInt(highDelayParsed, 50, 10000);
@@ -519,6 +579,12 @@ public partial class ClashGuardian : Form
                     memoryThreshold = memoryWarning;
                 }
                 fastInterval = ClampInt(fastInterval, 200, normalInterval);
+
+                string rawProxyTestTimeout = GetJsonValue(json, "proxyTestTimeoutMs", proxyTestTimeoutMs.ToString());
+                int proxyTestTimeoutParsed = TryParseInt(rawProxyTestTimeout, proxyTestTimeoutMs, out parsed);
+                int proxyTestTimeoutFixed = ClampInt(proxyTestTimeoutParsed, 200, 10000);
+                if (!parsed || proxyTestTimeoutFixed != proxyTestTimeoutParsed) Log("配置修正: proxyTestTimeoutMs " + rawProxyTestTimeout + " -> " + proxyTestTimeoutFixed);
+                proxyTestTimeoutMs = proxyTestTimeoutFixed;
 
                 List<string> customCores = GetJsonStringArray(json, "coreProcessNames");
                 if (customCores.Count > 0) coreProcessNames = customCores.ToArray();
@@ -581,6 +647,40 @@ public partial class ClashGuardian : Form
 
                 List<string> wl = GetJsonStringArray(json, "subscriptionWhitelist");
                 subscriptionWhitelist = wl.Count > 0 ? wl.ToArray() : new string[0];
+
+                // 连接性探测（用于订阅切换前的综合判断）
+                List<string> urls = GetJsonStringArray(json, "connectivityTestUrls");
+                if (urls.Count > 0) connectivityTestUrls = urls.ToArray();
+
+                string rawConnTimeout = GetJsonValue(json, "connectivityProbeTimeoutMs", connectivityProbeTimeoutMs.ToString());
+                int connTimeoutParsed = TryParseInt(rawConnTimeout, connectivityProbeTimeoutMs, out parsed);
+                int connTimeoutFixed = ClampInt(connTimeoutParsed, 300, 30000);
+                if (!parsed || connTimeoutFixed != connTimeoutParsed) Log("配置修正: connectivityProbeTimeoutMs " + rawConnTimeout + " -> " + connTimeoutFixed);
+                connectivityProbeTimeoutMs = connTimeoutFixed;
+
+                string rawConnMinOk = GetJsonValue(json, "connectivityProbeMinSuccessCount", connectivityProbeMinSuccessCount.ToString());
+                int connMinOkParsed = TryParseInt(rawConnMinOk, connectivityProbeMinSuccessCount, out parsed);
+                int connMinOkFixed = ClampInt(connMinOkParsed, 1, 10);
+                if (!parsed || connMinOkFixed != connMinOkParsed) Log("配置修正: connectivityProbeMinSuccessCount " + rawConnMinOk + " -> " + connMinOkFixed);
+                connectivityProbeMinSuccessCount = connMinOkFixed;
+
+                string rawConnSlow = GetJsonValue(json, "connectivitySlowThresholdMs", connectivitySlowThresholdMs.ToString());
+                int connSlowParsed = TryParseInt(rawConnSlow, connectivitySlowThresholdMs, out parsed);
+                int connSlowFixed = ClampInt(connSlowParsed, 50, 20000);
+                if (!parsed || connSlowFixed != connSlowParsed) Log("配置修正: connectivitySlowThresholdMs " + rawConnSlow + " -> " + connSlowFixed);
+                connectivitySlowThresholdMs = connSlowFixed;
+
+                string rawConnMinInterval = GetJsonValue(json, "connectivityProbeMinIntervalSeconds", connectivityProbeMinIntervalSeconds.ToString());
+                int connMinIntervalParsed = TryParseInt(rawConnMinInterval, connectivityProbeMinIntervalSeconds, out parsed);
+                int connMinIntervalFixed = ClampInt(connMinIntervalParsed, 1, 600);
+                if (!parsed || connMinIntervalFixed != connMinIntervalParsed) Log("配置修正: connectivityProbeMinIntervalSeconds " + rawConnMinInterval + " -> " + connMinIntervalFixed);
+                connectivityProbeMinIntervalSeconds = connMinIntervalFixed;
+
+                string rawConnMaxAge = GetJsonValue(json, "connectivityResultMaxAgeSeconds", connectivityResultMaxAgeSeconds.ToString());
+                int connMaxAgeParsed = TryParseInt(rawConnMaxAge, connectivityResultMaxAgeSeconds, out parsed);
+                int connMaxAgeFixed = ClampInt(connMaxAgeParsed, 1, 600);
+                if (!parsed || connMaxAgeFixed != connMaxAgeParsed) Log("配置修正: connectivityResultMaxAgeSeconds " + rawConnMaxAge + " -> " + connMaxAgeFixed);
+                connectivityResultMaxAgeSeconds = connMaxAgeFixed;
 
                 // 从配置文件恢复上次检测到的客户端路径
                 string savedClientPath = GetJsonValue(json, "clientPath", "");
@@ -1074,6 +1174,12 @@ public partial class ClashGuardian : Form
         string clientNames = string.Join("\", \"", DEFAULT_CLIENT_NAMES);
         string excludeNames = string.Join("\", \"", DEFAULT_EXCLUDE_REGIONS);
 
+        string connUrls = string.Join("\", \"", new string[] {
+            "http://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt"
+        });
+
         string config = "{\n" +
             "  \"clashApi\": \"" + clashApi + "\",\n" +
             "  \"clashSecret\": \"" + clashSecret + "\",\n" +
@@ -1083,8 +1189,16 @@ public partial class ClashGuardian : Form
             "  \"speedFactor\": " + speedFactor + ",\n" +
             "  \"allowAutoStartClient\": " + (allowAutoStartClient ? "true" : "false") + ",\n" +
             "  \"memoryThreshold\": " + memoryThreshold + ",\n" +
+            "  \"memoryWarning\": " + memoryWarning + ",\n" +
             "  \"highDelayThreshold\": " + highDelayThreshold + ",\n" +
             "  \"blacklistMinutes\": " + blacklistMinutes + ",\n" +
+            "  \"proxyTestTimeoutMs\": " + proxyTestTimeoutMs + ",\n" +
+            "  \"connectivityTestUrls\": [\"" + connUrls + "\"],\n" +
+            "  \"connectivityProbeTimeoutMs\": " + connectivityProbeTimeoutMs + ",\n" +
+            "  \"connectivityProbeMinSuccessCount\": " + connectivityProbeMinSuccessCount + ",\n" +
+            "  \"connectivitySlowThresholdMs\": " + connectivitySlowThresholdMs + ",\n" +
+            "  \"connectivityProbeMinIntervalSeconds\": " + connectivityProbeMinIntervalSeconds + ",\n" +
+            "  \"connectivityResultMaxAgeSeconds\": " + connectivityResultMaxAgeSeconds + ",\n" +
             "  \"autoSwitchSubscription\": false,\n" +
             "  \"subscriptionSwitchThreshold\": 3,\n" +
             "  \"subscriptionSwitchCooldownMinutes\": 15,\n" +

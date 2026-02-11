@@ -554,6 +554,7 @@ public partial class ClashGuardian
             }
 
             for (;;) {
+                bool pickedFromLiveProbe = false;
                 List<string> allNodes = GetGroupAllNodes(json, group);
                 r.AllNodesCount = allNodes != null ? allNodes.Count : 0;
 
@@ -700,11 +701,11 @@ public partial class ClashGuardian
                             bestPreferred = false;
 
                             foreach (var kv in preferredLive) {
-                                if (kv.Key != cn) { bestNode = kv.Key; bestDelay = kv.Value; bestPreferred = true; break; }
+                                if (kv.Key != cn) { bestNode = kv.Key; bestDelay = kv.Value; bestPreferred = true; pickedFromLiveProbe = true; break; }
                             }
                             if (bestNode == null || bestDelay >= MAX_ACCEPTABLE_DELAY) {
                                 foreach (var kv in normalLive) {
-                                    if (kv.Key != cn) { bestNode = kv.Key; bestDelay = kv.Value; bestPreferred = false; break; }
+                                    if (kv.Key != cn) { bestNode = kv.Key; bestDelay = kv.Value; bestPreferred = false; pickedFromLiveProbe = true; break; }
                                 }
                             }
                         }
@@ -718,10 +719,12 @@ public partial class ClashGuardian
 
                     string url = "/proxies/" + Uri.EscapeDataString(group);
                     if (ApiPut(url, "{\"name\":\"" + bestNode + "\"}")) {
+                        string delayKind = pickedFromLiveProbe ? "liveDelay" : "histDelay";
                         string prefMark = bestPreferred ? " [偏好]" : "";
-                        Log("切换: " + SafeNodeName(bestNode) + " (" + bestDelay + "ms) @" + group + prefMark);
+                        Log("切换: " + SafeNodeName(bestNode) + " (" + delayKind + "=" + bestDelay + "ms) @" + group + prefMark);
                         currentNode = bestNode;
-                        Interlocked.Exchange(ref lastDelay, bestDelay);
+                        Interlocked.Exchange(ref lastNodeDelay, bestDelay);
+                        lastNodeDelayKind = delayKind;
                         Interlocked.Increment(ref totalSwitches);
                         r.Outcome = NodeSwitchOutcome.Switched;
                         r.BestNode = bestNode;
@@ -1060,7 +1063,7 @@ public partial class ClashGuardian
 
         int successCount = 0;
         int minDelay = int.MaxValue;
-        int timeout = fast ? PROXY_TEST_TIMEOUT : API_TIMEOUT_NORMAL;
+        int timeout = fast ? proxyTestTimeoutMs : API_TIMEOUT_NORMAL;
 
         foreach (string url in testUrls) {
             try {

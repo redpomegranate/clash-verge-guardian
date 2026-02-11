@@ -18,11 +18,7 @@ if (-not (Test-Path $icon)) {
 }
 
 & $csc /nologo /target:winexe /win32icon:$icon /out:$outExe `
-  "$PSScriptRoot\\ClashGuardian.cs" `
-  "$PSScriptRoot\\ClashGuardian.UI.cs" `
-  "$PSScriptRoot\\ClashGuardian.Network.cs" `
-  "$PSScriptRoot\\ClashGuardian.Monitor.cs" `
-  "$PSScriptRoot\\ClashGuardian.Update.cs"
+  @(Get-ChildItem -Path $PSScriptRoot -Filter *.cs | Sort-Object Name | ForEach-Object { $_.FullName })
 
 if ($LASTEXITCODE -ne 0) {
   throw "Build failed (csc exit code: $LASTEXITCODE)"
