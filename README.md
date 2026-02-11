@@ -321,46 +321,78 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 
 ## 🧭 自动恢复流程（流程图）
 
+![自动恢复流程图（静态兜底）](assets/readme/auto-recovery-flow.svg)
+
+> 维护说明：流程图变更时，请同时更新下方 Mermaid 源码与 `assets/readme/auto-recovery-flow.svg`（手动同步）。
+
+<details>
+<summary>查看 Mermaid 源码（GitHub 支持时可渲染）</summary>
+
 ```mermaid
 flowchart TD
-  A[Timer CheckStatus] --> B[DoCheckInBackground]
-  B --> C[EvaluateStatus -> StatusDecision]
+  A["Timer CheckStatus"]
+  B["DoCheckInBackground"]
+  C["EvaluateStatus -> StatusDecision"]
+  SW["切换节点"]
+  RS["重启管线 RestartClash"]
+  UI["仅更新 UI / 统计"]
+  SWR{"切换结果？"}
+  NOGOOD["连续失败 x3（节流）<br/>尝试订阅切换或重启客户端"]
+  HM{"HighMemoryHighDelay？"}
+  HMPIPE["快速内核重置 x2<br/>每次：刷新测速 -> 切最佳节点 -> 验证代理和延迟"]
+  NORMAL["常规：杀内核 -> 等待自动恢复（≤ 8s） -> 验证代理"]
+  UP["升级：重启客户端"]
+  AUTO{"allowAutoStartClient = true？"}
+  CR["强制重启客户端（含后台进程）"]
+  READY["等待内核和 API 就绪"]
+  CHECK{"代理或延迟恢复？"}
+  TRY2["刷新测速并切节点（最多 2 次）"]
+  SUB{"可切换订阅？<br/>（autoSwitchSubscription and whitelist ≥ 2 and cooldown ok 或紧急绕过）"}
+  SUB2["切换订阅 -> 强制重启客户端"]
+  TRY2B["订阅切换后再刷新 / 切节点（2 次）"]
+  OK["恢复正常"]
+  STOP["停止自动操作<br/>提示手动介入"]
 
-  C -->|NeedSwitch| SW[切换节点]
-  C -->|NeedRestart| RS[重启管线 RestartClash]
-  C -->|No action| UI[仅更新UI/统计]
+  A --> B
+  B --> C
 
-  SW --> SWR{切换结果?}
-  SWR -->|成功| OK
-  SWR -->|失败: 无可用低延迟节点/延迟超时| NOGOOD[连续失败x3(节流)<br/>尝试订阅切换/重启客户端]
+  C -->|"NeedSwitch"| SW
+  C -->|"NeedRestart"| RS
+  C -->|"NoAction"| UI
+
+  SW --> SWR
+  SWR -->|"成功"| OK
+  SWR -->|"失败：无可用低延迟节点或延迟超时"| NOGOOD
   NOGOOD --> CR
   NOGOOD --> SUB2
- 
-  RS --> HM{HighMemoryHighDelay?}
-  HM -->|是| HMPIPE[快速内核重置 x2<br/>每次: 刷新测速 -> 切最佳节点 -> 验证代理+延迟]
-  HMPIPE -->|恢复| OK[恢复正常]
-  HMPIPE -->|仍失败| UP[升级: 重启客户端]
 
-  HM -->|否| NORMAL[常规: 杀内核 -> 等待自动恢复(<=8s) -> 验证代理]
-  NORMAL -->|恢复| OK
-  NORMAL -->|代理未恢复| UP
+  RS --> HM
+  HM -->|"是"| HMPIPE
+  HMPIPE -->|"恢复"| OK
+  HMPIPE -->|"仍失败"| UP
 
-  UP --> AUTO{allowAutoStartClient=true?}
-  AUTO -->|否| STOP[停止自动操作<br/>提示手动介入]
+  HM -->|"否"| NORMAL
+  NORMAL -->|"恢复"| OK
+  NORMAL -->|"代理未恢复"| UP
 
-  AUTO -->|是| CR[强制重启客户端(含后台进程)]
-  CR --> READY[等待内核+API就绪]
-  READY --> CHECK{代理/延迟恢复?}
-  CHECK -->|恢复| OK
-  CHECK -->|仍失败| TRY2[刷新测速并切节点(最多2次)]
-  TRY2 -->|恢复| OK
-  TRY2 -->|仍失败| SUB{可切换订阅? <br/>(autoSwitchSubscription & whitelist>=2 & cooldown ok/紧急绕过)}
-  SUB -->|否| STOP
-  SUB -->|是| SUB2[切换订阅 -> 强制重启客户端]
-  SUB2 --> TRY2B[订阅切换后再刷新/切节点(2次)]
-  TRY2B -->|恢复| OK
-  TRY2B -->|仍失败| STOP
+  UP --> AUTO
+  AUTO -->|"否"| STOP
+  AUTO -->|"是"| CR
+
+  CR --> READY
+  READY --> CHECK
+  CHECK -->|"恢复"| OK
+  CHECK -->|"仍失败"| TRY2
+  TRY2 -->|"恢复"| OK
+  TRY2 -->|"仍失败"| SUB
+  SUB -->|"否"| STOP
+  SUB -->|"是"| SUB2
+  SUB2 --> TRY2B
+  TRY2B -->|"恢复"| OK
+  TRY2B -->|"仍失败"| STOP
 ```
+
+</details>
 
 补充说明：
 - 当进入 `STOP`（需要手动介入）后，Guardian 会**停止继续自动重启/自动切换/自动订阅切换**，避免无限循环干扰；当代理恢复正常后会自动退出该状态。
