@@ -21,18 +21,24 @@ public partial class ClashGuardian : Form
     private const int DEFAULT_MEMORY_THRESHOLD = 150;      // 内存阈值 (MB)
     private const int DEFAULT_MEMORY_WARNING = 70;         // 内存警告阈值 (MB)
     private const int DEFAULT_HIGH_DELAY = 400;            // 高延迟阈值 (ms)
+    private const int DEFAULT_HIGH_DELAY_CONN_OK_EXTRA_MS = 120;     // 连接性为 OK 时的额外高延迟阈值 (ms)
+    private const int DEFAULT_HIGH_DELAY_SWITCH_CONSEC_CONN_OK = 4;  // 连接性 OK 时高延迟连续命中次数
+    private const int DEFAULT_HIGH_DELAY_SWITCH_CONSEC_CONN_UNKNOWN = 3; // 连接性 Unknown 时高延迟连续命中次数
     private const int DEFAULT_BLACKLIST_MINUTES = 20;      // 黑名单时长（分钟）
+    private const int DEFAULT_CLOSEWAIT_THRESHOLD_CORE = 25;          // Core 级 CloseWait 阈值
+    private const int DEFAULT_CLOSEWAIT_CONSECUTIVE = 3;              // Core CloseWait 连续命中次数
+    private const int DEFAULT_AUTO_SWITCH_MAX_PER_10MIN = 6;          // 自动切换 10 分钟上限
+    private const int DEFAULT_AUTO_RESTART_MAX_PER_10MIN = 3;         // 自动重启 10 分钟上限
+    private const int DEFAULT_AUTO_RESTART_MIN_INTERVAL_SECONDS = 20; // 自动重启最小间隔
+    private const int DEFAULT_SWITCH_STORM_SUPPRESS_SECONDS = 60;     // 切换风暴抑制时长
+    private const int DEFAULT_RESTART_STORM_SUPPRESS_SECONDS = 120;   // 重启风暴抑制时长
     private const int DEFAULT_PROXY_PORT = 7897;           // 代理端口
     private const int DEFAULT_API_PORT = 9097;             // API 端口
-    private const int TCP_CHECK_INTERVAL = 10;             // TCP 统计检测间隔（~50s）
-    private const int NODE_UPDATE_INTERVAL = 30;           // 节点信息更新间隔（~150s）
-    private const int DELAY_TEST_INTERVAL = 72;            // 延迟测试间隔（~6min）
     private const int LOG_RETENTION_DAYS = 7;              // 日志保留天数
     private const int COOLDOWN_COUNT = 5;                  // 重启后冷却次数
     private const int MAX_NODE_NAME_LENGTH = 50;           // 节点名最大长度
     private const int MAX_NODE_DISPLAY_LENGTH = 15;        // 节点名显示截断长度
     private const int MAX_ACCEPTABLE_DELAY = 2000;         // 最大可接受延迟 (ms)
-    private const int CLOSE_WAIT_THRESHOLD = 20;           // CloseWait 连接泄漏阈值
     private const int CONSECUTIVE_OK_THRESHOLD = 3;        // 恢复正常间隔所需连续成功次数
     private const int MAX_RECURSE_DEPTH = 5;               // 代理组递归解析最大深度
     private const int MIN_UPDATE_FILE_SIZE = 10240;        // 更新文件最小有效大小 (bytes)
@@ -68,7 +74,7 @@ public partial class ClashGuardian : Form
     private const int SUB_PROBE_RESULT_MAX_AGE_SECONDS = 60;           // 探测结果有效期（过期则视为未知）
 
     // 自动更新配置
-    private const string APP_VERSION = "1.0.6";
+    private const string APP_VERSION = "1.0.7";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -89,7 +95,9 @@ public partial class ClashGuardian : Form
         public string Reason;
         public string Event;
         public bool HasIssue;
-        public int NewFailCount;           // 决策后的 failCount 值
+        public int NewFailCount;           // 决策后的 proxy failCount 值
+        public int NewHighDelayCount;      // 决策后的高延迟连续计数
+        public int NewCloseWaitFailCount;  // 决策后的 core CloseWait 连续计数
         public bool IncrementTotalFails;   // 是否增加总失败数
         public bool ResetConsecutiveOK;    // 是否重置连续成功计数
         public bool IncrementConsecutiveOK;// 是否增加连续成功计数
@@ -109,6 +117,12 @@ public partial class ClashGuardian : Form
 
     private static readonly string[] DEFAULT_EXCLUDE_REGIONS = new string[] {
         "HK", "香港", "TW", "台湾", "MO", "澳门"
+    };
+
+    private static readonly string[] DEFAULT_CONNECTIVITY_TEST_URLS = new string[] {
+        "http://www.gstatic.com/generate_204",
+        "http://cp.cloudflare.com/generate_204",
+        "http://www.msftconnecttest.com/connecttest.txt"
     };
 
     // ==================== UI 颜色常量 ====================
@@ -134,6 +148,16 @@ public partial class ClashGuardian : Form
     private int memoryThreshold;
     private int memoryWarning;
     private int highDelayThreshold;
+    private int highDelayConnOkExtraMs;
+    private int highDelaySwitchConsecutiveConnOk;
+    private int highDelaySwitchConsecutiveConnUnknown;
+    private int closeWaitThresholdCore;
+    private int closeWaitConsecutive;
+    private int autoSwitchMaxPer10Min;
+    private int autoRestartMaxPer10Min;
+    private int autoRestartMinIntervalSeconds;
+    private int switchStormSuppressSeconds;
+    private int restartStormSuppressSeconds;
     private int blacklistMinutes;
     private int proxyTestTimeoutMs;              // TestProxy 超时（ms）
 
@@ -188,6 +212,8 @@ public partial class ClashGuardian : Form
 
     // 以下字段仅在 UI 线程修改（通过 BeginInvoke 确保），无需额外同步
     private int failCount = 0;
+    private int highDelayCount = 0;
+    private int closeWaitFailCount = 0;
     private int totalFails = 0;
     private int totalIssues = 0; // 只统计“问题段落次数”（正常->异常记1次）
     private int consecutiveOK = 0;
@@ -243,6 +269,7 @@ public partial class ClashGuardian : Form
     private volatile string subscriptionProbeBestNode = "";  // 最佳节点名
     private int subscriptionProbeCursor = 0;                 // round-robin cursor（候选节点轮转）
     private int _isChecking = 0;                           // 0=空闲, 1=检测中; Interlocked 操作
+    private int _isRestartQueued = 0;                     // 0=空闲, 1=已排队; 防止重复排队重启任务
     private volatile bool _isRestarting = false;           // 重启进行中标志（阻止 CheckStatus 并发）
     private int _didFirstCheck = 0;                        // 防止 HandleCreated 多次触发导致重复首次检测
 
@@ -478,6 +505,15 @@ public partial class ClashGuardian : Form
         return TryParseInt(s, fallback, out _);
     }
 
+    int LoadIntConfigWithClamp(string json, string key, int currentValue, int min, int max) {
+        bool parsed;
+        string raw = GetJsonValue(json, key, currentValue.ToString());
+        int parsedValue = TryParseInt(raw, currentValue, out parsed);
+        int fixedValue = ClampInt(parsedValue, min, max);
+        if (!parsed || fixedValue != parsedValue) Log("配置修正: " + key + " " + raw + " -> " + fixedValue);
+        return fixedValue;
+    }
+
     void LoadConfigFast() {
         clashApi = "http://127.0.0.1:" + DEFAULT_API_PORT;
         clashSecret = "set-your-secret";
@@ -489,14 +525,20 @@ public partial class ClashGuardian : Form
         memoryThreshold = DEFAULT_MEMORY_THRESHOLD;
         memoryWarning = DEFAULT_MEMORY_WARNING;
         highDelayThreshold = DEFAULT_HIGH_DELAY;
+        highDelayConnOkExtraMs = DEFAULT_HIGH_DELAY_CONN_OK_EXTRA_MS;
+        highDelaySwitchConsecutiveConnOk = DEFAULT_HIGH_DELAY_SWITCH_CONSEC_CONN_OK;
+        highDelaySwitchConsecutiveConnUnknown = DEFAULT_HIGH_DELAY_SWITCH_CONSEC_CONN_UNKNOWN;
+        closeWaitThresholdCore = DEFAULT_CLOSEWAIT_THRESHOLD_CORE;
+        closeWaitConsecutive = DEFAULT_CLOSEWAIT_CONSECUTIVE;
+        autoSwitchMaxPer10Min = DEFAULT_AUTO_SWITCH_MAX_PER_10MIN;
+        autoRestartMaxPer10Min = DEFAULT_AUTO_RESTART_MAX_PER_10MIN;
+        autoRestartMinIntervalSeconds = DEFAULT_AUTO_RESTART_MIN_INTERVAL_SECONDS;
+        switchStormSuppressSeconds = DEFAULT_SWITCH_STORM_SUPPRESS_SECONDS;
+        restartStormSuppressSeconds = DEFAULT_RESTART_STORM_SUPPRESS_SECONDS;
         blacklistMinutes = DEFAULT_BLACKLIST_MINUTES;
         proxyTestTimeoutMs = PROXY_TEST_TIMEOUT;
 
-        connectivityTestUrls = new string[] {
-            "http://www.gstatic.com/generate_204",
-            "http://cp.cloudflare.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt"
-        };
+        connectivityTestUrls = (string[])DEFAULT_CONNECTIVITY_TEST_URLS.Clone();
         connectivityProbeTimeoutMs = 3000;
         connectivityProbeMinSuccessCount = 1;
         connectivitySlowThresholdMs = 800;
@@ -519,58 +561,36 @@ public partial class ClashGuardian : Form
 
                 clashSecret = GetJsonValue(json, "clashSecret", clashSecret);
 
+                proxyPort = LoadIntConfigWithClamp(json, "proxyPort", proxyPort, 1, 65535);
+                normalInterval = LoadIntConfigWithClamp(json, "normalInterval", normalInterval, 500, 600000);
+
                 bool parsed;
-                string rawProxyPort = GetJsonValue(json, "proxyPort", proxyPort.ToString());
-                int proxyPortParsed = TryParseInt(rawProxyPort, proxyPort, out parsed);
-                int proxyPortFixed = ClampInt(proxyPortParsed, 1, 65535);
-                if (!parsed || proxyPortFixed != proxyPortParsed) Log("配置修正: proxyPort " + rawProxyPort + " -> " + proxyPortFixed);
-                proxyPort = proxyPortFixed;
-
-                string rawNormalInterval = GetJsonValue(json, "normalInterval", normalInterval.ToString());
-                int normalIntervalParsed = TryParseInt(rawNormalInterval, normalInterval, out parsed);
-                int normalIntervalFixed = ClampInt(normalIntervalParsed, 500, 600000);
-                if (!parsed || normalIntervalFixed != normalIntervalParsed) Log("配置修正: normalInterval " + rawNormalInterval + " -> " + normalIntervalFixed);
-                normalInterval = normalIntervalFixed;
-
                 string rawFastInterval = GetJsonValue(json, "fastInterval", fastInterval.ToString());
                 int fastIntervalParsed = TryParseInt(rawFastInterval, fastInterval, out parsed);
                 int fastIntervalFixed = ClampInt(fastIntervalParsed, 200, normalInterval);
                 if (!parsed || fastIntervalFixed != fastIntervalParsed) Log("閰嶇疆淇: fastInterval " + rawFastInterval + " -> " + fastIntervalFixed);
                 fastInterval = fastIntervalFixed;
 
-                string rawSpeed = GetJsonValue(json, "speedFactor", speedFactor.ToString());
-                int speedParsed = TryParseInt(rawSpeed, speedFactor, out parsed);
-                int speedFixed = ClampInt(speedParsed, 1, 5);
-                if (!parsed || speedFixed != speedParsed) Log("配置修正: speedFactor " + rawSpeed + " -> " + speedFixed);
-                speedFactor = speedFixed;
+                speedFactor = LoadIntConfigWithClamp(json, "speedFactor", speedFactor, 1, 5);
 
                 string rawAllowAutoStartClient = GetJsonValue(json, "allowAutoStartClient", allowAutoStartClient ? "true" : "false");
                 bool allowClient;
                 if (bool.TryParse(rawAllowAutoStartClient, out allowClient)) allowAutoStartClient = allowClient;
 
-                string rawMemoryThreshold = GetJsonValue(json, "memoryThreshold", memoryThreshold.ToString());
-                int memoryThresholdParsed = TryParseInt(rawMemoryThreshold, memoryThreshold, out parsed);
-                int memoryThresholdFixed = ClampInt(memoryThresholdParsed, 10, 4096);
-                if (!parsed || memoryThresholdFixed != memoryThresholdParsed) Log("配置修正: memoryThreshold " + rawMemoryThreshold + " -> " + memoryThresholdFixed);
-                memoryThreshold = memoryThresholdFixed;
-
-                string rawMemoryWarning = GetJsonValue(json, "memoryWarning", memoryWarning.ToString());
-                int memoryWarningParsed = TryParseInt(rawMemoryWarning, memoryWarning, out parsed);
-                int memoryWarningFixed = ClampInt(memoryWarningParsed, 10, 4096);
-                if (!parsed || memoryWarningFixed != memoryWarningParsed) Log("配置修正: memoryWarning " + rawMemoryWarning + " -> " + memoryWarningFixed);
-                memoryWarning = memoryWarningFixed;
-
-                string rawHighDelay = GetJsonValue(json, "highDelayThreshold", highDelayThreshold.ToString());
-                int highDelayParsed = TryParseInt(rawHighDelay, highDelayThreshold, out parsed);
-                int highDelayFixed = ClampInt(highDelayParsed, 50, 10000);
-                if (!parsed || highDelayFixed != highDelayParsed) Log("配置修正: highDelayThreshold " + rawHighDelay + " -> " + highDelayFixed);
-                highDelayThreshold = highDelayFixed;
-
-                string rawBlacklist = GetJsonValue(json, "blacklistMinutes", blacklistMinutes.ToString());
-                int blacklistParsed = TryParseInt(rawBlacklist, blacklistMinutes, out parsed);
-                int blacklistFixed = ClampInt(blacklistParsed, 1, 1440);
-                if (!parsed || blacklistFixed != blacklistParsed) Log("配置修正: blacklistMinutes " + rawBlacklist + " -> " + blacklistFixed);
-                blacklistMinutes = blacklistFixed;
+                memoryThreshold = LoadIntConfigWithClamp(json, "memoryThreshold", memoryThreshold, 10, 4096);
+                memoryWarning = LoadIntConfigWithClamp(json, "memoryWarning", memoryWarning, 10, 4096);
+                highDelayThreshold = LoadIntConfigWithClamp(json, "highDelayThreshold", highDelayThreshold, 50, 10000);
+                highDelayConnOkExtraMs = LoadIntConfigWithClamp(json, "highDelayConnOkExtraMs", highDelayConnOkExtraMs, 0, 5000);
+                highDelaySwitchConsecutiveConnOk = LoadIntConfigWithClamp(json, "highDelaySwitchConsecutiveConnOk", highDelaySwitchConsecutiveConnOk, 1, 10);
+                highDelaySwitchConsecutiveConnUnknown = LoadIntConfigWithClamp(json, "highDelaySwitchConsecutiveConnUnknown", highDelaySwitchConsecutiveConnUnknown, 1, 10);
+                blacklistMinutes = LoadIntConfigWithClamp(json, "blacklistMinutes", blacklistMinutes, 1, 1440);
+                closeWaitThresholdCore = LoadIntConfigWithClamp(json, "closeWaitThresholdCore", closeWaitThresholdCore, 1, 100000);
+                closeWaitConsecutive = LoadIntConfigWithClamp(json, "closeWaitConsecutive", closeWaitConsecutive, 1, 10);
+                autoSwitchMaxPer10Min = LoadIntConfigWithClamp(json, "autoSwitchMaxPer10Min", autoSwitchMaxPer10Min, 1, 120);
+                autoRestartMaxPer10Min = LoadIntConfigWithClamp(json, "autoRestartMaxPer10Min", autoRestartMaxPer10Min, 1, 60);
+                autoRestartMinIntervalSeconds = LoadIntConfigWithClamp(json, "autoRestartMinIntervalSeconds", autoRestartMinIntervalSeconds, 0, 600);
+                switchStormSuppressSeconds = LoadIntConfigWithClamp(json, "switchStormSuppressSeconds", switchStormSuppressSeconds, 5, 3600);
+                restartStormSuppressSeconds = LoadIntConfigWithClamp(json, "restartStormSuppressSeconds", restartStormSuppressSeconds, 5, 3600);
 
                 // 只影响极端误配：保持阈值一致性，避免配置导致异常行为
                 memoryWarning = ClampInt(memoryWarning, 10, 4096);
@@ -580,11 +600,7 @@ public partial class ClashGuardian : Form
                 }
                 fastInterval = ClampInt(fastInterval, 200, normalInterval);
 
-                string rawProxyTestTimeout = GetJsonValue(json, "proxyTestTimeoutMs", proxyTestTimeoutMs.ToString());
-                int proxyTestTimeoutParsed = TryParseInt(rawProxyTestTimeout, proxyTestTimeoutMs, out parsed);
-                int proxyTestTimeoutFixed = ClampInt(proxyTestTimeoutParsed, 200, 10000);
-                if (!parsed || proxyTestTimeoutFixed != proxyTestTimeoutParsed) Log("配置修正: proxyTestTimeoutMs " + rawProxyTestTimeout + " -> " + proxyTestTimeoutFixed);
-                proxyTestTimeoutMs = proxyTestTimeoutFixed;
+                proxyTestTimeoutMs = LoadIntConfigWithClamp(json, "proxyTestTimeoutMs", proxyTestTimeoutMs, 200, 10000);
 
                 List<string> customCores = GetJsonStringArray(json, "coreProcessNames");
                 if (customCores.Count > 0) coreProcessNames = customCores.ToArray();
@@ -633,17 +649,8 @@ public partial class ClashGuardian : Form
                 bool autoSub;
                 if (bool.TryParse(rawAutoSub, out autoSub)) autoSwitchSubscription = autoSub;
 
-                string rawSubTh = GetJsonValue(json, "subscriptionSwitchThreshold", subscriptionSwitchThreshold.ToString());
-                int subThParsed = TryParseInt(rawSubTh, subscriptionSwitchThreshold, out parsed);
-                int subThFixed = ClampInt(subThParsed, 1, 10);
-                if (!parsed || subThFixed != subThParsed) Log("配置修正: subscriptionSwitchThreshold " + rawSubTh + " -> " + subThFixed);
-                subscriptionSwitchThreshold = subThFixed;
-
-                string rawSubCd = GetJsonValue(json, "subscriptionSwitchCooldownMinutes", subscriptionSwitchCooldownMinutes.ToString());
-                int subCdParsed = TryParseInt(rawSubCd, subscriptionSwitchCooldownMinutes, out parsed);
-                int subCdFixed = ClampInt(subCdParsed, 1, 1440);
-                if (!parsed || subCdFixed != subCdParsed) Log("配置修正: subscriptionSwitchCooldownMinutes " + rawSubCd + " -> " + subCdFixed);
-                subscriptionSwitchCooldownMinutes = subCdFixed;
+                subscriptionSwitchThreshold = LoadIntConfigWithClamp(json, "subscriptionSwitchThreshold", subscriptionSwitchThreshold, 1, 10);
+                subscriptionSwitchCooldownMinutes = LoadIntConfigWithClamp(json, "subscriptionSwitchCooldownMinutes", subscriptionSwitchCooldownMinutes, 1, 1440);
 
                 List<string> wl = GetJsonStringArray(json, "subscriptionWhitelist");
                 subscriptionWhitelist = wl.Count > 0 ? wl.ToArray() : new string[0];
@@ -652,35 +659,11 @@ public partial class ClashGuardian : Form
                 List<string> urls = GetJsonStringArray(json, "connectivityTestUrls");
                 if (urls.Count > 0) connectivityTestUrls = urls.ToArray();
 
-                string rawConnTimeout = GetJsonValue(json, "connectivityProbeTimeoutMs", connectivityProbeTimeoutMs.ToString());
-                int connTimeoutParsed = TryParseInt(rawConnTimeout, connectivityProbeTimeoutMs, out parsed);
-                int connTimeoutFixed = ClampInt(connTimeoutParsed, 300, 30000);
-                if (!parsed || connTimeoutFixed != connTimeoutParsed) Log("配置修正: connectivityProbeTimeoutMs " + rawConnTimeout + " -> " + connTimeoutFixed);
-                connectivityProbeTimeoutMs = connTimeoutFixed;
-
-                string rawConnMinOk = GetJsonValue(json, "connectivityProbeMinSuccessCount", connectivityProbeMinSuccessCount.ToString());
-                int connMinOkParsed = TryParseInt(rawConnMinOk, connectivityProbeMinSuccessCount, out parsed);
-                int connMinOkFixed = ClampInt(connMinOkParsed, 1, 10);
-                if (!parsed || connMinOkFixed != connMinOkParsed) Log("配置修正: connectivityProbeMinSuccessCount " + rawConnMinOk + " -> " + connMinOkFixed);
-                connectivityProbeMinSuccessCount = connMinOkFixed;
-
-                string rawConnSlow = GetJsonValue(json, "connectivitySlowThresholdMs", connectivitySlowThresholdMs.ToString());
-                int connSlowParsed = TryParseInt(rawConnSlow, connectivitySlowThresholdMs, out parsed);
-                int connSlowFixed = ClampInt(connSlowParsed, 50, 20000);
-                if (!parsed || connSlowFixed != connSlowParsed) Log("配置修正: connectivitySlowThresholdMs " + rawConnSlow + " -> " + connSlowFixed);
-                connectivitySlowThresholdMs = connSlowFixed;
-
-                string rawConnMinInterval = GetJsonValue(json, "connectivityProbeMinIntervalSeconds", connectivityProbeMinIntervalSeconds.ToString());
-                int connMinIntervalParsed = TryParseInt(rawConnMinInterval, connectivityProbeMinIntervalSeconds, out parsed);
-                int connMinIntervalFixed = ClampInt(connMinIntervalParsed, 1, 600);
-                if (!parsed || connMinIntervalFixed != connMinIntervalParsed) Log("配置修正: connectivityProbeMinIntervalSeconds " + rawConnMinInterval + " -> " + connMinIntervalFixed);
-                connectivityProbeMinIntervalSeconds = connMinIntervalFixed;
-
-                string rawConnMaxAge = GetJsonValue(json, "connectivityResultMaxAgeSeconds", connectivityResultMaxAgeSeconds.ToString());
-                int connMaxAgeParsed = TryParseInt(rawConnMaxAge, connectivityResultMaxAgeSeconds, out parsed);
-                int connMaxAgeFixed = ClampInt(connMaxAgeParsed, 1, 600);
-                if (!parsed || connMaxAgeFixed != connMaxAgeParsed) Log("配置修正: connectivityResultMaxAgeSeconds " + rawConnMaxAge + " -> " + connMaxAgeFixed);
-                connectivityResultMaxAgeSeconds = connMaxAgeFixed;
+                connectivityProbeTimeoutMs = LoadIntConfigWithClamp(json, "connectivityProbeTimeoutMs", connectivityProbeTimeoutMs, 300, 30000);
+                connectivityProbeMinSuccessCount = LoadIntConfigWithClamp(json, "connectivityProbeMinSuccessCount", connectivityProbeMinSuccessCount, 1, 10);
+                connectivitySlowThresholdMs = LoadIntConfigWithClamp(json, "connectivitySlowThresholdMs", connectivitySlowThresholdMs, 50, 20000);
+                connectivityProbeMinIntervalSeconds = LoadIntConfigWithClamp(json, "connectivityProbeMinIntervalSeconds", connectivityProbeMinIntervalSeconds, 1, 600);
+                connectivityResultMaxAgeSeconds = LoadIntConfigWithClamp(json, "connectivityResultMaxAgeSeconds", connectivityResultMaxAgeSeconds, 1, 600);
 
                 // 从配置文件恢复上次检测到的客户端路径
                 string savedClientPath = GetJsonValue(json, "clientPath", "");
@@ -869,39 +852,85 @@ public partial class ClashGuardian : Form
         return null;
     }
 
+    bool UpdateConfigJson(Func<string, string> transform, string opName) {
+        if (transform == null) return false;
+        try {
+            if (!File.Exists(configFile)) {
+                SaveDefaultConfig();
+            }
+
+            lock (configLock) {
+                if (!File.Exists(configFile)) return false;
+                string json = File.ReadAllText(configFile, Encoding.UTF8);
+                string updated = transform(json);
+                if (string.IsNullOrEmpty(updated)) return false;
+
+                if (!string.Equals(updated, json, StringComparison.Ordinal)) {
+                    File.WriteAllText(configFile, updated, Encoding.UTF8);
+                }
+            }
+            return true;
+        } catch (Exception ex) {
+            string tag = string.IsNullOrEmpty(opName) ? "" : "(" + opName + ")";
+            Log("保存配置失败" + tag + ": " + ex.Message);
+            return false;
+        }
+    }
+
+    static string UpsertJsonFieldLiteral(string json, string key, string rawValueLiteral) {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key) || string.IsNullOrEmpty(rawValueLiteral)) return json;
+        string keyTag = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(keyTag, StringComparison.Ordinal);
+        if (keyIdx >= 0) {
+            int colon = json.IndexOf(':', keyIdx);
+            if (colon < 0) return json;
+
+            int valueStart = colon + 1;
+            while (valueStart < json.Length && char.IsWhiteSpace(json[valueStart])) valueStart++;
+
+            int valueEnd = valueStart;
+            bool inStr = false;
+            bool escape = false;
+            while (valueEnd < json.Length) {
+                char c = json[valueEnd];
+                if (escape) { escape = false; valueEnd++; continue; }
+                if (inStr && c == '\\') { escape = true; valueEnd++; continue; }
+                if (c == '"') { inStr = !inStr; valueEnd++; continue; }
+                if (!inStr && (c == ',' || c == '}')) break;
+                valueEnd++;
+            }
+            return json.Substring(0, valueStart) + rawValueLiteral + json.Substring(valueEnd);
+        }
+
+        int lastBrace = json.LastIndexOf('}');
+        if (lastBrace <= 0) return json;
+        int p = lastBrace - 1;
+        while (p >= 0 && char.IsWhiteSpace(json[p])) p--;
+        bool needComma = p >= 0 && json[p] != '{' && json[p] != ',';
+        string insert = (needComma ? "," : "") + "\n  " + keyTag + ": " + rawValueLiteral + "\n";
+        return json.Substring(0, lastBrace) + insert + json.Substring(lastBrace);
+    }
+
+    static string BuildJsonArrayLiteral(IList<string> values) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        if (values != null) {
+            for (int i = 0; i < values.Count; i++) {
+                if (i > 0) sb.Append(", ");
+                sb.Append("\"").Append(EscapeJsonString(values[i] ?? "")).Append("\"");
+            }
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
     // 将检测到的客户端路径持久化到 config.json
     void SaveClientPath() {
         if (string.IsNullOrEmpty(detectedClientPath)) return;
-        try {
-            lock (configLock) {
-                if (File.Exists(configFile)) {
-                    string json = File.ReadAllText(configFile, Encoding.UTF8);
-                    if (json.Contains("\"clientPath\"")) {
-                        // 替换已有的 clientPath
-                        int start = json.IndexOf("\"clientPath\"");
-                        int valueStart = json.IndexOf(':', start) + 1;
-                        // 找到值的结束位置（逗号或 }）
-                        int valueEnd = valueStart;
-                        bool inStr = false;
-                        while (valueEnd < json.Length) {
-                            if (json[valueEnd] == '"') inStr = !inStr;
-                            if (!inStr && (json[valueEnd] == ',' || json[valueEnd] == '}')) break;
-                            valueEnd++;
-                        }
-                        string escaped = detectedClientPath.Replace("\\", "\\\\");
-                        json = json.Substring(0, valueStart) + " \"" + escaped + "\"" + json.Substring(valueEnd);
-                    } else {
-                        // 在最后一个 } 前插入
-                        int lastBrace = json.LastIndexOf('}');
-                        if (lastBrace > 0) {
-                            string escaped = detectedClientPath.Replace("\\", "\\\\");
-                            json = json.Substring(0, lastBrace) + ",\n  \"clientPath\": \"" + escaped + "\"\n}";
-                        }
-                    }
-                    File.WriteAllText(configFile, json, Encoding.UTF8);
-                }
-            }
-        } catch { /* 保存客户端路径失败不影响运行 */ }
+        string escaped = EscapeJsonString(detectedClientPath);
+        UpdateConfigJson(
+            json => UpsertJsonFieldLiteral(json, "clientPath", "\"" + escaped + "\""),
+            "clientPath");
     }
 
     void SaveDisabledNodes() {
@@ -913,50 +942,10 @@ public partial class ClashGuardian : Form
                 }
             }
             snapshot.Sort(StringComparer.OrdinalIgnoreCase);
-
-            // 确保存在配置文件（首次运行可能还未写入）
-            if (!File.Exists(configFile)) {
-                SaveDefaultConfig();
-            }
-
-            StringBuilder sbArr = new StringBuilder();
-            sbArr.Append("[");
-            for (int i = 0; i < snapshot.Count; i++) {
-                if (i > 0) sbArr.Append(", ");
-                sbArr.Append("\"").Append(EscapeJsonString(snapshot[i])).Append("\"");
-            }
-            sbArr.Append("]");
-            string arr = sbArr.ToString();
-
-            lock (configLock) {
-                if (!File.Exists(configFile)) return;
-                string json = File.ReadAllText(configFile, Encoding.UTF8);
-
-                string key = "\"disabledNodes\"";
-                int keyIdx = json.IndexOf(key, StringComparison.Ordinal);
-
-                if (keyIdx >= 0) {
-                    int colon = json.IndexOf(':', keyIdx);
-                    int arrStart = colon >= 0 ? json.IndexOf('[', colon) : -1;
-                    if (arrStart > 0) {
-                        int arrEnd = FindMatchingArrayBracket(json, arrStart);
-                        if (arrEnd > arrStart) {
-                            json = json.Substring(0, arrStart) + arr + json.Substring(arrEnd + 1);
-                        }
-                    }
-                } else {
-                    int lastBrace = json.LastIndexOf('}');
-                    if (lastBrace > 0) {
-                        int p = lastBrace - 1;
-                        while (p >= 0 && char.IsWhiteSpace(json[p])) p--;
-                        bool needComma = p >= 0 && json[p] != '{' && json[p] != ',';
-                        string insert = (needComma ? "," : "") + "\n  \"disabledNodes\": " + arr + "\n";
-                        json = json.Substring(0, lastBrace) + insert + json.Substring(lastBrace);
-                    }
-                }
-
-                File.WriteAllText(configFile, json, Encoding.UTF8);
-            }
+            string arr = BuildJsonArrayLiteral(snapshot);
+            UpdateConfigJson(
+                json => UpsertJsonFieldLiteral(json, "disabledNodes", arr),
+                "disabledNodes");
         } catch (Exception ex) {
             Log("保存禁用名单失败: " + ex.Message);
         }
@@ -971,50 +960,10 @@ public partial class ClashGuardian : Form
                 }
             }
             snapshot.Sort(StringComparer.OrdinalIgnoreCase);
-
-            // 确保存在配置文件（首次运行可能还未写入）
-            if (!File.Exists(configFile)) {
-                SaveDefaultConfig();
-            }
-
-            StringBuilder sbArr = new StringBuilder();
-            sbArr.Append("[");
-            for (int i = 0; i < snapshot.Count; i++) {
-                if (i > 0) sbArr.Append(", ");
-                sbArr.Append("\"").Append(EscapeJsonString(snapshot[i])).Append("\"");
-            }
-            sbArr.Append("]");
-            string arr = sbArr.ToString();
-
-            lock (configLock) {
-                if (!File.Exists(configFile)) return;
-                string json = File.ReadAllText(configFile, Encoding.UTF8);
-
-                string key = "\"preferredNodes\"";
-                int keyIdx = json.IndexOf(key, StringComparison.Ordinal);
-
-                if (keyIdx >= 0) {
-                    int colon = json.IndexOf(':', keyIdx);
-                    int arrStart = colon >= 0 ? json.IndexOf('[', colon) : -1;
-                    if (arrStart > 0) {
-                        int arrEnd = FindMatchingArrayBracket(json, arrStart);
-                        if (arrEnd > arrStart) {
-                            json = json.Substring(0, arrStart) + arr + json.Substring(arrEnd + 1);
-                        }
-                    }
-                } else {
-                    int lastBrace = json.LastIndexOf('}');
-                    if (lastBrace > 0) {
-                        int p = lastBrace - 1;
-                        while (p >= 0 && char.IsWhiteSpace(json[p])) p--;
-                        bool needComma = p >= 0 && json[p] != '{' && json[p] != ',';
-                        string insert = (needComma ? "," : "") + "\n  \"preferredNodes\": " + arr + "\n";
-                        json = json.Substring(0, lastBrace) + insert + json.Substring(lastBrace);
-                    }
-                }
-
-                File.WriteAllText(configFile, json, Encoding.UTF8);
-            }
+            string arr = BuildJsonArrayLiteral(snapshot);
+            UpdateConfigJson(
+                json => UpsertJsonFieldLiteral(json, "preferredNodes", arr),
+                "preferredNodes");
         } catch (Exception ex) {
             Log("保存偏好节点失败: " + ex.Message);
         }
@@ -1174,11 +1123,7 @@ public partial class ClashGuardian : Form
         string clientNames = string.Join("\", \"", DEFAULT_CLIENT_NAMES);
         string excludeNames = string.Join("\", \"", DEFAULT_EXCLUDE_REGIONS);
 
-        string connUrls = string.Join("\", \"", new string[] {
-            "http://www.gstatic.com/generate_204",
-            "http://cp.cloudflare.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt"
-        });
+        string connUrls = string.Join("\", \"", DEFAULT_CONNECTIVITY_TEST_URLS);
 
         string config = "{\n" +
             "  \"clashApi\": \"" + clashApi + "\",\n" +
@@ -1191,6 +1136,16 @@ public partial class ClashGuardian : Form
             "  \"memoryThreshold\": " + memoryThreshold + ",\n" +
             "  \"memoryWarning\": " + memoryWarning + ",\n" +
             "  \"highDelayThreshold\": " + highDelayThreshold + ",\n" +
+            "  \"highDelayConnOkExtraMs\": " + highDelayConnOkExtraMs + ",\n" +
+            "  \"highDelaySwitchConsecutiveConnOk\": " + highDelaySwitchConsecutiveConnOk + ",\n" +
+            "  \"highDelaySwitchConsecutiveConnUnknown\": " + highDelaySwitchConsecutiveConnUnknown + ",\n" +
+            "  \"closeWaitThresholdCore\": " + closeWaitThresholdCore + ",\n" +
+            "  \"closeWaitConsecutive\": " + closeWaitConsecutive + ",\n" +
+            "  \"autoSwitchMaxPer10Min\": " + autoSwitchMaxPer10Min + ",\n" +
+            "  \"autoRestartMaxPer10Min\": " + autoRestartMaxPer10Min + ",\n" +
+            "  \"autoRestartMinIntervalSeconds\": " + autoRestartMinIntervalSeconds + ",\n" +
+            "  \"switchStormSuppressSeconds\": " + switchStormSuppressSeconds + ",\n" +
+            "  \"restartStormSuppressSeconds\": " + restartStormSuppressSeconds + ",\n" +
             "  \"blacklistMinutes\": " + blacklistMinutes + ",\n" +
             "  \"proxyTestTimeoutMs\": " + proxyTestTimeoutMs + ",\n" +
             "  \"connectivityTestUrls\": [\"" + connUrls + "\"],\n" +

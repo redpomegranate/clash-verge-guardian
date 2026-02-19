@@ -1,4 +1,4 @@
-# Clash Guardian Pro v1.0.6 - 多内核智能守护进程
+# Clash Guardian Pro v1.0.7 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -101,6 +101,16 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
   "memoryThreshold": 150,
   "memoryWarning": 70,
   "highDelayThreshold": 400,
+  "highDelayConnOkExtraMs": 120,
+  "highDelaySwitchConsecutiveConnOk": 4,
+  "highDelaySwitchConsecutiveConnUnknown": 3,
+  "closeWaitThresholdCore": 25,
+  "closeWaitConsecutive": 3,
+  "autoSwitchMaxPer10Min": 6,
+  "autoRestartMaxPer10Min": 3,
+  "autoRestartMinIntervalSeconds": 20,
+  "switchStormSuppressSeconds": 60,
+  "restartStormSuppressSeconds": 120,
   "blacklistMinutes": 20,
   "proxyTestTimeoutMs": 900,
   "connectivityTestUrls": ["http://www.gstatic.com/generate_204", "http://cp.cloudflare.com/generate_204", "http://www.msftconnecttest.com/connecttest.txt"],
@@ -137,6 +147,16 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 | `memoryThreshold` | 内存阈值(MB) | `150` |
 | `memoryWarning` | 内存预警阈值(MB) | `70` |
 | `highDelayThreshold` | 高延迟阈值(ms) | `400` |
+| `highDelayConnOkExtraMs` | 连接性为 Ok 时，高延迟额外阈值(ms) | `120` |
+| `highDelaySwitchConsecutiveConnOk` | 连接性为 Ok 时，高延迟连续命中触发切换次数 | `4` |
+| `highDelaySwitchConsecutiveConnUnknown` | 连接性为 Unknown 时，高延迟连续命中触发切换次数 | `3` |
+| `closeWaitThresholdCore` | core 进程级 CLOSE_WAIT 阈值 | `25` |
+| `closeWaitConsecutive` | core CLOSE_WAIT 连续命中触发次数 | `3` |
+| `autoSwitchMaxPer10Min` | 自动切换 10 分钟内上限 | `6` |
+| `autoRestartMaxPer10Min` | 自动重启 10 分钟内上限 | `3` |
+| `autoRestartMinIntervalSeconds` | 自动重启最小间隔(秒) | `20` |
+| `switchStormSuppressSeconds` | 切换风暴抑制时长(秒) | `60` |
+| `restartStormSuppressSeconds` | 重启风暴抑制时长(秒) | `120` |
 | `blacklistMinutes` | 黑名单时长(分钟) | `20` |
 | `proxyTestTimeoutMs` | 快速代理探测超时(ms) | `900` |
 | `connectivityTestUrls` | 连接性探测 URL 列表（通过本地代理访问） | gstatic/cf/msftconnecttest |
@@ -166,11 +186,18 @@ Icon based on Clash Verge, modified background by [Tao Zheng].
 | 内存极高 | > 150 MB | 无条件重启 |
 | 内存较高 + 代理无响应 | > 70 MB | 立即重启 |
 | 内存较高 + 延迟过高 | > 70 MB 且延迟 > 400ms | 快速恢复：重置内核(最多2次)→刷新测速→切节点；订阅切换需结合连接性探测（Slow/Down） |
-| 连接泄漏 + 代理无响应 | CLOSE_WAIT > 20 | 立即重启 |
+| core 连接泄漏 + 代理无响应 | core CLOSE_WAIT > 25 且连续 3 次 | 触发重启 |
 | 代理无响应 | 连续 2 次 | 切换节点（加入黑名单） |
 | 代理无响应 | 连续 4 次 | 重启程序 |
-| 延迟过高 | > 400ms 连续 2 次 | 切换节点 |
+| 延迟过高 + 连接性 Slow/Down | > 400ms 连续 2 次 | 切换节点 |
+| 延迟过高 + 连接性 Unknown | > 400ms 连续 3 次 | 切换节点 |
+| 延迟过高 + 连接性 Ok | > 520ms 连续 4 次（400+120） | 切换节点 |
 | 内存较高但代理正常 | > 70 MB 且延迟正常 | 仅记录，不重启 |
+
+自动动作风暴保护：
+- 自动切换：10 分钟最多 `autoSwitchMaxPer10Min` 次（默认 6）
+- 自动重启：10 分钟最多 `autoRestartMaxPer10Min` 次（默认 3）
+- 自动重启最小间隔：`autoRestartMinIntervalSeconds`（默认 20 秒）
 
 ## 🚀 使用方法
 
@@ -217,6 +244,10 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 
 **注意**：Watcher 只负责拉起 ClashGuardian，本身不会启动/重启 Clash 客户端。
 
+启用方式：
+- 方式 1（推荐）：点击主界面 `跟随 Clash` 按钮启用/关闭（优先使用计划任务，失败回退注册表 Run）。
+- 方式 2（手动）：按 `Win + R` 输入 `shell:startup`，创建 `ClashGuardian.exe --watch-clash` 快捷方式放入启动文件夹。
+
 命令行参数：
 - `--watch-clash`：Watcher 模式（无 UI/托盘）
 - `--follow-clash`：跟随模式（有托盘，默认不弹主窗口；Clash 退出后自动退出）
@@ -248,6 +279,7 @@ ClashGuardian\
 ├── ClashGuardian.Update.cs
 ├── ClashGuardian.Connectivity.cs
 ├── ClashGuardian.ConfigBackfill.cs
+├── ClashGuardian.TcpCoreStats.cs
 ├── assets\
 │   ├── icon-source.png
 │   └── ClashGuardian.ico
@@ -298,19 +330,6 @@ Time,ProxyOK,Delay,MemMB,Handles,TimeWait,Established,CloseWait,Node,Event
 - 系统内置节点（DIRECT、REJECT、GLOBAL）
 - 特殊分组（自动选择、故障转移、负载均衡）
 - **黑名单节点**（最近 20 分钟内失败的节点）
-
-## 📝 跟随 Clash 启动/退出
-
-启用后会在登录时启动一个轻量 Watcher（无 UI/托盘）：
-- 检测到 Clash 客户端启动：自动拉起 ClashGuardian（`--follow-clash`）
-- 检测到 Clash 全部退出：ClashGuardian 自动退出（Watcher 继续等待下一次启动）
-
-### 方式 1：程序内置（推荐）
-点击主界面 `跟随 Clash` 按钮即可启用/关闭（优先使用计划任务，失败回退注册表 Run）。
-
-### 方式 2：手动设置
-1. 按 `Win + R` 输入 `shell:startup` 打开启动文件夹
-2. 创建 `ClashGuardian.exe --watch-clash` 的快捷方式放入该文件夹
 
 ## ⚠️ 注意事项
 
@@ -406,6 +425,14 @@ flowchart TD
 - 一旦触发“强制重启客户端”，TUN/虚拟网卡会重建，Windows 网络会出现短暂断流；这通常表现为“VPN 断网体感被放大”。
 
 ## 🔄 更新日志
+
+### v1.0.7 (2026-02-19)
+- **稳定性：高延迟判据分层** - `HighDelay` 按连接性 `Ok/Unknown/Slow/Down` 区分触发门槛；`Conn=Ok` 需要更高延迟和更多连续命中，降低误切换。
+- **稳定性：CloseWait 改为 core 进程级判定** - 新增 `CoreCloseWait` 采样，且仅在 `proxyFail + 连续命中` 条件下触发 `CloseWaitLeak` 重启，减少误判重启。
+- **防风暴：统一自动动作 Gate** - 自动切换/自动重启共用 10 分钟窗口上限、最小间隔、抑制窗口和日志节流；手动操作不受该 Gate 限制。
+- **架构精简：决策/执行/配置去重** - `UpdateUI`、`RestartClash` 拆分阶段方法；配置读写统一到 `LoadIntConfigWithClamp` 与 `UpdateConfigJson`，降低耦合和重复代码。
+- **新增：Guardrail 配置项** - 增加高延迟/CloseWait/自动动作频率相关参数，并支持 `TryParse + Clamp + Backfill`，保持旧配置向后兼容。
+- **修复：窗口最小化交互** - 点击最小化回任务栏，点击关闭（X）才隐藏到托盘；托盘双击恢复与菜单退出行为保持不变。
 
 ### v1.0.6 (2026-02-11)
 - **修复：首次检测句柄竞态** - 首次检测改为句柄创建后执行，避免 “在创建窗口句柄之前调用 BeginInvoke”
