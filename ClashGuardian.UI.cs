@@ -102,22 +102,13 @@ public partial class ClashGuardian
         int col2 = padding + btnWidth + MAIN_BUTTON_HGAP;
         int col3 = padding + (btnWidth + MAIN_BUTTON_HGAP) * 2;
 
-        restartBtn = CreateButton("立即重启", padding, y, btnWidth, btnHeight, () => ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")));
+        restartBtn = CreateButton("立即重启", padding, y, btnWidth, btnHeight, () => QueueRestartAction("手动", false, "Manual"));
         pauseBtn = CreateButton("暂停检测", col2, y, btnWidth, btnHeight, ToggleDetectionPause);
         exitBtn = CreateButton("退出", col3, y, btnWidth, btnHeight, () => { trayIcon.Visible = false; Application.Exit(); });
         y += btnHeight + MAIN_BUTTON_VGAP;
 
         Button switchBtn = CreateButton("切换节点", padding, y, btnWidth, btnHeight, () => {
-            ThreadPool.QueueUserWorkItem(_ => {
-                if (SwitchToBestNode()) {
-                    this.BeginInvoke((Action)(() => {
-                        RefreshNodeDisplay();
-                        Log("手动切换成功");
-                    }));
-                } else {
-                    this.BeginInvoke((Action)(() => Log("切换失败")));
-                }
-            });
+            QueueManualSwitchAction(false);
         });
         followBtn = CreateButton(GetFollowClashButtonText(), col2, y, btnWidth, btnHeight,
             () => ThreadPool.QueueUserWorkItem(_ => ToggleFollowClashWatcher()));
@@ -141,8 +132,6 @@ public partial class ClashGuardian
         this.Controls.Add(switchBtn);
         this.Controls.Add(followBtn);
         this.Controls.Add(uuRouteBtn);
-
-        this.Resize += delegate { if (this.WindowState == FormWindowState.Minimized) this.Hide(); };
 
         ThreadPool.QueueUserWorkItem(_ => {
             try { CleanLegacyUuWatcherArtifacts(Application.ExecutablePath); } catch { /* ignore */ }
@@ -180,12 +169,41 @@ public partial class ClashGuardian
         return line;
     }
 
+    void ShowMainWindowFromTray() {
+        this.Show();
+        this.WindowState = FormWindowState.Normal;
+        this.Activate();
+    }
+
+    void ApplyManualSwitchUiResult(bool switched) {
+        if (switched) {
+            this.BeginInvoke((Action)(() => { RefreshNodeDisplay(); Log("手动切换成功"); }));
+            return;
+        }
+        this.BeginInvoke((Action)(() => Log("切换失败")));
+    }
+
+    void QueueManualSwitchAction(bool logExceptions) {
+        ThreadPool.QueueUserWorkItem(_ => {
+            if (!logExceptions) {
+                ApplyManualSwitchUiResult(SwitchToBestNode());
+                return;
+            }
+
+            try {
+                ApplyManualSwitchUiResult(SwitchToBestNode());
+            } catch (Exception ex) {
+                Log("切换异常: " + ex.Message);
+            }
+        });
+    }
+
     void InitializeTrayIcon() {
         trayIcon = new NotifyIcon();
         trayIcon.Icon = AppIcon;
         trayIcon.Text = "Clash 守护";
         trayIcon.Visible = true;
-        trayIcon.DoubleClick += delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); };
+        trayIcon.DoubleClick += delegate { ShowMainWindowFromTray(); };
 
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Opening += delegate {
@@ -208,7 +226,7 @@ public partial class ClashGuardian
             } catch { /* ignore */ }
         };
 
-        menu.Items.Add("显示窗口", null, delegate { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); });
+        menu.Items.Add("显示窗口", null, delegate { ShowMainWindowFromTray(); });
         pauseDetectionMenuItem = new ToolStripMenuItem("暂停检测");
         pauseDetectionMenuItem.Click += delegate { ToggleDetectionPause(); };
         menu.Items.Add(pauseDetectionMenuItem);
@@ -219,20 +237,8 @@ public partial class ClashGuardian
 
         menu.Items.Add(new ToolStripSeparator());
 
-        menu.Items.Add("立即重启", null, delegate { ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")); });
-        menu.Items.Add("切换节点", null, delegate {
-            ThreadPool.QueueUserWorkItem(_ => {
-                try {
-                    if (SwitchToBestNode()) {
-                        this.BeginInvoke((Action)(() => { RefreshNodeDisplay(); Log("手动切换成功"); }));
-                    } else {
-                        this.BeginInvoke((Action)(() => Log("切换失败")));
-                    }
-                } catch (Exception ex) {
-                    Log("切换异常: " + ex.Message);
-                }
-            });
-        });
+        menu.Items.Add("立即重启", null, delegate { QueueRestartAction("手动", false, "Manual"); });
+        menu.Items.Add("切换节点", null, delegate { QueueManualSwitchAction(true); });
         menu.Items.Add("触发测速", null, delegate { TriggerDelayTest(); });
 
         disabledNodesMenu = new ToolStripMenuItem("禁用名单");
@@ -651,6 +657,8 @@ public partial class ClashGuardian
     void ResumeDetectionUi() {
         _isDetectionPaused = false;
         failCount = 0;
+        highDelayCount = 0;
+        closeWaitFailCount = 0;
         consecutiveOK = 0;
         cooldownCount = 0;
         lastStableTime = DateTime.Now;

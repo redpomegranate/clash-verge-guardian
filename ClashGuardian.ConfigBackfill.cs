@@ -8,20 +8,6 @@ using System.Collections.Generic;
 /// </summary>
 public partial class ClashGuardian
 {
-    static string BuildJsonStringArrayLiteral(string[] arr)
-    {
-        if (arr == null || arr.Length == 0) return "[]";
-        StringBuilder sb = new StringBuilder();
-        sb.Append("[");
-        for (int i = 0; i < arr.Length; i++)
-        {
-            if (i > 0) sb.Append(", ");
-            sb.Append("\"").Append(EscapeJsonString(arr[i] ?? "")).Append("\"");
-        }
-        sb.Append("]");
-        return sb.ToString();
-    }
-
     static string InsertJsonFieldIfMissing(string json, string key, string rawValueLiteral)
     {
         if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return json;
@@ -58,7 +44,17 @@ public partial class ClashGuardian
                 safeDefaults["speedFactor"] = speedFactor.ToString();
                 safeDefaults["memoryWarning"] = memoryWarning.ToString();
                 safeDefaults["proxyTestTimeoutMs"] = proxyTestTimeoutMs.ToString();
-                safeDefaults["connectivityTestUrls"] = BuildJsonStringArrayLiteral(connectivityTestUrls);
+                safeDefaults["highDelayConnOkExtraMs"] = highDelayConnOkExtraMs.ToString();
+                safeDefaults["highDelaySwitchConsecutiveConnOk"] = highDelaySwitchConsecutiveConnOk.ToString();
+                safeDefaults["highDelaySwitchConsecutiveConnUnknown"] = highDelaySwitchConsecutiveConnUnknown.ToString();
+                safeDefaults["closeWaitThresholdCore"] = closeWaitThresholdCore.ToString();
+                safeDefaults["closeWaitConsecutive"] = closeWaitConsecutive.ToString();
+                safeDefaults["autoSwitchMaxPer10Min"] = autoSwitchMaxPer10Min.ToString();
+                safeDefaults["autoRestartMaxPer10Min"] = autoRestartMaxPer10Min.ToString();
+                safeDefaults["autoRestartMinIntervalSeconds"] = autoRestartMinIntervalSeconds.ToString();
+                safeDefaults["switchStormSuppressSeconds"] = switchStormSuppressSeconds.ToString();
+                safeDefaults["restartStormSuppressSeconds"] = restartStormSuppressSeconds.ToString();
+                safeDefaults["connectivityTestUrls"] = BuildJsonArrayLiteral(connectivityTestUrls);
                 safeDefaults["connectivityProbeTimeoutMs"] = connectivityProbeTimeoutMs.ToString();
                 safeDefaults["connectivityProbeMinSuccessCount"] = connectivityProbeMinSuccessCount.ToString();
                 safeDefaults["connectivitySlowThresholdMs"] = connectivitySlowThresholdMs.ToString();

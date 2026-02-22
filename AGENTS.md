@@ -9,7 +9,7 @@
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
-- **架构**：7 个 partial class 文件，按职责拆分
+- **架构**：8 个 partial class 文件，按职责拆分
 
 ## 📁 项目结构
 
@@ -22,6 +22,8 @@ ClashGuardian\
 ├── ClashGuardian.Update.cs
 ├── ClashGuardian.Connectivity.cs
 ├── ClashGuardian.ConfigBackfill.cs
+├── ClashGuardian.TcpCoreStats.cs
+├── ClashGuardian.AssemblyInfo.cs # 程序元数据（版本/产品信息）
 ├── assets\
 │   ├── icon-source.png        # icon 源图
 │   └── ClashGuardian.ico      # 编译用 win32 icon
@@ -68,15 +70,17 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 10. **重启逻辑** - 杀内核→等5秒→检查自动恢复+代理可用验证；仅当 `allowAutoStartClient=true` 才允许自动重启客户端；客户端不在时不干涉（显示“等待 Clash...”）；`restartLock` + `_isRestarting` 防并发
 11. **按钮/菜单** - 耗时操作（重启、切换、更新检查）必须通过 `ThreadPool.QueueUserWorkItem` 在后台执行，禁止阻塞 UI 线程
 12. **客户端路径** - 检测到后持久化到 config.json 的 `clientPath` 字段；搜索优先级：运行进程→config→默认路径→注册表
-13. **暂停检测** - 暂停期间停止检测循环（Timer 停止），不自动重启/切换；恢复时重置 failCount/consecutiveOK/cooldownCount 并恢复 interval
+13. **暂停检测** - 暂停期间停止检测循环（Timer 停止），不自动重启/切换；恢复时重置 `failCount/highDelayCount/closeWaitFailCount/consecutiveOK/cooldownCount` 并恢复 interval
 14. **诊断导出** - `ExportDiagnostics` 仅用户触发，脱敏 `clashSecret`，导出到 `%LOCALAPPDATA%\\ClashGuardian\\diagnostics_*`
 15. **禁用名单（disabledNodes）** - 托盘勾选后写入 config；一旦存在 `disabledNodes` 将忽略 `excludeRegions`
 16. **偏好节点（preferredNodes）** - 托盘勾选后写入 config；自动切换优先偏好节点（不可用则回退，偏好集合过小可能降低抗风险）
 17. **订阅级自动切换（Clash Verge Rev）** - 默认关闭；通过修改 `%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\profiles.yaml` 的 `current:` 并强制重启客户端生效；严禁日志输出订阅 URL/token
 18. **延迟指标区分** - `TestProxy` RTT（`lastDelay`）与节点 `histDelay/liveDelay` 必须分离；UI 只展示前者
-19. **配置补全策略** - 仅补全安全 key（如 `fastInterval/speedFactor/connectivity*`）；不要自动补 `disabledNodes`
+19. **配置补全策略** - 仅补全安全 key（如 `fastInterval/speedFactor/proxyTestTimeoutMs/connectivity*` 及 guardrail）；不要自动补 `disabledNodes`
 20. **订阅切换前置条件** - 所有自动订阅切换路径必须要求 `allowAutoStartClient=true`
 21. **文档同步强制** - 每次修改代码/参数/UI/行为后，必须同步更新 `README.md` 与 `AGENTS.md` 的对应说明，再进行编译与交付
+22. **窗口行为** - 最小化保留在任务栏；仅在 `OnFormClosing(UserClosing)` 时隐藏到托盘后台
+23. **稳态去重原则** - 可以提取私有 helper 做去重，但不得改变阈值、事件名、配置 key、CSV 列结构和自动动作触发顺序
 
 ## 🏗️ 代码模块（按文件）
 
@@ -85,15 +89,17 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 |------|------|
 | 常量 | `DEFAULT_*`、`APP_VERSION`、超时常量、阈值常量 |
 | 结构体 | `StatusDecision` — 决策结果（纯数据） |
-| 静态数组 | `DEFAULT_CORE_NAMES`、`DEFAULT_CLIENT_NAMES`、`DEFAULT_API_PORTS`、`DEFAULT_EXCLUDE_REGIONS` |
+| 静态数组 | `DEFAULT_CORE_NAMES`、`DEFAULT_CLIENT_NAMES`、`DEFAULT_API_PORTS`、`DEFAULT_EXCLUDE_REGIONS`、`DEFAULT_CONNECTIVITY_TEST_URLS` |
 | 字段 | 运行时配置、UI 组件、运行时状态、线程安全设施 |
-| 方法 | 构造函数、`DoFirstCheck`、`LoadConfigFast`、`SaveDefaultConfig`、`DetectRunningCore/Client`、`FindClientFromRegistry`、`SaveClientPath`、`AutoDiscoverApi`、`Main` |
+| 方法 | 构造函数、`DoFirstCheck`、`LoadConfigFast`、`LoadIntConfigWithClamp`、`SaveDefaultConfig`、`UpdateConfigJson`、`DetectRunningCore/Client`、`FindClientFromRegistry`、`SaveClientPath`、`AutoDiscoverApi`、`Main` |
 
 ### ClashGuardian.UI.cs
 | 方法 | 说明 |
 |------|------|
 | `InitializeUI` | 窗口布局和控件创建 |
 | `CreateButton`/`CreateInfoLabel`/`CreateSeparator` | UI 工厂方法 |
+| `ShowMainWindowFromTray` | 托盘恢复窗口统一入口 |
+| `QueueManualSwitchAction` | 手动切换节点统一入口（按钮/菜单复用） |
 | `InitializeTrayIcon` | 系统托盘菜单（含禁用名单/偏好节点/暂停检测/诊断导出/黑名单管理/检查更新） |
 | `OpenFileInNotepad` | 安全打开配置/数据/日志（try/catch，不崩溃） |
 | `ToggleDetectionPause`/`PauseDetectionUi`/`ResumeDetectionUi` | 暂停/恢复检测（停止 Timer） |
@@ -121,6 +127,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 |------|------|
 | `Log`/`LogPerf`/`LogData`/`CleanOldLogs` | 日志管理 |
 | `ExportDiagnostics` | 诊断包导出：summary+脱敏配置+日志+监控数据 |
+| `IsClientRunningSafe`/`ApplyWaitingClashUiState`/`ResetIssueCounters` | 稳态去重 helper（统一客户端在场判断、等待 Clash UI、计数重置） |
 | `GetTcpStats`/`GetMihomoStats` | 系统状态采集 |
 | `RestartClash` | 重启流程：杀内核→等5秒→检查恢复+代理验证→必要时重启客户端（默认禁止，需 `allowAutoStartClient=true`）；客户端不在时不干涉；`_isRestarting` 防并发 |
 | `StartClientProcess` | 启动客户端进程（最小化窗口） |
@@ -151,6 +158,12 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 |------|------|
 | `BackfillConfigIfMissing` | 启动时安全补全缺失 key（不引入语义变化字段） |
 
+### ClashGuardian.TcpCoreStats.cs
+| 方法 | 说明 |
+|------|------|
+| `GetTcpStatsSnapshot` | 采集全局 TCP 统计并补充 `CoreCloseWait`（决策使用） |
+| `GetCoreProcessPidSnapshot`/`TryParseNetstatTcpLine` | core PID 快照与 netstat 解析辅助 |
+
 ## 📊 决策逻辑（EvaluateStatus）
 
 | 条件 | 动作 | Event |
@@ -159,10 +172,12 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | 内存 > 150MB | 无条件重启 | `CriticalMemory` |
 | 内存 > 70MB + 代理异常 | 重启 | `HighMemoryNoProxy` |
 | 内存 > 70MB + 代理正常 + 延迟 > 400ms | 重启（快速恢复管线） | `HighMemoryHighDelay` |
-| CloseWait > 20 + 代理异常 | 重启 | `CloseWaitLeak` |
+| core CloseWait > 25 + 代理异常，连续 3 次 | 重启 | `CloseWaitLeak` |
 | 代理连续 2 次无响应 | 切换节点 | `NodeSwitch` |
 | 代理连续 4 次无响应 | 重启 | `ProxyTimeout` |
-| 延迟 > 400ms 连续 2 次 | 切换节点 | `HighDelaySwitch` |
+| 高延迟 + Conn=Slow/Down（>400ms）连续 2 次 | 切换节点 | `HighDelaySwitch` |
+| 高延迟 + Conn=Unknown（>400ms）连续 3 次 | 切换节点 | `HighDelaySwitch` |
+| 高延迟 + Conn=Ok（>520ms）连续 4 次 | 切换节点 | `HighDelaySwitch` |
 
 ## 🔒 线程安全模型
 
@@ -173,7 +188,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `lastDelay` | `Interlocked.Exchange` | 后台写，UI 读 |
 | `lastNodeDelay`/`lastNodeDelayKind` | `Interlocked + volatile` | 节点 history/live delay（仅诊断/日志） |
 | `totalIssues`/`totalChecks`/`totalRestarts`/`totalSwitches` | `Interlocked.Increment` | 后台写，UI 读 |
-| `failCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
+| `failCount`/`highDelayCount`/`closeWaitFailCount`/`consecutiveOK`/`cooldownCount` | UI 线程专用 | 仅通过 `BeginInvoke` 修改 |
 | `autoSwitchEpisodeAttempts`/`pendingSwitchVerification` | UI 线程专用 | 订阅切换 episode 计数 |
 | `nodeBlacklist` | `blacklistLock` | 多线程读写 |
 | `restartLock` | `lock` | 重启门闩原子化（避免并发重启竞态） |
@@ -183,6 +198,15 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 | `connectivity*` 快照字段 | `Interlocked` | 连接性探测结果跨线程读写 |
 
 ## 🔄 关键修复记录
+
+### v1.0.7 改进
+1. **稳定性：高延迟判据分层** - `HighDelay` 按 `ConnVerdict(Ok/Unknown/Slow/Down)` 分层，`Conn=Ok` 需更高延迟和更多连续命中后才切换，降低误切换。
+2. **稳定性：CloseWait 进程级判据** - 新增 `CoreCloseWait` 聚合采样；仅在 `proxyFail + coreCloseWait 连续超阈值` 时触发 `CloseWaitLeak` 重启。
+3. **防风暴：自动动作统一 Gate** - 自动切换/重启共享 10 分钟窗口限流、最小间隔、抑制窗口和抑制日志节流；手动操作不受自动 Gate 限制。
+4. **架构精简：核心流程拆分** - `UpdateUI` 拆为 `ApplyDecisionState/RenderUi/ScheduleAutoActions`；`RestartClash` 拆为阶段方法，提升可维护性。
+5. **配置路径去重** - `LoadConfigFast` 引入 `LoadIntConfigWithClamp`；`SaveClientPath/SaveDisabledNodes/SavePreferredNodes` 统一走 `UpdateConfigJson`。
+6. **新增 guardrail 配置** - 增加高延迟、CloseWait、自动动作频率相关 key，并在 `ConfigBackfill` 做安全补全（仅补缺失，向后兼容）。
+7. **交互修复：最小化回任务栏** - 最小化不再隐藏；关闭（X）才入托盘，托盘恢复和退出行为保持原有语义。
 
 ### v1.0.6 改进
 1. **修复：首次检测句柄竞态** - 首次检测改为句柄创建后触发，避免 “在创建窗口句柄之前调用 BeginInvoke”
@@ -270,7 +294,7 @@ Get-Process | Where-Object {$_.ProcessName -like "*ClashGuardian*"} | Stop-Proce
 
 ## v1.0.8 增量约束（新增）
 
-1. 新增 `--watch-uu-route` 无 UI watcher 模式，禁止创建额外架构文件，仍保持 5 个 partial class 主体。
+1. 新增 `--watch-uu-route` 无 UI watcher 模式，禁止创建额外架构文件，保持既有 partial class 架构（当前 8 个）。
 2. 新增主界面按钮与托盘菜单项：`UU 联动（Steam/PUBG）`，状态必须双向一致。
 3. 新增计划任务名：`ClashGuardianUURouteWatcher`，并兼容清理旧任务 `ClashGuardian.UUWatcher`。
 4. UU watcher 运行数据目录固定为 `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\`（`state.json`/`watcher.log`/`heartbeat.json`）。
