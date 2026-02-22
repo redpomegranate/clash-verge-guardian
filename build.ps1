@@ -24,4 +24,14 @@ if ($LASTEXITCODE -ne 0) {
   throw "Build failed (csc exit code: $LASTEXITCODE)"
 }
 
-Write-Host "Built: $outExe"
+$exitCode = $LASTEXITCODE
+if ($exitCode -ne 0) {
+  throw "Build failed (exit code: $exitCode). If output is locked, close running ClashGuardian.exe and retry."
+}
+
+if (-not (Test-Path $outExe)) {
+  throw "Build failed: output not found: $outExe"
+}
+
+$builtTime = (Get-Item $outExe).LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+Write-Host "Built: $outExe ($builtTime)"

@@ -5,7 +5,7 @@
 ## 📋 项目概述
 
 - **项目名称**：Clash Guardian Pro
-- **版本**：v1.0.7
+- **版本**：v1.0.8
 - **功能**：多 Clash 客户端的智能守护进程
 - **语言**：C# (.NET Framework 4.5+)
 - **平台**：Windows 10/11
@@ -78,8 +78,9 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 18. **延迟指标区分** - `TestProxy` RTT（`lastDelay`）与节点 `histDelay/liveDelay` 必须分离；UI 只展示前者
 19. **配置补全策略** - 仅补全安全 key（如 `fastInterval/speedFactor/proxyTestTimeoutMs/connectivity*` 及 guardrail）；不要自动补 `disabledNodes`
 20. **订阅切换前置条件** - 所有自动订阅切换路径必须要求 `allowAutoStartClient=true`
-21. **窗口行为** - 最小化保留在任务栏；仅在 `OnFormClosing(UserClosing)` 时隐藏到托盘后台
-22. **稳态去重原则** - 可以提取私有 helper 做去重，但不得改变阈值、事件名、配置 key、CSV 列结构和自动动作触发顺序
+21. **文档同步强制** - 每次修改代码/参数/UI/行为后，必须同步更新 `README.md` 与 `AGENTS.md` 的对应说明，再进行编译与交付
+22. **窗口行为** - 最小化保留在任务栏；仅在 `OnFormClosing(UserClosing)` 时隐藏到托盘后台
+23. **稳态去重原则** - 可以提取私有 helper 做去重，但不得改变阈值、事件名、配置 key、CSV 列结构和自动动作触发顺序
 
 ## 🏗️ 代码模块（按文件）
 
@@ -290,3 +291,13 @@ Get-Process | Where-Object {$_.ProcessName -like "*clash*" -or $_.ProcessName -l
 # 结束 ClashGuardian
 Get-Process | Where-Object {$_.ProcessName -like "*ClashGuardian*"} | Stop-Process -Force
 ```
+
+## v1.0.8 增量约束（新增）
+
+1. 新增 `--watch-uu-route` 无 UI watcher 模式，禁止创建额外架构文件，保持既有 partial class 架构（当前 8 个）。
+2. 新增主界面按钮与托盘菜单项：`UU 联动（Steam/PUBG）`，状态必须双向一致。
+3. 新增计划任务名：`ClashGuardianUURouteWatcher`，并兼容清理旧任务 `ClashGuardian.UUWatcher`。
+4. UU watcher 运行数据目录固定为 `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\`（`state.json`/`watcher.log`/`heartbeat.json`）。
+5. 关闭 UU 联动时必须执行“先放行硬隔离、再回滚路由与 ProxyOverride”的可恢复策略。
+6. 主界面按钮区保持 `2行 x 3列`，并在下方区域视觉居中（允许小幅上移调优）。
+7. 任何代码改动完成后，必须同步更新说明文档（至少 `README.md` 与 `AGENTS.md`）。
