@@ -1,4 +1,4 @@
-# Clash Guardian Pro v1.0.6 - 多内核智能守护进程
+# Clash Guardian Pro v1.0.8 - 多内核智能守护进程
 
 一个智能化的 Windows 系统托盘应用，用于自动监控和维护 Clash 系列代理客户端的稳定运行。
 
@@ -210,6 +210,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 - `测速` - 手动测试代理延迟并更新状态栏（同时触发 Clash 全节点测速）
 - `切换节点` - 手动切换到最佳节点（立即刷新统计）
 - `跟随 Clash` - 启用/关闭“跟随 Clash 启动”（登录后后台 Watcher 检测到 Clash 启动会拉起 Guardian）
+- `开启UU联动/关闭UU联动` - 启用/关闭 Steam + PUBG 的 UU 路由守护（后台 watcher 持续生效）
 
 ### 跟随 Clash 启动/退出（推荐）
 
@@ -219,13 +220,27 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32ico
 
 命令行参数：
 - `--watch-clash`：Watcher 模式（无 UI/托盘）
+- `--watch-uu-route`：UU 路由守护 Watcher 模式（无 UI/托盘）
 - `--follow-clash`：跟随模式（有托盘，默认不弹主窗口；Clash 退出后自动退出）
+
+### UU 联动（Steam/PUBG）
+
+启用后会在登录时启动 `ClashGuardianUURouteWatcher`：
+- 监测 `uu.exe` 状态并做 3 秒防抖
+- `UU ON`：将 `GAME_STEAM_ROUTE` 切到 `DIRECT`，合并 `ProxyOverride`，并在管理员模式下应用到 `127.0.0.1:7897` 的硬隔离规则
+- `UU OFF`：先放行硬隔离，再回滚路由和代理覆盖；若 API 短时失败进入 pending 并自动重试
+
+运行时状态文件目录：
+- `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\state.json`
+- `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\watcher.log`
+- `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\heartbeat.json`
 
 ### 系统托盘
 
 最小化后程序进入系统托盘，右键菜单：
 - 显示窗口
 - 暂停检测 / 恢复检测
+- UU 联动（Steam/PUBG）开 / 关
 - 立即重启
 - 切换节点
 - 触发测速
@@ -263,6 +278,7 @@ ClashGuardian\
 - `logs\\guardian.log` - 异常日志（仅异常）
 - `monitor\\monitor_YYYYMMDD.csv` - 监控数据
 - `diagnostics\\diagnostics_YYYYMMDD_HHmmss\\` - 诊断包导出目录
+- `uu-watcher\\state.json` / `uu-watcher\\watcher.log` / `uu-watcher\\heartbeat.json` - UU 路由守护状态与日志
 
 ### CSV 数据格式
 
@@ -374,6 +390,14 @@ flowchart TD
 - 一旦触发“强制重启客户端”，TUN/虚拟网卡会重建，Windows 网络会出现短暂断流；这通常表现为“VPN 断网体感被放大”。
 
 ## 🔄 更新日志
+
+### v1.0.8 (2026-02-22)
+- **新增：内建 UU 联动守护** - 合并原外置脚本能力到 `ClashGuardian.exe`，支持 `--watch-uu-route` 无 UI 后台模式
+- **新增：主界面/托盘开关** - 新增 `开启UU联动/关闭UU联动` 与托盘 `UU 联动（Steam/PUBG）` 开关
+- **优化：主界面按钮布局** - 按钮维持 `2x3` 栅格并整体上移，位于下方区域居中，减少留白并提升规整度
+- **新增：开机任务** - 使用 `ClashGuardianUURouteWatcher` 任务在登录后后台运行，并兼容清理旧任务 `ClashGuardian.UUWatcher`
+- **新增：状态机回退机制** - `NORMAL/ENTERING_UU/UU_ACTIVE/EXITING_UU/DEGRADED_EXIT_PENDING` 与退避重试回滚
+- **清理：移除外置 UU 脚本入口** - 功能并入主程序，统一由内建 watcher 管理
 
 ### v1.0.6 (2026-02-11)
 - **修复：首次检测句柄竞态** - 首次检测改为句柄创建后执行，避免 “在创建窗口句柄之前调用 BeginInvoke”

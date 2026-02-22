@@ -7,6 +7,8 @@ using System.IO;
 using System.Threading;
 using System.Collections.Generic;
 using System.Text;
+using System.Security.Principal;
+using System.Security.Cryptography;
 using Microsoft.Win32;
 
 /// <summary>
@@ -68,7 +70,7 @@ public partial class ClashGuardian : Form
     private const int SUB_PROBE_RESULT_MAX_AGE_SECONDS = 60;           // 探测结果有效期（过期则视为未知）
 
     // 自动更新配置
-    private const string APP_VERSION = "1.0.6";
+    private const string APP_VERSION = "1.0.8";
     private const string GITHUB_REPO = "redpomegranate/clash-verge-guardian";
     private const string UPDATE_API = "https://api.github.com/repos/{0}/releases/latest";
 
@@ -174,7 +176,7 @@ public partial class ClashGuardian : Form
     // ==================== UI 组件 ====================
     private NotifyIcon trayIcon;
     private Label statusLabel, memLabel, proxyLabel, logLabel, checkLabel, stableLabel;
-    private Button restartBtn, exitBtn, pauseBtn, followBtn;
+    private Button restartBtn, exitBtn, pauseBtn, followBtn, uuRouteBtn;
     private System.Windows.Forms.Timer timer;
 
     // ==================== 运行时状态 ====================
@@ -1261,17 +1263,23 @@ public partial class ClashGuardian : Form
         }
 
         bool watch = false;
+        bool watchUuRoute = false;
         bool follow = false;
         if (args != null) {
             for (int i = 0; i < args.Length; i++) {
                 string a = args[i];
                 if (a == "--watch-clash") watch = true;
+                else if (a == "--watch-uu-route") watchUuRoute = true;
                 else if (a == "--follow-clash") follow = true;
             }
         }
 
         if (watch) {
             RunClashWatcherLoop();
+            return;
+        }
+        if (watchUuRoute) {
+            RunUuRouteWatcherLoop();
             return;
         }
 
@@ -1487,6 +1495,1247 @@ public partial class ClashGuardian : Form
                 try {
                     if (stopEvent != null && stopEvent.WaitOne(500)) break;
                 } catch { Thread.Sleep(500); }
+            }
+        }
+    }
+
+    // ==================== Watcher: UU route guard (no UI) ====================
+
+    const string UU_WATCHER_MUTEX_NAME = "Global\\ClashGuardian_UU_Watcher";
+    const string UU_WATCHER_STOP_EVENT_NAME = "ClashGuardianUuWatcherStopEvent";
+    const string UU_WATCHER_ROOT_RELATIVE = "uu-watcher";
+    const string UU_WATCHER_STATE_FILE_NAME = "state.json";
+    const string UU_WATCHER_LOG_FILE_NAME = "watcher.log";
+    const string UU_WATCHER_HEARTBEAT_FILE_NAME = "heartbeat.json";
+    const string UU_WATCHER_POLICY_TAG = "2026-02-22-builtin-v1";
+    const string UU_WATCHER_FIREWALL_RULE_GROUP = "ClashGuardian.UUWatcher";
+    const string UU_WATCHER_FIREWALL_RULE_PREFIX = "ClashGuardian.UUWatcher.Block7897";
+    const string UU_WATCHER_ROUTE_GROUP = "GAME_STEAM_ROUTE";
+    const string UU_WATCHER_DEFAULT_API = "http://127.0.0.1:9097";
+    const string UU_WATCHER_DEFAULT_SECRET = "set-your-secret";
+    const string UU_WATCHER_LOCAL_PROXY_ADDRESS = "127.0.0.1";
+    const int UU_WATCHER_LOCAL_PROXY_PORT = 7897;
+    const int UU_WATCHER_POLL_SECONDS = 2;
+    const int UU_WATCHER_DEBOUNCE_SECONDS = 3;
+    const int UU_WATCHER_POLICY_INTERVAL_SECONDS = 10;
+    const int UU_WATCHER_LEAK_DRAIN_MIN_INTERVAL_SECONDS = 10;
+    const int UU_WATCHER_LEAK_DRAIN_MAX_PER_ROUND = 5;
+    const int UU_WATCHER_MIN_SWITCH_INTERVAL_SECONDS = 15;
+    const int UU_WATCHER_FLAP_WINDOW_SECONDS = 60;
+    const int UU_WATCHER_FLAP_SWITCH_THRESHOLD = 4;
+    const int UU_WATCHER_QUARANTINE_SECONDS = 30;
+    const int UU_WATCHER_WAKE_GAP_SECONDS = 20;
+    const int UU_WATCHER_API_FAIL_ALERT_THRESHOLD = 10;
+    const int UU_WATCHER_PENDING_ALERT_SECONDS = 300;
+    const int UU_WATCHER_HEARTBEAT_INTERVAL_SECONDS = 5;
+    const int UU_WATCHER_HEARTBEAT_STALE_SECONDS = 20;
+
+    static readonly int[] UU_WATCHER_RETRY_DELAYS_SECONDS = new int[] { 2, 5, 10, 20, 30 };
+
+    static readonly string[] UU_WATCHER_TARGET_PROCESS_NAMES = new string[] {
+        "steam.exe", "steamwebhelper.exe", "tslgame.exe"
+    };
+    static readonly string[] UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES = new string[] {
+        "tslgame.exe"
+    };
+    static readonly string[] UU_WATCHER_BYPASS_ENTRIES = new string[] {
+        "*.steampowered.com", "steampowered.com",
+        "*.steamcommunity.com", "steamcommunity.com",
+        "*.steamgames.com", "steamgames.com",
+        "*.steamusercontent.com", "steamusercontent.com",
+        "*.steamcontent.com", "steamcontent.com",
+        "*.steamstatic.com", "steamstatic.com",
+        "*.steamserver.net", "steamserver.net",
+        "*.valve.net", "valve.net",
+        "*.valvesoftware.com", "valvesoftware.com",
+        "*.steamcdn-a.akamaihd.net", "steamcdn-a.akamaihd.net",
+        "*.api.steampowered.com", "api.steampowered.com",
+        "*.cm.steampowered.com", "cm.steampowered.com",
+        "*.playbattlegrounds.com", "playbattlegrounds.com",
+        "*.pubg.com", "pubg.com",
+        "*.krafton.com", "krafton.com",
+        "*.kraftonde.com", "kraftonde.com",
+        "*.battleye.com", "battleye.com",
+        "*.easyanticheat.net", "easyanticheat.net",
+        "*.globalsign.com", "globalsign.com"
+    };
+
+    class UuWatcherFirewallRuleDef {
+        public string DisplayName = "";
+        public string Direction = "Outbound";
+        public string Action = "Block";
+        public string Enabled = "True";
+        public string Profile = "Any";
+        public string Program = "";
+        public string Protocol = "";
+        public string LocalPort = "";
+        public string RemotePort = "";
+        public string LocalAddress = "";
+        public string RemoteAddress = "";
+    }
+
+    class UuWatcherSnapshot {
+        public string Route = "";
+        public string ProxyOverride = "";
+        public int ProxyEnable = 0;
+        public List<UuWatcherFirewallRuleDef> FwRules = new List<UuWatcherFirewallRuleDef>();
+    }
+
+    class UuWatcherState {
+        public string Mode = "NORMAL";
+        public string DesiredMode = "NORMAL";
+        public UuWatcherSnapshot Snapshot = new UuWatcherSnapshot();
+        public bool RollbackPending = false;
+        public string RollbackPendingSince = "";
+        public int RetryCount = 0;
+        public string NextRetryAt = "";
+        public string SwitchId = "";
+        public bool HardIsolationUnavailable = false;
+        public int FlapCounter = 0;
+        public List<string> SwitchWindow = new List<string>();
+        public string LastSwitchAt = "";
+        public string QuarantineUntil = "";
+    }
+
+    class UuWatcherLeakConn {
+        public string Id = "";
+        public string Process = "";
+        public string Host = "";
+        public string Rule = "";
+        public string RulePayload = "";
+        public string Chains = "";
+    }
+
+    class UuWatcherContext {
+        public string RootDir = "";
+        public string StateFile = "";
+        public string LogFile = "";
+        public string HeartbeatFile = "";
+        public string ApiBase = UU_WATCHER_DEFAULT_API;
+        public string ApiSecret = UU_WATCHER_DEFAULT_SECRET;
+        public bool IsAdmin = false;
+        public string InstanceId = "";
+        public int ApiFailConsec = 0;
+        public int LastApiAlertCount = 0;
+        public DateTime LastPolicyEnforceAt = DateTime.MinValue;
+        public DateTime LastLeakDrainAt = DateTime.MinValue;
+        public DateTime LastPendingAlertAt = DateTime.MinValue;
+        public DateTime LastMinSwitchWarnAt = DateTime.MinValue;
+        public DateTime LastQuarantineSkipWarnAt = DateTime.MinValue;
+        public DateTime LastHeartbeatAt = DateTime.MinValue;
+        public string LastFirewallSignature = "";
+        public bool QuarantineActive = false;
+        public EventWaitHandle StopEvent = null;
+    }
+
+    static UuWatcherState NewDefaultUuWatcherState() {
+        return new UuWatcherState();
+    }
+
+    static string UuWatcherRootDir() {
+        string local = "";
+        try { local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); } catch { local = ""; }
+        if (string.IsNullOrEmpty(local)) {
+            try { local = AppDomain.CurrentDomain.BaseDirectory; } catch { local = "."; }
+        }
+        return Path.Combine(local, "ClashGuardian", UU_WATCHER_ROOT_RELATIVE);
+    }
+
+    static string GetJsonStringValueStatic(string json, string key, string defaultValue) {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return defaultValue;
+        string search = "\"" + key + "\":";
+        int idx = json.IndexOf(search, StringComparison.Ordinal);
+        if (idx < 0) return defaultValue;
+        idx += search.Length;
+        while (idx < json.Length && char.IsWhiteSpace(json[idx])) idx++;
+        if (idx >= json.Length) return defaultValue;
+        if (json[idx] == '"') {
+            int next;
+            return ReadJsonStringAtStatic(json, idx, out next);
+        }
+        int end = idx;
+        while (end < json.Length) {
+            char c = json[end];
+            if (c == ',' || c == '}' || c == ']' || c == '\r' || c == '\n') break;
+            end++;
+        }
+        string raw = json.Substring(idx, end - idx).Trim();
+        if (string.IsNullOrEmpty(raw)) return defaultValue;
+        return raw;
+    }
+
+    static bool GetJsonBoolValueStatic(string json, string key, bool defaultValue) {
+        string v = GetJsonStringValueStatic(json, key, defaultValue ? "true" : "false");
+        bool parsed;
+        if (bool.TryParse(v, out parsed)) return parsed;
+        return defaultValue;
+    }
+
+    static int GetJsonIntValueStatic(string json, string key, int defaultValue) {
+        string v = GetJsonStringValueStatic(json, key, defaultValue.ToString());
+        int parsed;
+        if (int.TryParse(v, out parsed)) return parsed;
+        return defaultValue;
+    }
+
+    static bool JsonHasKeyStatic(string json, string key) {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return false;
+        return json.IndexOf("\"" + key + "\"", StringComparison.Ordinal) >= 0;
+    }
+
+    static string ReadJsonStringAtStatic(string json, int quoteIndex, out int nextIndex) {
+        nextIndex = quoteIndex;
+        if (string.IsNullOrEmpty(json) || quoteIndex < 0 || quoteIndex >= json.Length || json[quoteIndex] != '"') return "";
+        StringBuilder sb = new StringBuilder();
+        int i = quoteIndex + 1;
+        while (i < json.Length) {
+            char c = json[i];
+            if (c == '"') {
+                nextIndex = i + 1;
+                return sb.ToString();
+            }
+            if (c == '\\' && i + 1 < json.Length) {
+                char n = json[i + 1];
+                if (n == '"' || n == '\\' || n == '/') { sb.Append(n); i += 2; continue; }
+                if (n == 'n') { sb.Append('\n'); i += 2; continue; }
+                if (n == 'r') { sb.Append('\r'); i += 2; continue; }
+                if (n == 't') { sb.Append('\t'); i += 2; continue; }
+                if (n == 'b') { sb.Append('\b'); i += 2; continue; }
+                if (n == 'f') { sb.Append('\f'); i += 2; continue; }
+                if (n == 'u' && i + 5 < json.Length) {
+                    try {
+                        string hex = json.Substring(i + 2, 4);
+                        int code = int.Parse(hex, System.Globalization.NumberStyles.HexNumber);
+                        sb.Append((char)code);
+                        i += 6;
+                        continue;
+                    } catch { }
+                }
+            }
+            sb.Append(c);
+            i++;
+        }
+        nextIndex = i;
+        return sb.ToString();
+    }
+
+    static bool FindJsonObjectBoundsStatic(string json, string key, out int objStart, out int objEnd) {
+        objStart = 0; objEnd = 0;
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return false;
+        string search = "\"" + key + "\":";
+        int idx = json.IndexOf(search, StringComparison.Ordinal);
+        if (idx < 0) return false;
+        idx += search.Length;
+        while (idx < json.Length && char.IsWhiteSpace(json[idx])) idx++;
+        if (idx >= json.Length || json[idx] != '{') return false;
+        objStart = idx;
+        int depth = 1;
+        bool inString = false;
+        bool escape = false;
+        int i = idx + 1;
+        while (i < json.Length) {
+            char c = json[i];
+            if (inString) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') inString = false;
+            } else {
+                if (c == '"') inString = true;
+                else if (c == '{') depth++;
+                else if (c == '}') depth--;
+                if (depth == 0) {
+                    objEnd = i + 1;
+                    return true;
+                }
+            }
+            i++;
+        }
+        return false;
+    }
+
+    static DateTime ParseUuWatcherTime(string value) {
+        if (string.IsNullOrEmpty(value)) return DateTime.MinValue;
+        DateTime dt;
+        if (DateTime.TryParse(value, out dt)) return dt;
+        return DateTime.MinValue;
+    }
+
+    static void WriteUuWatcherLog(UuWatcherContext ctx, string msg) {
+        try {
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + msg;
+            File.AppendAllText(ctx.LogFile, line + Environment.NewLine, Encoding.UTF8);
+        } catch { /* ignore */ }
+    }
+
+    static string NewUuWatcherSwitchId() {
+        return DateTime.Now.ToString("yyyyMMddHHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+    }
+
+    static List<string> ExtractTopLevelJsonObjectsFromArrayByKeyStatic(string json, string key) {
+        List<string> result = new List<string>();
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return result;
+        int keyIdx = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+        if (keyIdx < 0) return result;
+        int arrStart = json.IndexOf('[', keyIdx);
+        if (arrStart < 0) return result;
+        bool inString = false;
+        bool escape = false;
+        int depthObj = 0;
+        int objStart = -1;
+        for (int i = arrStart + 1; i < json.Length; i++) {
+            char c = json[i];
+            if (inString) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '{') {
+                if (depthObj == 0) objStart = i;
+                depthObj++;
+                continue;
+            }
+            if (c == '}') {
+                if (depthObj > 0) {
+                    depthObj--;
+                    if (depthObj == 0 && objStart >= 0) {
+                        result.Add(json.Substring(objStart, i - objStart + 1));
+                        objStart = -1;
+                    }
+                }
+                continue;
+            }
+            if (c == ']' && depthObj == 0) break;
+        }
+        return result;
+    }
+
+    static UuWatcherState NormalizeUuWatcherState(string raw) {
+        UuWatcherState s = NewDefaultUuWatcherState();
+        if (string.IsNullOrEmpty(raw)) return s;
+
+        // Backward compatibility with old schema.
+        if (JsonHasKeyStatic(raw, "isUuMode")) {
+            bool oldUu = GetJsonBoolValueStatic(raw, "isUuMode", false);
+            if (oldUu) {
+                s.Mode = "UU_ACTIVE";
+                s.DesiredMode = "UU_ACTIVE";
+            }
+            s.SwitchId = GetJsonStringValueStatic(raw, "lastSwitch", "");
+            s.Snapshot.Route = GetJsonStringValueStatic(raw, "routeBeforeUu", "");
+            s.Snapshot.ProxyOverride = GetJsonStringValueStatic(raw, "proxyOverrideBeforeUu", "");
+            return s;
+        }
+
+        string mode = GetJsonStringValueStatic(raw, "mode", "NORMAL");
+        if (mode == "NORMAL" || mode == "ENTERING_UU" || mode == "UU_ACTIVE" || mode == "EXITING_UU" || mode == "DEGRADED_EXIT_PENDING") s.Mode = mode;
+        string desired = GetJsonStringValueStatic(raw, "desiredMode", "NORMAL");
+        if (desired == "NORMAL" || desired == "UU_ACTIVE") s.DesiredMode = desired;
+        s.RollbackPending = GetJsonBoolValueStatic(raw, "rollbackPending", false);
+        s.RollbackPendingSince = GetJsonStringValueStatic(raw, "rollbackPendingSince", "");
+        s.RetryCount = GetJsonIntValueStatic(raw, "retryCount", 0);
+        s.NextRetryAt = GetJsonStringValueStatic(raw, "nextRetryAt", "");
+        s.SwitchId = GetJsonStringValueStatic(raw, "switchId", "");
+        s.HardIsolationUnavailable = GetJsonBoolValueStatic(raw, "hardIsolationUnavailable", false);
+        s.FlapCounter = GetJsonIntValueStatic(raw, "flapCounter", 0);
+        s.LastSwitchAt = GetJsonStringValueStatic(raw, "lastSwitchAt", "");
+        s.QuarantineUntil = GetJsonStringValueStatic(raw, "quarantineUntil", "");
+
+        List<string> switchWindow = ParseJsonStringArrayStatic(raw, "switchWindow");
+        if (switchWindow != null && switchWindow.Count > 0) s.SwitchWindow = switchWindow;
+
+        int snapshotStart, snapshotEnd;
+        if (FindJsonObjectBoundsStatic(raw, "snapshot", out snapshotStart, out snapshotEnd)) {
+            string snap = raw.Substring(snapshotStart, snapshotEnd - snapshotStart);
+            s.Snapshot.Route = GetJsonStringValueStatic(snap, "route", "");
+            s.Snapshot.ProxyOverride = GetJsonStringValueStatic(snap, "proxyOverride", "");
+            s.Snapshot.ProxyEnable = GetJsonIntValueStatic(snap, "proxyEnable", 0);
+
+            List<string> fwObjs = ExtractTopLevelJsonObjectsFromArrayByKeyStatic(snap, "fwRules");
+            for (int i = 0; i < fwObjs.Count; i++) {
+                string obj = fwObjs[i];
+                UuWatcherFirewallRuleDef def = new UuWatcherFirewallRuleDef();
+                def.DisplayName = GetJsonStringValueStatic(obj, "displayName", "");
+                def.Direction = GetJsonStringValueStatic(obj, "direction", "Outbound");
+                def.Action = GetJsonStringValueStatic(obj, "action", "Block");
+                def.Enabled = GetJsonStringValueStatic(obj, "enabled", "True");
+                def.Profile = GetJsonStringValueStatic(obj, "profile", "Any");
+                def.Program = GetJsonStringValueStatic(obj, "program", "");
+                def.Protocol = GetJsonStringValueStatic(obj, "protocol", "");
+                def.LocalPort = GetJsonStringValueStatic(obj, "localPort", "");
+                def.RemotePort = GetJsonStringValueStatic(obj, "remotePort", "");
+                def.LocalAddress = GetJsonStringValueStatic(obj, "localAddress", "");
+                def.RemoteAddress = GetJsonStringValueStatic(obj, "remoteAddress", "");
+                if (!string.IsNullOrEmpty(def.DisplayName)) s.Snapshot.FwRules.Add(def);
+            }
+        }
+
+        return s;
+    }
+
+    static string BuildUuWatcherStateJson(UuWatcherState s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\n");
+        sb.Append("  \"mode\": \"").Append(EscapeJsonString(s.Mode)).Append("\",\n");
+        sb.Append("  \"desiredMode\": \"").Append(EscapeJsonString(s.DesiredMode)).Append("\",\n");
+        sb.Append("  \"rollbackPending\": ").Append(s.RollbackPending ? "true" : "false").Append(",\n");
+        sb.Append("  \"rollbackPendingSince\": \"").Append(EscapeJsonString(s.RollbackPendingSince)).Append("\",\n");
+        sb.Append("  \"retryCount\": ").Append(s.RetryCount).Append(",\n");
+        sb.Append("  \"nextRetryAt\": \"").Append(EscapeJsonString(s.NextRetryAt)).Append("\",\n");
+        sb.Append("  \"switchId\": \"").Append(EscapeJsonString(s.SwitchId)).Append("\",\n");
+        sb.Append("  \"hardIsolationUnavailable\": ").Append(s.HardIsolationUnavailable ? "true" : "false").Append(",\n");
+        sb.Append("  \"flapCounter\": ").Append(s.FlapCounter).Append(",\n");
+        sb.Append("  \"switchWindow\": [");
+        for (int i = 0; i < s.SwitchWindow.Count; i++) {
+            if (i > 0) sb.Append(", ");
+            sb.Append("\"").Append(EscapeJsonString(s.SwitchWindow[i])).Append("\"");
+        }
+        sb.Append("],\n");
+        sb.Append("  \"lastSwitchAt\": \"").Append(EscapeJsonString(s.LastSwitchAt)).Append("\",\n");
+        sb.Append("  \"quarantineUntil\": \"").Append(EscapeJsonString(s.QuarantineUntil)).Append("\",\n");
+        sb.Append("  \"snapshot\": {\n");
+        sb.Append("    \"route\": \"").Append(EscapeJsonString(s.Snapshot.Route)).Append("\",\n");
+        sb.Append("    \"proxyOverride\": \"").Append(EscapeJsonString(s.Snapshot.ProxyOverride)).Append("\",\n");
+        sb.Append("    \"proxyEnable\": ").Append(s.Snapshot.ProxyEnable).Append(",\n");
+        sb.Append("    \"fwRules\": [");
+        for (int i = 0; i < s.Snapshot.FwRules.Count; i++) {
+            UuWatcherFirewallRuleDef d = s.Snapshot.FwRules[i];
+            if (i > 0) sb.Append(", ");
+            sb.Append("{");
+            sb.Append("\"displayName\":\"").Append(EscapeJsonString(d.DisplayName)).Append("\",");
+            sb.Append("\"direction\":\"").Append(EscapeJsonString(d.Direction)).Append("\",");
+            sb.Append("\"action\":\"").Append(EscapeJsonString(d.Action)).Append("\",");
+            sb.Append("\"enabled\":\"").Append(EscapeJsonString(d.Enabled)).Append("\",");
+            sb.Append("\"profile\":\"").Append(EscapeJsonString(d.Profile)).Append("\",");
+            sb.Append("\"program\":\"").Append(EscapeJsonString(d.Program)).Append("\",");
+            sb.Append("\"protocol\":\"").Append(EscapeJsonString(d.Protocol)).Append("\",");
+            sb.Append("\"localPort\":\"").Append(EscapeJsonString(d.LocalPort)).Append("\",");
+            sb.Append("\"remotePort\":\"").Append(EscapeJsonString(d.RemotePort)).Append("\",");
+            sb.Append("\"localAddress\":\"").Append(EscapeJsonString(d.LocalAddress)).Append("\",");
+            sb.Append("\"remoteAddress\":\"").Append(EscapeJsonString(d.RemoteAddress)).Append("\"");
+            sb.Append("}");
+        }
+        sb.Append("]\n");
+        sb.Append("  }\n");
+        sb.Append("}\n");
+        return sb.ToString();
+    }
+
+    static UuWatcherState LoadUuWatcherState(UuWatcherContext ctx) {
+        try {
+            if (!File.Exists(ctx.StateFile)) return NewDefaultUuWatcherState();
+            string raw = File.ReadAllText(ctx.StateFile, Encoding.UTF8);
+            if (string.IsNullOrEmpty(raw)) return NewDefaultUuWatcherState();
+            return NormalizeUuWatcherState(raw);
+        } catch (Exception ex) {
+            WriteUuWatcherLog(ctx, "[WARN] state read failed: " + ex.Message);
+            return NewDefaultUuWatcherState();
+        }
+    }
+
+    static void SaveUuWatcherState(UuWatcherContext ctx, UuWatcherState s) {
+        try {
+            File.WriteAllText(ctx.StateFile, BuildUuWatcherStateJson(s), Encoding.UTF8);
+        } catch (Exception ex) {
+            WriteUuWatcherLog(ctx, "[WARN] state write failed: " + ex.Message);
+        }
+    }
+
+    static string[] LoadWatcherApiConfig() {
+        string api = UU_WATCHER_DEFAULT_API;
+        string secret = UU_WATCHER_DEFAULT_SECRET;
+        try {
+            string cfg = GetWatcherConfigFilePath();
+            if (!string.IsNullOrEmpty(cfg) && File.Exists(cfg)) {
+                string json = File.ReadAllText(cfg, Encoding.UTF8);
+                string apiCfg = GetJsonStringValueStatic(json, "clashApi", api);
+                if (!string.IsNullOrEmpty(apiCfg)) api = apiCfg.Trim().TrimEnd('/');
+                string secCfg = GetJsonStringValueStatic(json, "clashSecret", secret);
+                if (!string.IsNullOrEmpty(secCfg)) secret = secCfg.Trim();
+            }
+        } catch { /* ignore */ }
+        return new string[] { api, secret };
+    }
+
+    static void EnsureUuWatcherHeartbeat(UuWatcherContext ctx) {
+        DateTime now = DateTime.Now;
+        if ((now - ctx.LastHeartbeatAt).TotalSeconds < UU_WATCHER_HEARTBEAT_INTERVAL_SECONDS) return;
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\n");
+            sb.Append("  \"instanceId\": \"").Append(EscapeJsonString(ctx.InstanceId)).Append("\",\n");
+            sb.Append("  \"lastSeen\": \"").Append(now.ToString("o")).Append("\",\n");
+            sb.Append("  \"pid\": ").Append(Process.GetCurrentProcess().Id).Append("\n");
+            sb.Append("}\n");
+            File.WriteAllText(ctx.HeartbeatFile, sb.ToString(), Encoding.UTF8);
+            ctx.LastHeartbeatAt = now;
+        } catch (Exception ex) {
+            WriteUuWatcherLog(ctx, "[WARN] heartbeat write failed: " + ex.Message);
+        }
+    }
+
+    static void InitUuWatcherHeartbeat(UuWatcherContext ctx) {
+        try {
+            if (File.Exists(ctx.HeartbeatFile)) {
+                string prevRaw = File.ReadAllText(ctx.HeartbeatFile, Encoding.UTF8);
+                if (!string.IsNullOrEmpty(prevRaw)) {
+                    string prevId = GetJsonStringValueStatic(prevRaw, "instanceId", "");
+                    DateTime last = ParseUuWatcherTime(GetJsonStringValueStatic(prevRaw, "lastSeen", ""));
+                    if (last != DateTime.MinValue) {
+                        TimeSpan age = DateTime.Now - last;
+                        if (age.TotalSeconds > UU_WATCHER_HEARTBEAT_STALE_SECONDS) {
+                            WriteUuWatcherLog(ctx, "[WARN] stale heartbeat detected, taking over previousInstance=" + prevId + ", ageSec=" + ((int)age.TotalSeconds).ToString());
+                        }
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            WriteUuWatcherLog(ctx, "[WARN] heartbeat init failed: " + ex.Message);
+        }
+        EnsureUuWatcherHeartbeat(ctx);
+    }
+
+    static bool RunProcessHiddenStatic(string fileName, string args, int timeoutMs, out int exitCode) {
+        exitCode = -1;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo(fileName, args);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process p = Process.Start(psi)) {
+                try { p.WaitForExit(timeoutMs); } catch { }
+                try { if (!p.HasExited) p.Kill(); } catch { }
+                if (!p.HasExited) return false;
+                exitCode = p.ExitCode;
+                return true;
+            }
+        } catch { return false; }
+    }
+
+    static bool InvokeMihomoRequest(UuWatcherContext ctx, string method, string path, string body, out string responseText, out string errorText) {
+        responseText = "";
+        errorText = "";
+        try {
+            HttpWebRequest req = WebRequest.Create(ctx.ApiBase + path) as HttpWebRequest;
+            req.Method = method;
+            req.Timeout = 5000;
+            req.ReadWriteTimeout = 5000;
+            req.Headers.Add("Authorization", "Bearer " + ctx.ApiSecret);
+            try { if (req.RequestUri != null && req.RequestUri.IsLoopback) req.Proxy = null; } catch { }
+            if (!string.IsNullOrEmpty(body)) {
+                byte[] bytes = Encoding.UTF8.GetBytes(body);
+                req.ContentType = "application/json; charset=utf-8";
+                req.ContentLength = bytes.Length;
+                using (Stream stream = req.GetRequestStream()) {
+                    stream.Write(bytes, 0, bytes.Length);
+                }
+            }
+            using (HttpWebResponse resp = req.GetResponse() as HttpWebResponse) {
+                using (Stream rs = resp.GetResponseStream()) {
+                    if (rs != null) {
+                        using (StreamReader sr = new StreamReader(rs, Encoding.UTF8)) {
+                            responseText = sr.ReadToEnd();
+                        }
+                    }
+                }
+            }
+            ctx.ApiFailConsec = 0;
+            return true;
+        } catch (Exception ex) {
+            ctx.ApiFailConsec++;
+            errorText = ex.Message;
+            WriteUuWatcherLog(ctx, "[WARN] api failed method=" + method + " path=" + path + " consec=" + ctx.ApiFailConsec + " error=" + errorText);
+            if (ctx.ApiFailConsec > UU_WATCHER_API_FAIL_ALERT_THRESHOLD && ctx.ApiFailConsec != ctx.LastApiAlertCount) {
+                WriteUuWatcherLog(ctx, "[ALERT] API_FAIL_CONSEC=" + ctx.ApiFailConsec);
+                ctx.LastApiAlertCount = ctx.ApiFailConsec;
+            }
+            return false;
+        }
+    }
+
+    static string UuGetRouteNow(UuWatcherContext ctx) {
+        string resp, err;
+        string groupEscaped = Uri.EscapeDataString(UU_WATCHER_ROUTE_GROUP);
+        if (!InvokeMihomoRequest(ctx, "GET", "/proxies/" + groupEscaped, null, out resp, out err)) return "";
+        return GetJsonStringValueStatic(resp, "now", "");
+    }
+
+    static bool UuSetRouteNow(UuWatcherContext ctx, string name) {
+        if (string.IsNullOrEmpty(name)) return false;
+        string resp, err;
+        string groupEscaped = Uri.EscapeDataString(UU_WATCHER_ROUTE_GROUP);
+        string body = "{\"name\":\"" + EscapeJsonString(name) + "\"}";
+        bool ok = InvokeMihomoRequest(ctx, "PUT", "/proxies/" + groupEscaped, body, out resp, out err);
+        if (ok) WriteUuWatcherLog(ctx, "[INFO] route set " + UU_WATCHER_ROUTE_GROUP + " -> " + name);
+        return ok;
+    }
+
+    static bool TestUuRunningStatic() {
+        try {
+            Process[] procs = Process.GetProcessesByName("uu");
+            bool running = procs != null && procs.Length > 0;
+            if (procs != null) foreach (var p in procs) p.Dispose();
+            return running;
+        } catch { return false; }
+    }
+
+    static void GetProxySettingsStatic(out int proxyEnable, out string proxyServer, out string proxyOverride) {
+        proxyEnable = 0; proxyServer = ""; proxyOverride = "";
+        try {
+            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", false)) {
+                if (rk == null) return;
+                object en = rk.GetValue("ProxyEnable");
+                object sv = rk.GetValue("ProxyServer");
+                object ov = rk.GetValue("ProxyOverride");
+                if (en != null) {
+                    try { proxyEnable = Convert.ToInt32(en); } catch { proxyEnable = 0; }
+                }
+                if (sv != null) proxyServer = sv.ToString();
+                if (ov != null) proxyOverride = ov.ToString();
+            }
+        } catch { /* ignore */ }
+    }
+
+    static bool SetProxyOverrideStatic(string value) {
+        try {
+            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true)) {
+                if (rk == null) return false;
+                rk.SetValue("ProxyOverride", value ?? "");
+                return true;
+            }
+        } catch { return false; }
+    }
+
+    static bool SetProxyEnableStatic(int value) {
+        try {
+            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true)) {
+                if (rk == null) return false;
+                rk.SetValue("ProxyEnable", value);
+                return true;
+            }
+        } catch { return false; }
+    }
+
+    static bool IsInvalidProxyOverrideTokenStatic(string item) {
+        if (string.IsNullOrEmpty(item)) return true;
+        string k = item.Trim().ToLowerInvariant();
+        if (k == "[string]" || k == "[string[]]" || k == "[object]" || k == "[object[]]" || k == "system.string[]" || k == "system.object[]") return true;
+        if (k.StartsWith("[") && k.EndsWith("]")) return true;
+        return false;
+    }
+
+    static string MergeProxyOverrideStatic(string baseValue, string[] appendEntries) {
+        HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        List<string> result = new List<string>();
+        if (!string.IsNullOrEmpty(baseValue)) {
+            string[] arr = baseValue.Split(';');
+            for (int i = 0; i < arr.Length; i++) {
+                string item = arr[i] == null ? "" : arr[i].Trim();
+                if (string.IsNullOrEmpty(item)) continue;
+                if (IsInvalidProxyOverrideTokenStatic(item)) continue;
+                if (seen.Add(item)) result.Add(item);
+            }
+        }
+        if (appendEntries != null) {
+            for (int i = 0; i < appendEntries.Length; i++) {
+                string item = appendEntries[i] == null ? "" : appendEntries[i].Trim();
+                if (string.IsNullOrEmpty(item)) continue;
+                if (IsInvalidProxyOverrideTokenStatic(item)) continue;
+                if (seen.Add(item)) result.Add(item);
+            }
+        }
+        return string.Join(";", result.ToArray());
+    }
+
+    static string GetShortHashStatic(string text) {
+        if (text == null) text = "";
+        using (MD5 md5 = MD5.Create()) {
+            byte[] input = Encoding.UTF8.GetBytes(text);
+            byte[] hash = md5.ComputeHash(input);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < hash.Length; i++) sb.Append(hash[i].ToString("x2"));
+            string full = sb.ToString();
+            if (full.Length > 8) return full.Substring(0, 8);
+            return full;
+        }
+    }
+
+    static List<string> GetRunningTargetProgramPathsStatic() {
+        Dictionary<string, string> set = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < UU_WATCHER_TARGET_PROCESS_NAMES.Length; i++) {
+            string procName = UU_WATCHER_TARGET_PROCESS_NAMES[i];
+            string baseName = procName;
+            if (baseName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) baseName = baseName.Substring(0, baseName.Length - 4);
+            try {
+                Process[] procs = Process.GetProcessesByName(baseName);
+                foreach (Process p in procs) {
+                    try {
+                        string path = "";
+                        try { path = p.MainModule.FileName; } catch { path = ""; }
+                        if (!string.IsNullOrEmpty(path) && !set.ContainsKey(path)) set[path] = path;
+                    } finally { p.Dispose(); }
+                }
+            } catch { /* ignore */ }
+        }
+        List<string> result = new List<string>();
+        foreach (var kv in set) result.Add(kv.Value);
+        return result;
+    }
+
+    static List<UuWatcherFirewallRuleDef> BuildDynamicIsolationRuleDefinitionsStatic() {
+        List<UuWatcherFirewallRuleDef> defs = new List<UuWatcherFirewallRuleDef>();
+        List<string> paths = GetRunningTargetProgramPathsStatic();
+        for (int p = 0; p < paths.Count; p++) {
+            string path = paths[p];
+            string file = "";
+            try { file = Path.GetFileName(path).ToLowerInvariant(); } catch { file = "target.exe"; }
+            string hash = GetShortHashStatic(path);
+            for (int i = 0; i < 2; i++) {
+                string protocol = i == 0 ? "TCP" : "UDP";
+                UuWatcherFirewallRuleDef d = new UuWatcherFirewallRuleDef();
+                d.DisplayName = UU_WATCHER_FIREWALL_RULE_PREFIX + "." + file + "." + protocol + "." + hash;
+                d.Direction = "Outbound";
+                d.Action = "Block";
+                d.Enabled = "True";
+                d.Profile = "Any";
+                d.Program = path;
+                d.Protocol = protocol;
+                d.RemotePort = UU_WATCHER_LOCAL_PROXY_PORT.ToString();
+                d.RemoteAddress = UU_WATCHER_LOCAL_PROXY_ADDRESS;
+                defs.Add(d);
+            }
+        }
+        return defs;
+    }
+
+    static string BuildFirewallSignatureStatic(List<UuWatcherFirewallRuleDef> defs) {
+        if (defs == null || defs.Count == 0) return "";
+        List<string> parts = new List<string>();
+        for (int i = 0; i < defs.Count; i++) {
+            UuWatcherFirewallRuleDef d = defs[i];
+            parts.Add((d.Program ?? "") + "|" + (d.Protocol ?? "") + "|" + (d.RemoteAddress ?? "") + "|" + (d.RemotePort ?? ""));
+        }
+        parts.Sort(StringComparer.OrdinalIgnoreCase);
+        return string.Join(";", parts.ToArray());
+    }
+
+    static bool DeleteWatcherFirewallRuleGroupStatic() {
+        int code;
+        bool launched = RunProcessHiddenStatic("netsh.exe", "advfirewall firewall delete rule name=all group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"", 10000, out code);
+        if (!launched) return false;
+        return code == 0 || code == 1;
+    }
+
+    static bool AddFirewallRuleStatic(UuWatcherFirewallRuleDef def) {
+        if (def == null || string.IsNullOrEmpty(def.DisplayName) || string.IsNullOrEmpty(def.Program) || string.IsNullOrEmpty(def.Protocol)) return false;
+        string args = "advfirewall firewall add rule " +
+                      "name=\"" + def.DisplayName + "\" " +
+                      "dir=out action=block " +
+                      "enable=yes profile=any " +
+                      "program=\"" + def.Program + "\" " +
+                      "protocol=" + def.Protocol + " " +
+                      "remoteip=" + UU_WATCHER_LOCAL_PROXY_ADDRESS + " " +
+                      "remoteport=" + UU_WATCHER_LOCAL_PROXY_PORT + " " +
+                      "group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"";
+        int code;
+        bool launched = RunProcessHiddenStatic("netsh.exe", args, 10000, out code);
+        if (!launched) return false;
+        return code == 0;
+    }
+
+    static bool ResetWatcherFirewallRulesStatic(List<UuWatcherFirewallRuleDef> defs) {
+        if (!DeleteWatcherFirewallRuleGroupStatic()) return false;
+        if (defs == null || defs.Count == 0) return true;
+        for (int i = 0; i < defs.Count; i++) {
+            if (!AddFirewallRuleStatic(defs[i])) return false;
+        }
+        return true;
+    }
+
+    static bool ApplyHardIsolationRulesStatic(UuWatcherContext ctx, UuWatcherState state) {
+        if (!ctx.IsAdmin) {
+            if (!state.HardIsolationUnavailable) {
+                state.HardIsolationUnavailable = true;
+                SaveUuWatcherState(ctx, state);
+            }
+            WriteUuWatcherLog(ctx, "[WARN] hard isolation unavailable: not running as administrator");
+            return false;
+        }
+        List<UuWatcherFirewallRuleDef> defs = BuildDynamicIsolationRuleDefinitionsStatic();
+        bool ok = ResetWatcherFirewallRulesStatic(defs);
+        if (ok) WriteUuWatcherLog(ctx, "[INFO] hard isolation applied rules=" + defs.Count);
+        else WriteUuWatcherLog(ctx, "[WARN] hard isolation apply failed");
+        ctx.LastFirewallSignature = BuildFirewallSignatureStatic(defs);
+        return ok;
+    }
+
+    static void EnsureHardIsolationRulesForRunningTargetsStatic(UuWatcherContext ctx, UuWatcherState state) {
+        if (!ctx.IsAdmin) {
+            if (!state.HardIsolationUnavailable) {
+                state.HardIsolationUnavailable = true;
+                SaveUuWatcherState(ctx, state);
+            }
+            return;
+        }
+        List<UuWatcherFirewallRuleDef> defs = BuildDynamicIsolationRuleDefinitionsStatic();
+        if (defs.Count == 0) return;
+        string signature = BuildFirewallSignatureStatic(defs);
+        if (signature == ctx.LastFirewallSignature) return;
+        bool ok = ResetWatcherFirewallRulesStatic(defs);
+        if (ok) {
+            ctx.LastFirewallSignature = signature;
+            WriteUuWatcherLog(ctx, "[INFO] hard isolation incrementally refreshed rules=" + defs.Count);
+        }
+    }
+
+    static List<UuWatcherLeakConn> GetMihomoProxyLeakConnectionsStatic(UuWatcherContext ctx, string[] processNames) {
+        List<UuWatcherLeakConn> hits = new List<UuWatcherLeakConn>();
+        Dictionary<string, bool> targets = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        if (processNames != null) {
+            for (int i = 0; i < processNames.Length; i++) {
+                string p = processNames[i];
+                if (!string.IsNullOrEmpty(p) && !targets.ContainsKey(p)) targets[p] = true;
+            }
+        }
+
+        string resp, err;
+        if (!InvokeMihomoRequest(ctx, "GET", "/connections", null, out resp, out err)) return hits;
+        List<string> objs = ExtractTopLevelJsonObjectsFromArrayByKeyStatic(resp, "connections");
+        for (int i = 0; i < objs.Count; i++) {
+            string obj = objs[i];
+            string proc = GetJsonStringValueStatic(obj, "process", "");
+            if (string.IsNullOrEmpty(proc)) continue;
+            if (!targets.ContainsKey(proc)) continue;
+            List<string> chains = ParseJsonStringArrayStatic(obj, "chains");
+            bool hasProxy = false;
+            if (chains != null) {
+                for (int c = 0; c < chains.Count; c++) {
+                    string part = chains[c];
+                    if (!string.IsNullOrEmpty(part) && part.IndexOf("proxy", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        hasProxy = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasProxy) continue;
+            UuWatcherLeakConn hit = new UuWatcherLeakConn();
+            hit.Id = GetJsonStringValueStatic(obj, "id", "");
+            hit.Process = proc;
+            hit.Host = GetJsonStringValueStatic(obj, "host", "");
+            hit.Rule = GetJsonStringValueStatic(obj, "rule", "");
+            hit.RulePayload = GetJsonStringValueStatic(obj, "rulePayload", "");
+            hit.Chains = chains == null ? "" : string.Join(" > ", chains.ToArray());
+            hits.Add(hit);
+        }
+        return hits;
+    }
+
+    static void DrainMihomoProxyLeakConnectionsStatic(UuWatcherContext ctx, string[] processNames, bool force) {
+        DateTime now = DateTime.Now;
+        if (!force && (now - ctx.LastLeakDrainAt).TotalSeconds < UU_WATCHER_LEAK_DRAIN_MIN_INTERVAL_SECONDS) return;
+        List<UuWatcherLeakConn> leaks = GetMihomoProxyLeakConnectionsStatic(ctx, processNames);
+        if (leaks.Count == 0) {
+            ctx.LastLeakDrainAt = now;
+            return;
+        }
+        int closeCount = 0;
+        for (int i = 0; i < leaks.Count && i < UU_WATCHER_LEAK_DRAIN_MAX_PER_ROUND; i++) {
+            string id = leaks[i].Id;
+            if (string.IsNullOrEmpty(id)) continue;
+            string resp, err;
+            bool ok = InvokeMihomoRequest(ctx, "DELETE", "/connections/" + id, null, out resp, out err);
+            if (ok) closeCount++;
+        }
+        ctx.LastLeakDrainAt = now;
+        if (closeCount > 0) {
+            WriteUuWatcherLog(ctx, "[WARN] drained proxy leak connections closed=" + closeCount + " total=" + leaks.Count + " limit=" + UU_WATCHER_LEAK_DRAIN_MAX_PER_ROUND + " scope=tslgame.exe");
+        }
+    }
+
+    static int GetRetryDelaySecondsStatic(int retryCount) {
+        if (retryCount < 0) retryCount = 0;
+        if (retryCount >= UU_WATCHER_RETRY_DELAYS_SECONDS.Length) return UU_WATCHER_RETRY_DELAYS_SECONDS[UU_WATCHER_RETRY_DELAYS_SECONDS.Length - 1];
+        return UU_WATCHER_RETRY_DELAYS_SECONDS[retryCount];
+    }
+
+    static bool UpdateQuarantineStateStatic(UuWatcherContext ctx, UuWatcherState state) {
+        DateTime now = DateTime.Now;
+        DateTime until = ParseUuWatcherTime(state.QuarantineUntil);
+        if (until > now) {
+            ctx.QuarantineActive = true;
+            return true;
+        }
+        if (ctx.QuarantineActive) WriteUuWatcherLog(ctx, "[INFO] QUARANTINE_EXIT");
+        ctx.QuarantineActive = false;
+        if (!string.IsNullOrEmpty(state.QuarantineUntil)) {
+            state.QuarantineUntil = "";
+            SaveUuWatcherState(ctx, state);
+        }
+        return false;
+    }
+
+    static void RegisterSwitchEventStatic(UuWatcherContext ctx, UuWatcherState state, DateTime now, string switchId) {
+        List<string> window = new List<string>();
+        if (state.SwitchWindow != null) {
+            for (int i = 0; i < state.SwitchWindow.Count; i++) {
+                DateTime t = ParseUuWatcherTime(state.SwitchWindow[i]);
+                if (t == DateTime.MinValue) continue;
+                if ((now - t).TotalSeconds <= UU_WATCHER_FLAP_WINDOW_SECONDS) window.Add(t.ToString("o"));
+            }
+        }
+        window.Add(now.ToString("o"));
+        state.SwitchWindow = window;
+        state.FlapCounter = window.Count;
+        state.LastSwitchAt = now.ToString("o");
+        if (window.Count > UU_WATCHER_FLAP_SWITCH_THRESHOLD) {
+            DateTime until = now.AddSeconds(UU_WATCHER_QUARANTINE_SECONDS);
+            state.QuarantineUntil = until.ToString("o");
+            ctx.QuarantineActive = true;
+            WriteUuWatcherLog(ctx, "[WARN] QUARANTINE_ENTER switchId=" + switchId + " switchesIn60s=" + window.Count + " until=" + until.ToString("o"));
+            WriteUuWatcherLog(ctx, "[ALERT] switchesIn60s=" + window.Count + " threshold=" + UU_WATCHER_FLAP_SWITCH_THRESHOLD);
+        }
+    }
+
+    static bool CanPerformSwitchStatic(UuWatcherContext ctx, UuWatcherState state, bool ignoreInterval) {
+        DateTime now = DateTime.Now;
+        if (UpdateQuarantineStateStatic(ctx, state)) {
+            if ((now - ctx.LastQuarantineSkipWarnAt).TotalSeconds >= 5) {
+                WriteUuWatcherLog(ctx, "[WARN] switch skipped due to quarantine");
+                ctx.LastQuarantineSkipWarnAt = now;
+            }
+            return false;
+        }
+        if (!ignoreInterval) {
+            DateTime last = ParseUuWatcherTime(state.LastSwitchAt);
+            if (last != DateTime.MinValue && (now - last).TotalSeconds < UU_WATCHER_MIN_SWITCH_INTERVAL_SECONDS) {
+                if ((now - ctx.LastMinSwitchWarnAt).TotalSeconds >= 5) {
+                    WriteUuWatcherLog(ctx, "[WARN] switch skipped due to minSwitchInterval=" + UU_WATCHER_MIN_SWITCH_INTERVAL_SECONDS + "s");
+                    ctx.LastMinSwitchWarnAt = now;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void EnsureEnterSnapshotStatic(UuWatcherContext ctx, UuWatcherState state) {
+        bool hasSnapshot = false;
+        if (!string.IsNullOrEmpty(state.Snapshot.Route) || !string.IsNullOrEmpty(state.Snapshot.ProxyOverride)) hasSnapshot = true;
+        if (state.Snapshot.FwRules != null && state.Snapshot.FwRules.Count > 0) hasSnapshot = true;
+        if (hasSnapshot) return;
+
+        string routeBefore = UuGetRouteNow(ctx);
+        int proxyEnable; string proxyServer; string proxyOverride;
+        GetProxySettingsStatic(out proxyEnable, out proxyServer, out proxyOverride);
+        state.Snapshot.Route = routeBefore;
+        state.Snapshot.ProxyOverride = MergeProxyOverrideStatic(proxyOverride, new string[0]);
+        state.Snapshot.ProxyEnable = proxyEnable;
+        state.Snapshot.FwRules = new List<UuWatcherFirewallRuleDef>();
+        SaveUuWatcherState(ctx, state);
+        WriteUuWatcherLog(ctx, "[INFO] snapshot captured route=" + routeBefore + " proxyEnable=" + proxyEnable + " fwRules=0");
+    }
+
+    static void EnterUuModeStatic(UuWatcherContext ctx, UuWatcherState state, bool ignoreSwitchInterval) {
+        if (!CanPerformSwitchStatic(ctx, state, ignoreSwitchInterval)) return;
+        DateTime now = DateTime.Now;
+        string switchId = NewUuWatcherSwitchId();
+        RegisterSwitchEventStatic(ctx, state, now, switchId);
+        state.Mode = "ENTERING_UU";
+        state.DesiredMode = "UU_ACTIVE";
+        state.SwitchId = switchId;
+        SaveUuWatcherState(ctx, state);
+        WriteUuWatcherLog(ctx, "[INFO] ENTER_BEGIN switchId=" + switchId);
+
+        EnsureEnterSnapshotStatic(ctx, state);
+        bool routeOk = UuSetRouteNow(ctx, "DIRECT");
+        int proxyEnable; string proxyServer; string proxyOverride;
+        GetProxySettingsStatic(out proxyEnable, out proxyServer, out proxyOverride);
+        string merged = MergeProxyOverrideStatic(proxyOverride, UU_WATCHER_BYPASS_ENTRIES);
+        bool overrideOk = SetProxyOverrideStatic(merged);
+        bool hardOk = ApplyHardIsolationRulesStatic(ctx, state);
+
+        state.Mode = "UU_ACTIVE";
+        state.DesiredMode = "UU_ACTIVE";
+        state.RollbackPending = false;
+        state.RollbackPendingSince = "";
+        state.RetryCount = 0;
+        state.NextRetryAt = "";
+        SaveUuWatcherState(ctx, state);
+        WriteUuWatcherLog(ctx, "[INFO] ENTER_DONE switchId=" + switchId + " routeOk=" + routeOk + " overrideOk=" + overrideOk + " hardIsolationOk=" + hardOk);
+    }
+
+    static bool TryCompleteExitRollbackStatic(UuWatcherContext ctx, UuWatcherState state, string source) {
+        string routeTarget = state.Snapshot.Route;
+        if (string.IsNullOrEmpty(routeTarget)) {
+            routeTarget = "Proxy";
+            WriteUuWatcherLog(ctx, "[WARN] snapshot.route missing, fallback route target=Proxy");
+        }
+        string overrideTarget = state.Snapshot.ProxyOverride ?? "";
+        int proxyEnableTarget = state.Snapshot.ProxyEnable;
+        List<UuWatcherFirewallRuleDef> fwRules = state.Snapshot.FwRules ?? new List<UuWatcherFirewallRuleDef>();
+
+        bool routeOk = UuSetRouteNow(ctx, routeTarget);
+        bool overrideOk = SetProxyOverrideStatic(overrideTarget);
+        bool proxyEnableOk = SetProxyEnableStatic(proxyEnableTarget);
+        bool fwRestoreOk = true;
+        if (ctx.IsAdmin) {
+            fwRestoreOk = ResetWatcherFirewallRulesStatic(fwRules);
+        } else {
+            state.HardIsolationUnavailable = true;
+            SaveUuWatcherState(ctx, state);
+        }
+
+        if (routeOk && overrideOk && proxyEnableOk && fwRestoreOk) {
+            if (source == "retry") WriteUuWatcherLog(ctx, "[INFO] EXIT_RETRY_SUCCESS switchId=" + state.SwitchId);
+            state.Mode = "NORMAL";
+            state.DesiredMode = "NORMAL";
+            state.RollbackPending = false;
+            state.RollbackPendingSince = "";
+            state.RetryCount = 0;
+            state.NextRetryAt = "";
+            state.Snapshot = new UuWatcherSnapshot();
+            SaveUuWatcherState(ctx, state);
+            WriteUuWatcherLog(ctx, "[INFO] EXIT_DONE switchId=" + state.SwitchId + " route=" + routeTarget);
+            return true;
+        }
+
+        DateTime now = DateTime.Now;
+        int delay = GetRetryDelaySecondsStatic(state.RetryCount);
+        DateTime next = now.AddSeconds(delay);
+        state.Mode = "DEGRADED_EXIT_PENDING";
+        state.DesiredMode = "NORMAL";
+        state.RollbackPending = true;
+        if (string.IsNullOrEmpty(state.RollbackPendingSince)) state.RollbackPendingSince = now.ToString("o");
+        state.RetryCount = state.RetryCount + 1;
+        state.NextRetryAt = next.ToString("o");
+        SaveUuWatcherState(ctx, state);
+        WriteUuWatcherLog(ctx, "[WARN] EXIT_RETRY_PENDING switchId=" + state.SwitchId + " source=" + source + " retryCount=" + state.RetryCount + " nextRetryAt=" + state.NextRetryAt + " routeOk=" + routeOk + " overrideOk=" + overrideOk + " proxyEnableOk=" + proxyEnableOk + " fwRestoreOk=" + fwRestoreOk);
+        return false;
+    }
+
+    static void ExitUuModeStatic(UuWatcherContext ctx, UuWatcherState state, bool ignoreSwitchInterval) {
+        if (!CanPerformSwitchStatic(ctx, state, ignoreSwitchInterval)) return;
+        DateTime now = DateTime.Now;
+        string switchId = NewUuWatcherSwitchId();
+        RegisterSwitchEventStatic(ctx, state, now, switchId);
+        state.Mode = "EXITING_UU";
+        state.DesiredMode = "NORMAL";
+        state.SwitchId = switchId;
+        SaveUuWatcherState(ctx, state);
+        WriteUuWatcherLog(ctx, "[INFO] EXIT_BEGIN switchId=" + switchId);
+
+        bool phase1Ok = true;
+        if (ctx.IsAdmin) {
+            phase1Ok = ResetWatcherFirewallRulesStatic(new List<UuWatcherFirewallRuleDef>());
+        } else {
+            state.HardIsolationUnavailable = true;
+            SaveUuWatcherState(ctx, state);
+            phase1Ok = false;
+        }
+        WriteUuWatcherLog(ctx, "[INFO] EXIT_PHASE1_DONE switchId=" + switchId + " hardIsolationRemoved=" + phase1Ok);
+        TryCompleteExitRollbackStatic(ctx, state, "exit");
+    }
+
+    static void HandlePendingRollbackStatic(UuWatcherContext ctx, UuWatcherState state, bool force) {
+        if (!state.RollbackPending) return;
+        if (state.DesiredMode == "UU_ACTIVE") return;
+        DateTime next = ParseUuWatcherTime(state.NextRetryAt);
+        if (!force && next != DateTime.MinValue && next > DateTime.Now) return;
+        TryCompleteExitRollbackStatic(ctx, state, "retry");
+    }
+
+    static void EnforceUuPolicyStatic(UuWatcherContext ctx, UuWatcherState state, bool force) {
+        DateTime now = DateTime.Now;
+        if (!force && (now - ctx.LastPolicyEnforceAt).TotalSeconds < UU_WATCHER_POLICY_INTERVAL_SECONDS) return;
+        ctx.LastPolicyEnforceAt = now;
+
+        string routeNow = UuGetRouteNow(ctx);
+        if (!string.IsNullOrEmpty(routeNow) && !string.Equals(routeNow, "DIRECT", StringComparison.OrdinalIgnoreCase)) {
+            WriteUuWatcherLog(ctx, "[WARN] policy correction route " + routeNow + " -> DIRECT");
+            UuSetRouteNow(ctx, "DIRECT");
+        }
+
+        int proxyEnable; string proxyServer; string proxyOverride;
+        GetProxySettingsStatic(out proxyEnable, out proxyServer, out proxyOverride);
+        string merged = MergeProxyOverrideStatic(proxyOverride, UU_WATCHER_BYPASS_ENTRIES);
+        if (!string.Equals(merged, proxyOverride, StringComparison.Ordinal)) {
+            WriteUuWatcherLog(ctx, "[INFO] policy correction proxy override");
+            SetProxyOverrideStatic(merged);
+        }
+
+        EnsureHardIsolationRulesForRunningTargetsStatic(ctx, state);
+        DrainMihomoProxyLeakConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES, false);
+    }
+
+    static void EmitUuHealthAlertsStatic(UuWatcherContext ctx, UuWatcherState state) {
+        if (state.Mode == "DEGRADED_EXIT_PENDING" && state.RollbackPending) {
+            DateTime since = ParseUuWatcherTime(state.RollbackPendingSince);
+            if (since != DateTime.MinValue) {
+                TimeSpan elapsed = DateTime.Now - since;
+                if (elapsed.TotalSeconds > UU_WATCHER_PENDING_ALERT_SECONDS) {
+                    if (ctx.LastPendingAlertAt == DateTime.MinValue || (DateTime.Now - ctx.LastPendingAlertAt).TotalSeconds >= 60) {
+                        WriteUuWatcherLog(ctx, "[ALERT] DEGRADED_EXIT_PENDING durationSec=" + ((int)elapsed.TotalSeconds).ToString());
+                        ctx.LastPendingAlertAt = DateTime.Now;
+                    }
+                }
+            }
+        }
+    }
+
+    static void InvokeUuReconcileStatic(UuWatcherContext ctx, UuWatcherState state, bool uuRunning, string reason, bool ignoreSwitchInterval) {
+        WriteUuWatcherLog(ctx, "[INFO] RECONCILE_BEGIN reason=" + reason + " mode=" + state.Mode + " desired=" + state.DesiredMode + " uuRunning=" + uuRunning);
+        string desired = uuRunning ? "UU_ACTIVE" : "NORMAL";
+        if (state.DesiredMode != desired) {
+            state.DesiredMode = desired;
+            SaveUuWatcherState(ctx, state);
+        }
+
+        if (uuRunning) {
+            if (state.Mode == "DEGRADED_EXIT_PENDING") {
+                state.Mode = "UU_ACTIVE";
+                state.RollbackPending = false;
+                state.RollbackPendingSince = "";
+                state.RetryCount = 0;
+                state.NextRetryAt = "";
+                SaveUuWatcherState(ctx, state);
+                WriteUuWatcherLog(ctx, "[INFO] reconcile cancelled pending rollback because UU is ON");
+            }
+            if (state.Mode != "UU_ACTIVE") {
+                EnterUuModeStatic(ctx, state, ignoreSwitchInterval);
+            } else {
+                EnforceUuPolicyStatic(ctx, state, true);
+            }
+        } else {
+            if (state.Mode == "UU_ACTIVE" || state.Mode == "ENTERING_UU") {
+                ExitUuModeStatic(ctx, state, ignoreSwitchInterval);
+            } else if (state.Mode == "DEGRADED_EXIT_PENDING" && state.RollbackPending) {
+                HandlePendingRollbackStatic(ctx, state, true);
+            } else {
+                if (ctx.IsAdmin) {
+                    ResetWatcherFirewallRulesStatic(new List<UuWatcherFirewallRuleDef>());
+                }
+            }
+        }
+        WriteUuWatcherLog(ctx, "[INFO] RECONCILE_DONE reason=" + reason + " mode=" + state.Mode + " desired=" + state.DesiredMode);
+    }
+
+    static void RunUuRouteWatcherLoop() {
+        bool createdNew;
+        using (Mutex mutex = new Mutex(true, UU_WATCHER_MUTEX_NAME, out createdNew)) {
+            if (!createdNew) return;
+
+            UuWatcherContext ctx = new UuWatcherContext();
+            ctx.RootDir = UuWatcherRootDir();
+            try { Directory.CreateDirectory(ctx.RootDir); } catch { }
+            ctx.StateFile = Path.Combine(ctx.RootDir, UU_WATCHER_STATE_FILE_NAME);
+            ctx.LogFile = Path.Combine(ctx.RootDir, UU_WATCHER_LOG_FILE_NAME);
+            ctx.HeartbeatFile = Path.Combine(ctx.RootDir, UU_WATCHER_HEARTBEAT_FILE_NAME);
+            string[] apiCfg = LoadWatcherApiConfig();
+            ctx.ApiBase = apiCfg[0];
+            ctx.ApiSecret = apiCfg[1];
+            ctx.IsAdmin = false;
+            try {
+                WindowsIdentity wi = WindowsIdentity.GetCurrent();
+                WindowsPrincipal wp = new WindowsPrincipal(wi);
+                ctx.IsAdmin = wp.IsInRole(WindowsBuiltInRole.Administrator);
+            } catch { ctx.IsAdmin = false; }
+            ctx.InstanceId = Guid.NewGuid().ToString("N");
+            try {
+                ctx.StopEvent = new EventWaitHandle(false, EventResetMode.ManualReset, UU_WATCHER_STOP_EVENT_NAME);
+                ctx.StopEvent.Reset();
+            } catch { ctx.StopEvent = null; }
+
+            WriteUuWatcherLog(ctx, "[INFO] watcher starting instanceId=" + ctx.InstanceId + " admin=" + ctx.IsAdmin);
+            WriteUuWatcherLog(ctx, "[INFO] policy version=" + UU_WATCHER_POLICY_TAG);
+
+            UuWatcherState state = LoadUuWatcherState(ctx);
+            if (!ctx.IsAdmin && !state.HardIsolationUnavailable) {
+                state.HardIsolationUnavailable = true;
+                SaveUuWatcherState(ctx, state);
+            }
+
+            InitUuWatcherHeartbeat(ctx);
+            bool uuRaw = TestUuRunningStatic();
+            DateTime uuRawChangedAt = DateTime.Now;
+            bool uuStable = uuRaw;
+            InvokeUuReconcileStatic(ctx, state, uuStable, "startup", true);
+
+            DateTime lastLoopAt = DateTime.Now;
+            while (true) {
+                try {
+                    EnsureUuWatcherHeartbeat(ctx);
+
+                    DateTime now = DateTime.Now;
+                    if ((now - lastLoopAt).TotalSeconds >= UU_WATCHER_WAKE_GAP_SECONDS) {
+                        WriteUuWatcherLog(ctx, "[INFO] wake detected gapSec=" + ((int)(now - lastLoopAt).TotalSeconds).ToString());
+                        InvokeUuReconcileStatic(ctx, state, uuStable, "wake", true);
+                    }
+                    lastLoopAt = now;
+
+                    bool currentRaw = TestUuRunningStatic();
+                    if (currentRaw != uuRaw) {
+                        uuRaw = currentRaw;
+                        uuRawChangedAt = DateTime.Now;
+                        WriteUuWatcherLog(ctx, "[INFO] uu raw status changed running=" + uuRaw);
+                    }
+                    if (uuStable != uuRaw) {
+                        if ((DateTime.Now - uuRawChangedAt).TotalSeconds >= UU_WATCHER_DEBOUNCE_SECONDS) {
+                            uuStable = uuRaw;
+                            WriteUuWatcherLog(ctx, "[INFO] uu stable status changed running=" + uuStable);
+                        }
+                    }
+
+                    string desired = uuStable ? "UU_ACTIVE" : "NORMAL";
+                    if (state.DesiredMode != desired) {
+                        state.DesiredMode = desired;
+                        SaveUuWatcherState(ctx, state);
+                    }
+
+                    bool inQuarantine = UpdateQuarantineStateStatic(ctx, state);
+                    if (inQuarantine) {
+                        EmitUuHealthAlertsStatic(ctx, state);
+                    } else {
+                        if (state.DesiredMode == "UU_ACTIVE") {
+                            if (state.Mode == "NORMAL" || state.Mode == "EXITING_UU") {
+                                EnterUuModeStatic(ctx, state, false);
+                            } else if (state.Mode == "DEGRADED_EXIT_PENDING") {
+                                state.Mode = "UU_ACTIVE";
+                                state.RollbackPending = false;
+                                state.RollbackPendingSince = "";
+                                state.RetryCount = 0;
+                                state.NextRetryAt = "";
+                                SaveUuWatcherState(ctx, state);
+                                WriteUuWatcherLog(ctx, "[INFO] switched from DEGRADED_EXIT_PENDING back to UU_ACTIVE because UU is ON");
+                                EnforceUuPolicyStatic(ctx, state, true);
+                            } else {
+                                EnforceUuPolicyStatic(ctx, state, false);
+                            }
+                        } else {
+                            if (state.Mode == "UU_ACTIVE" || state.Mode == "ENTERING_UU") {
+                                ExitUuModeStatic(ctx, state, false);
+                            } else if (state.Mode == "DEGRADED_EXIT_PENDING" && state.RollbackPending) {
+                                HandlePendingRollbackStatic(ctx, state, false);
+                            } else if (state.Mode == "EXITING_UU") {
+                                HandlePendingRollbackStatic(ctx, state, true);
+                            }
+                        }
+                        EmitUuHealthAlertsStatic(ctx, state);
+                    }
+                } catch (Exception ex) {
+                    WriteUuWatcherLog(ctx, "[ERROR] loop exception: " + ex.Message);
+                }
+
+                try {
+                    if (ctx.StopEvent != null) {
+                        if (ctx.StopEvent.WaitOne(UU_WATCHER_POLL_SECONDS * 1000)) break;
+                    } else {
+                        Thread.Sleep(UU_WATCHER_POLL_SECONDS * 1000);
+                    }
+                } catch {
+                    Thread.Sleep(UU_WATCHER_POLL_SECONDS * 1000);
+                }
             }
         }
     }

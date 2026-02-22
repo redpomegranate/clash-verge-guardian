@@ -16,6 +16,7 @@ public partial class ClashGuardian
     ToolStripMenuItem disabledNodesMenu;
     ToolStripMenuItem preferredNodesMenu;
     ToolStripMenuItem pauseDetectionMenuItem;
+    ToolStripMenuItem uuRouteMenuItem;
 
     ToolStripDropDown disabledNodesDropDown;
     ToolStripDropDown preferredNodesDropDown;
@@ -26,6 +27,15 @@ public partial class ClashGuardian
 
     const int POPUP_WIDTH = 340;
     const int POPUP_HEIGHT = 360;
+    const int MAIN_PADDING = 16;
+    const int MAIN_CONTENT_WIDTH = 360;
+    const int MAIN_INFO_HEIGHT = 22;
+    const int MAIN_INFO_GAP = 4;
+    const int MAIN_BUTTON_HEIGHT = 34;
+    const int MAIN_BUTTON_HGAP = 9;
+    const int MAIN_BUTTON_VGAP = 10;
+    const int MAIN_BUTTON_SHIFT_UP = 6;
+    const int MAIN_BOTTOM_PADDING = 20;
     DateTime lastDisabledNodesMenuRefresh = DateTime.MinValue;
 
     Icon AppIcon {
@@ -40,7 +50,7 @@ public partial class ClashGuardian
 
     void InitializeUI() {
         this.Text = "Clash Guardian Pro v" + APP_VERSION;
-        this.Size = new Size(400, 340);
+        this.ClientSize = new Size(MAIN_PADDING * 2 + MAIN_CONTENT_WIDTH, 320);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedSingle;
         this.MaximizeBox = false;
@@ -48,68 +58,56 @@ public partial class ClashGuardian
         this.Font = new Font("Microsoft YaHei UI", 9);
         this.BackColor = COLOR_FORM_BG;
 
-        int padding = 16;
-        int labelHeight = 22;
+        int padding = MAIN_PADDING;
+        int contentWidth = MAIN_CONTENT_WIDTH;
         int y = padding;
 
         statusLabel = new Label();
         statusLabel.Text = "● 状态: 加速启动中，请稍等...";
         statusLabel.Location = new Point(padding, y);
-        statusLabel.Size = new Size(360, 28);
+        statusLabel.Size = new Size(contentWidth, 30);
         statusLabel.Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold);
         statusLabel.ForeColor = COLOR_WARNING;
-        y += 36;
+        y += statusLabel.Height + 8;
 
         Label line1 = CreateSeparator(padding, y);
-        y += 12;
+        y += 14;
 
         memLabel = CreateInfoLabel("内  存:  --", padding, y, COLOR_TEXT);
-        y += labelHeight + 4;
+        y += MAIN_INFO_HEIGHT + MAIN_INFO_GAP;
 
         proxyLabel = CreateInfoLabel("代  理:  --", padding, y, COLOR_TEXT);
-        y += labelHeight + 4;
+        y += MAIN_INFO_HEIGHT + MAIN_INFO_GAP;
 
         checkLabel = CreateInfoLabel("统  计:  --", padding, y, COLOR_GRAY);
-        y += labelHeight + 4;
+        y += MAIN_INFO_HEIGHT + MAIN_INFO_GAP;
 
         stableLabel = CreateInfoLabel("稳定性:  --", padding, y, COLOR_CYAN);
-        y += labelHeight + 8;
+        y += MAIN_INFO_HEIGHT + 8;
 
         Label line2 = CreateSeparator(padding, y);
-        y += 10;
+        y += 12;
 
         logLabel = new Label();
         logLabel.Text = "最近事件:  无";
         logLabel.Location = new Point(padding, y);
-        logLabel.Size = new Size(360, 36);
+        logLabel.Size = new Size(contentWidth, 34);
         logLabel.ForeColor = Color.FromArgb(80, 80, 80);
-        y += 44;
+        y += logLabel.Height + 10;
 
-        int btnWidth = 110;
-        int btnHeight = 32;
-        int btnSpacing = 10;
+        y -= MAIN_BUTTON_SHIFT_UP;
+
+        int btnWidth = (contentWidth - MAIN_BUTTON_HGAP * 2) / 3;
+        int btnHeight = MAIN_BUTTON_HEIGHT;
+        int col2 = padding + btnWidth + MAIN_BUTTON_HGAP;
+        int col3 = padding + (btnWidth + MAIN_BUTTON_HGAP) * 2;
 
         restartBtn = CreateButton("立即重启", padding, y, btnWidth, btnHeight, () => ThreadPool.QueueUserWorkItem(_ => RestartClash("手动")));
-        pauseBtn = CreateButton("暂停检测", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, ToggleDetectionPause);
-        exitBtn = CreateButton("退出", padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight, () => { trayIcon.Visible = false; Application.Exit(); });
-        y += btnHeight + 8;
+        pauseBtn = CreateButton("暂停检测", col2, y, btnWidth, btnHeight, ToggleDetectionPause);
+        exitBtn = CreateButton("退出", col3, y, btnWidth, btnHeight, () => { trayIcon.Visible = false; Application.Exit(); });
+        y += btnHeight + MAIN_BUTTON_VGAP;
 
-        Button testBtn = CreateButton("测速", padding, y, btnWidth, btnHeight, () => {
-            ThreadPool.QueueUserWorkItem(_ => {
-                TriggerDelayTest();
-                bool ok;
-                int d = TestProxy(out ok, true);
-                GetCurrentNode();
-                this.BeginInvoke((Action)(() => {
-                    string ds = d > 0 ? d + "ms" : "--";
-                    string nd = string.IsNullOrEmpty(currentNode) ? "--" : SafeNodeName(currentNode);
-                    proxyLabel.Text = "代  理:  " + (ok ? "OK" : "X") + " " + ds + " | " + TruncateNodeName(nd);
-                    proxyLabel.ForeColor = ok ? COLOR_OK : COLOR_ERROR;
-                    Log("测速: " + ds);
-                }));
-            });
-        });
-        Button switchBtn = CreateButton("切换节点", padding + btnWidth + btnSpacing, y, btnWidth, btnHeight, () => {
+        Button switchBtn = CreateButton("切换节点", padding, y, btnWidth, btnHeight, () => {
             ThreadPool.QueueUserWorkItem(_ => {
                 if (SwitchToBestNode()) {
                     this.BeginInvoke((Action)(() => {
@@ -121,8 +119,13 @@ public partial class ClashGuardian
                 }
             });
         });
-        followBtn = CreateButton(GetFollowClashButtonText(), padding + (btnWidth + btnSpacing) * 2, y, btnWidth, btnHeight,
+        followBtn = CreateButton(GetFollowClashButtonText(), col2, y, btnWidth, btnHeight,
             () => ThreadPool.QueueUserWorkItem(_ => ToggleFollowClashWatcher()));
+        uuRouteBtn = CreateButton(GetUuRouteButtonText(), col3, y, btnWidth, btnHeight,
+            () => ThreadPool.QueueUserWorkItem(_ => ToggleUuRouteWatcher()));
+
+        int contentBottom = y + btnHeight;
+        this.ClientSize = new Size(padding * 2 + contentWidth, contentBottom + MAIN_BOTTOM_PADDING);
 
         this.Controls.Add(statusLabel);
         this.Controls.Add(line1);
@@ -135,11 +138,15 @@ public partial class ClashGuardian
         this.Controls.Add(restartBtn);
         this.Controls.Add(pauseBtn);
         this.Controls.Add(exitBtn);
-        this.Controls.Add(testBtn);
         this.Controls.Add(switchBtn);
         this.Controls.Add(followBtn);
+        this.Controls.Add(uuRouteBtn);
 
         this.Resize += delegate { if (this.WindowState == FormWindowState.Minimized) this.Hide(); };
+
+        ThreadPool.QueueUserWorkItem(_ => {
+            try { CleanLegacyUuWatcherArtifacts(Application.ExecutablePath); } catch { /* ignore */ }
+        });
     }
 
     Button CreateButton(string text, int x, int y, int width, int height, Action onClick) {
@@ -160,7 +167,7 @@ public partial class ClashGuardian
         Label lbl = new Label();
         lbl.Text = text;
         lbl.Location = new Point(x, y);
-        lbl.Size = new Size(360, 22);
+        lbl.Size = new Size(MAIN_CONTENT_WIDTH, MAIN_INFO_HEIGHT);
         lbl.ForeColor = color;
         return lbl;
     }
@@ -169,7 +176,7 @@ public partial class ClashGuardian
         Label line = new Label();
         line.BorderStyle = BorderStyle.Fixed3D;
         line.Location = new Point(x, y);
-        line.Size = new Size(360, 2);
+        line.Size = new Size(MAIN_CONTENT_WIDTH, 2);
         return line;
     }
 
@@ -186,6 +193,15 @@ public partial class ClashGuardian
                 if (pauseDetectionMenuItem != null) {
                     pauseDetectionMenuItem.Text = _isDetectionPaused ? "恢复检测" : "暂停检测";
                 }
+                if (uuRouteMenuItem != null) {
+                    uuRouteMenuItem.Text = GetUuRouteMenuText();
+                }
+                if (followBtn != null) {
+                    followBtn.Text = GetFollowClashButtonText();
+                }
+                if (uuRouteBtn != null) {
+                    uuRouteBtn.Text = GetUuRouteButtonText();
+                }
                 if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds > 60) {
                     RefreshDisabledNodesMenuAsync(false);
                 }
@@ -196,6 +212,10 @@ public partial class ClashGuardian
         pauseDetectionMenuItem = new ToolStripMenuItem("暂停检测");
         pauseDetectionMenuItem.Click += delegate { ToggleDetectionPause(); };
         menu.Items.Add(pauseDetectionMenuItem);
+
+        uuRouteMenuItem = new ToolStripMenuItem(GetUuRouteMenuText());
+        uuRouteMenuItem.Click += delegate { ThreadPool.QueueUserWorkItem(_ => ToggleUuRouteWatcher()); };
+        menu.Items.Add(uuRouteMenuItem);
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -658,6 +678,11 @@ public partial class ClashGuardian
     const string FOLLOW_TASK_NAME = "ClashGuardianFollowClashWatcher";
     const string FOLLOW_RUN_VALUE = "ClashGuardianFollowClashWatcher";
     const string LEGACY_RUN_VALUE = "ClashGuardian";
+    const string UU_ROUTE_TASK_NAME = "ClashGuardianUURouteWatcher";
+    const string UU_ROUTE_RUN_VALUE = "ClashGuardianUURouteWatcher";
+    const string UU_ROUTE_LEGACY_TASK_NAME = "ClashGuardian.UUWatcher";
+    const string UU_ROUTE_LEGACY_RUN_VALUE = "ClashGuardian.UUWatcher";
+    const string UU_ROUTE_STOP_EVENT = "ClashGuardianUuWatcherStopEvent";
 
     string GetFollowClashButtonText() {
         return IsFollowClashWatcherEnabled() ? "取消跟随" : "跟随 Clash";
@@ -665,6 +690,95 @@ public partial class ClashGuardian
 
     bool IsFollowClashWatcherEnabled() {
         return IsScheduledTaskPresent(FOLLOW_TASK_NAME) || IsRunKeyPresent(FOLLOW_RUN_VALUE);
+    }
+
+    string GetUuRouteButtonText() {
+        return IsUuRouteWatcherEnabled() ? "关闭UU联动" : "开启UU联动";
+    }
+
+    string GetUuRouteMenuText() {
+        return "UU 联动（Steam/PUBG）: " + (IsUuRouteWatcherEnabled() ? "开" : "关");
+    }
+
+    bool IsUuRouteWatcherEnabled() {
+        return IsScheduledTaskPresent(UU_ROUTE_TASK_NAME) || IsRunKeyPresent(UU_ROUTE_RUN_VALUE);
+    }
+
+    bool TryCreateUuRouteTask(string exePath, string runLevel) {
+        try {
+            string tr = "\"\\\"" + exePath + "\\\" --watch-uu-route\"";
+            string args = "/Create /F /SC ONLOGON /RL " + runLevel + " /TN \"" + UU_ROUTE_TASK_NAME + "\" /TR " + tr;
+            return RunProcessHidden("schtasks.exe", args) == 0;
+        } catch { return false; }
+    }
+
+    void CleanLegacyUuWatcherArtifacts(string exePath) {
+        try { RunProcessHidden("schtasks.exe", "/Delete /F /TN \"" + UU_ROUTE_LEGACY_TASK_NAME + "\""); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches(UU_ROUTE_LEGACY_RUN_VALUE, ""); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches("ClashGuardian.UUWatcher", ""); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches("ClashGuardianUUWatcher", ""); } catch { /* ignore */ }
+    }
+
+    void SignalUuRouteWatcherStop() {
+        try {
+            using (EventWaitHandle e = new EventWaitHandle(false, EventResetMode.ManualReset, UU_ROUTE_STOP_EVENT)) {
+                e.Set();
+            }
+        } catch { /* ignore */ }
+    }
+
+    void StartUuRouteWatcherNow(string exePath) {
+        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo(exePath, "--watch-uu-route");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.WorkingDirectory = Path.GetDirectoryName(exePath); } catch { /* ignore */ }
+            Process.Start(psi);
+        } catch { /* ignore */ }
+    }
+
+    void ToggleUuRouteWatcher() {
+        string exePath = "";
+        try { exePath = Application.ExecutablePath; } catch { exePath = ""; }
+
+        bool enabled = IsUuRouteWatcherEnabled();
+        if (enabled) {
+            try { RunProcessHidden("schtasks.exe", "/Delete /F /TN \"" + UU_ROUTE_TASK_NAME + "\""); } catch { /* ignore */ }
+            try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+            try { SignalUuRouteWatcherStop(); } catch { /* ignore */ }
+            try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
+            Log("已关闭 UU 联动");
+        } else {
+            bool created = false;
+            created = TryCreateUuRouteTask(exePath, "HIGHEST");
+            if (!created) created = TryCreateUuRouteTask(exePath, "LIMITED");
+
+            if (created) {
+                try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+                Log("已启用 UU 联动 (计划任务)");
+            } else {
+                try {
+                    using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true)) {
+                        if (rk != null) rk.SetValue(UU_ROUTE_RUN_VALUE, "\"" + exePath + "\" --watch-uu-route");
+                    }
+                    Log("已启用 UU 联动 (注册表自启)");
+                } catch (Exception ex) {
+                    Log("UU 联动设置失败: " + ex.Message);
+                }
+            }
+
+            try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
+            try { StartUuRouteWatcherNow(exePath); } catch { /* ignore */ }
+        }
+
+        try {
+            if (!this.IsHandleCreated) return;
+            this.BeginInvoke((Action)(() => {
+                try { if (uuRouteBtn != null) uuRouteBtn.Text = GetUuRouteButtonText(); } catch { /* ignore */ }
+                try { if (uuRouteMenuItem != null) uuRouteMenuItem.Text = GetUuRouteMenuText(); } catch { /* ignore */ }
+            }));
+        } catch { /* ignore */ }
     }
 
     bool IsRunKeyPresent(string valueName) {
