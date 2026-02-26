@@ -191,6 +191,10 @@ public partial class ClashGuardian
         "GLOBAL", "节点选择", "Proxy", "代理模式", "手动切换", "Select", "🚀 节点选择"
     };
 
+    private static readonly string[] MAIN_SELECTOR_PREFERRED_ORDER = new string[] {
+        "Proxy", "节点选择", "代理模式", "手动切换", "Select", "🚀 节点选择"
+    };
+
     private static readonly string[] SKIP_GROUPS = new string[] {
         "DIRECT", "REJECT", "GLOBAL", "Proxy", "节点选择", "代理模式",
         "手动切换", "Select", "自动选择", "故障转移", "负载均衡",
@@ -230,6 +234,16 @@ public partial class ClashGuardian
                 }
             }
         } catch (Exception ex) { Log("节点获取异常: " + ex.Message); }
+    }
+
+    // Capture a stable (group,node) snapshot for temporary policies such as post-match pinning.
+    void CaptureCurrentNodeSnapshotForPin(out string group, out string node) {
+        group = nodeGroup;
+        node = currentNode;
+        if (!string.IsNullOrEmpty(group) && !string.IsNullOrEmpty(node)) return;
+        try { GetCurrentNode(API_TIMEOUT_FAST); } catch { /* ignore */ }
+        group = nodeGroup;
+        node = currentNode;
     }
 
     string ResolveActualNode(string json, string proxyName, int depth) {
@@ -305,14 +319,82 @@ public partial class ClashGuardian
         return 0;
     }
 
+    int GetSelectorMainPriority(string groupName) {
+        if (string.IsNullOrEmpty(groupName)) return int.MaxValue;
+        for (int i = 0; i < MAIN_SELECTOR_PREFERRED_ORDER.Length; i++) {
+            if (string.Equals(MAIN_SELECTOR_PREFERRED_ORDER[i], groupName, StringComparison.Ordinal)) {
+                return i;
+            }
+        }
+        return int.MaxValue;
+    }
+
+    int CountCandidateNodesInGroup(string json, string selectorGroup) {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(selectorGroup)) return 0;
+        try {
+            List<string> nodes = GetCandidateNodesFromProxiesJson(json, selectorGroup);
+            return nodes != null ? nodes.Count : 0;
+        } catch {
+            return 0;
+        }
+    }
+
     string FindSelectorGroup(string json) {
         List<string> globalAll = GetGroupAllNodes(json, "GLOBAL");
+        string fallback = "";
+
+        string bestGroup = "";
+        int bestCount = -1;
+        bool bestIsCurrent = false;
+        int bestMainPriority = int.MaxValue;
+
+        string currentGroup = nodeGroup;
         foreach (string entry in globalAll) {
             string t = FindProxyType(json, entry);
             if (t == "Selector" || t == "URLTest" || t == "Fallback") {
-                return entry;
+                if (string.IsNullOrEmpty(fallback)) fallback = entry;
+
+                int candidateCount = CountCandidateNodesInGroup(json, entry);
+                if (candidateCount <= 0) continue;
+
+                bool isCurrent = !string.IsNullOrEmpty(currentGroup) && string.Equals(currentGroup, entry, StringComparison.Ordinal);
+                int mainPriority = GetSelectorMainPriority(entry);
+
+                if (string.IsNullOrEmpty(bestGroup)) {
+                    bestGroup = entry;
+                    bestCount = candidateCount;
+                    bestIsCurrent = isCurrent;
+                    bestMainPriority = mainPriority;
+                    continue;
+                }
+
+                if (candidateCount > bestCount) {
+                    bestGroup = entry;
+                    bestCount = candidateCount;
+                    bestIsCurrent = isCurrent;
+                    bestMainPriority = mainPriority;
+                    continue;
+                }
+
+                if (candidateCount < bestCount) continue;
+
+                if (isCurrent && !bestIsCurrent) {
+                    bestGroup = entry;
+                    bestIsCurrent = true;
+                    bestMainPriority = mainPriority;
+                    continue;
+                }
+                if (!isCurrent && bestIsCurrent) continue;
+
+                if (mainPriority < bestMainPriority) {
+                    bestGroup = entry;
+                    bestMainPriority = mainPriority;
+                }
             }
         }
+
+        if (!string.IsNullOrEmpty(bestGroup)) return bestGroup;
+        if (!string.IsNullOrEmpty(fallback)) return fallback;
         return "GLOBAL";
     }
 

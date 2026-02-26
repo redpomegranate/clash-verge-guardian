@@ -4,7 +4,9 @@ using System.Drawing;
 using System.Windows.Forms;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Threading;
+using System.Security.Principal;
 using Microsoft.Win32;
 
 /// <summary>
@@ -36,7 +38,14 @@ public partial class ClashGuardian
     const int MAIN_BUTTON_VGAP = 10;
     const int MAIN_BUTTON_SHIFT_UP = 6;
     const int MAIN_BOTTOM_PADDING = 20;
+    const int UU_ROUTE_HEARTBEAT_STALE_SECONDS = 20;
+    const int UU_ROUTE_WATCHDOG_INTERVAL_MS = 15000;
+    const int UU_ROUTE_SELF_HEAL_LOG_THROTTLE_SECONDS = 30;
+    const int UU_ROUTE_TASK_DELETE_VERIFY_WAIT_MS = 3000;
     DateTime lastDisabledNodesMenuRefresh = DateTime.MinValue;
+    DateTime lastUuRouteSelfHealLogAt = DateTime.MinValue;
+    System.Windows.Forms.Timer uuRouteWatchdogTimer;
+    int _uuRouteWatchdogBusy = 0;
 
     Icon AppIcon {
         get {
@@ -211,15 +220,10 @@ public partial class ClashGuardian
                 if (pauseDetectionMenuItem != null) {
                     pauseDetectionMenuItem.Text = _isDetectionPaused ? "恢复检测" : "暂停检测";
                 }
-                if (uuRouteMenuItem != null) {
-                    uuRouteMenuItem.Text = GetUuRouteMenuText();
-                }
                 if (followBtn != null) {
                     followBtn.Text = GetFollowClashButtonText();
                 }
-                if (uuRouteBtn != null) {
-                    uuRouteBtn.Text = GetUuRouteButtonText();
-                }
+                RefreshUuRouteUiTextSafe();
                 if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds > 60) {
                     RefreshDisabledNodesMenuAsync(false);
                 }
@@ -325,6 +329,9 @@ public partial class ClashGuardian
         if (s_followClashMode) {
             InitializeFollowExitMonitor();
         }
+
+        EnsureUuRouteWatchdogStarted();
+        ThreadPool.QueueUserWorkItem(_ => RunUuRouteWatchdog());
 
         // 启动后异步拉取一次节点列表，生成“禁用名单”子菜单
         RefreshDisabledNodesMenuAsync(true);
@@ -701,15 +708,147 @@ public partial class ClashGuardian
     }
 
     string GetUuRouteButtonText() {
-        return IsUuRouteWatcherEnabled() ? "关闭UU联动" : "开启UU联动";
+        UuRouteWatcherRuntimeState st = GetUuRouteWatcherRuntimeState();
+        if (!st.Enabled) return "开启UU联动";
+        if (st.RequireAdmin) return "开-需管理员";
+        if (st.RunningHealthy) return "开-运行中";
+        return "开-未运行";
     }
 
     string GetUuRouteMenuText() {
-        return "UU 联动（Steam/PUBG）: " + (IsUuRouteWatcherEnabled() ? "开" : "关");
+        UuRouteWatcherRuntimeState st = GetUuRouteWatcherRuntimeState();
+        if (!st.Enabled) return "UU 联动（Steam/PUBG）: 关";
+        if (st.RequireAdmin) return "UU 联动（Steam/PUBG）: 开-需管理员";
+        if (st.RunningHealthy) return "UU 联动（Steam/PUBG）: 开-运行中";
+        return "UU 联动（Steam/PUBG）: 开-未运行(自愈中)";
+    }
+
+    bool HasUuRouteRunArtifacts() {
+        return IsRunKeyPresent(UU_ROUTE_RUN_VALUE)
+            || IsRunKeyPresent(UU_ROUTE_LEGACY_RUN_VALUE)
+            || IsRunKeyPresent("ClashGuardian.UUWatcher")
+            || IsRunKeyPresent("ClashGuardianUUWatcher");
+    }
+
+    bool IsUuRouteTaskEnabled() {
+        return IsScheduledTaskPresent(UU_ROUTE_TASK_NAME);
     }
 
     bool IsUuRouteWatcherEnabled() {
-        return IsScheduledTaskPresent(UU_ROUTE_TASK_NAME) || IsRunKeyPresent(UU_ROUTE_RUN_VALUE);
+        return IsUuRouteTaskEnabled();
+    }
+
+    class UuRouteWatcherRuntimeState {
+        public bool Enabled = false;
+        public bool RunningHealthy = false;
+        public bool HardIsolationUnavailable = false;
+        public bool RequireAdmin = false;
+        public string Mode = "";
+        public string DesiredMode = "";
+    }
+
+    string GetUuWatcherRootDir() {
+        try {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrEmpty(local)) return Path.Combine(local, "ClashGuardian", "uu-watcher");
+        } catch { /* ignore */ }
+        return "";
+    }
+
+    static bool IsUuActiveLikeMode(string mode) {
+        if (string.IsNullOrEmpty(mode)) return false;
+        return string.Equals(mode, "UU_ACTIVE", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(mode, "ENTERING_UU", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(mode, "DEGRADED_EXIT_PENDING", StringComparison.OrdinalIgnoreCase);
+    }
+
+    UuRouteWatcherRuntimeState GetUuRouteWatcherRuntimeState() {
+        UuRouteWatcherRuntimeState st = new UuRouteWatcherRuntimeState();
+        st.Enabled = IsUuRouteWatcherEnabled();
+        if (!st.Enabled) return st;
+
+        string root = GetUuWatcherRootDir();
+        if (!string.IsNullOrEmpty(root)) {
+            try {
+                string statePath = Path.Combine(root, "state.json");
+                if (File.Exists(statePath)) {
+                    string raw = File.ReadAllText(statePath, Encoding.UTF8);
+                    if (!string.IsNullOrEmpty(raw)) {
+                        st.Mode = GetJsonStringValueStatic(raw, "mode", "");
+                        st.DesiredMode = GetJsonStringValueStatic(raw, "desiredMode", "");
+                        st.HardIsolationUnavailable = GetJsonBoolValueStatic(raw, "hardIsolationUnavailable", false);
+                    }
+                }
+            } catch { /* ignore */ }
+
+            try {
+                string hbPath = Path.Combine(root, "heartbeat.json");
+                if (File.Exists(hbPath)) {
+                    string hb = File.ReadAllText(hbPath, Encoding.UTF8);
+                    if (!string.IsNullOrEmpty(hb)) {
+                        DateTime seen = ParseUuWatcherTime(GetJsonStringValueStatic(hb, "lastSeen", ""));
+                        if (seen != DateTime.MinValue) {
+                            st.RunningHealthy = (DateTime.Now - seen).TotalSeconds <= UU_ROUTE_HEARTBEAT_STALE_SECONDS;
+                        }
+                    }
+                }
+            } catch { /* ignore */ }
+        }
+
+        bool desiredActive = string.Equals(st.DesiredMode, "UU_ACTIVE", StringComparison.OrdinalIgnoreCase);
+        bool uuRunning = false;
+        try {
+            Process[] uu = Process.GetProcessesByName("uu");
+            uuRunning = uu != null && uu.Length > 0;
+            if (uu != null) foreach (Process p in uu) p.Dispose();
+        } catch { /* ignore */ }
+        st.RequireAdmin = st.HardIsolationUnavailable && (desiredActive || IsUuActiveLikeMode(st.Mode) || uuRunning);
+        return st;
+    }
+
+    void RefreshUuRouteUiTextSafe() {
+        try { if (uuRouteBtn != null) uuRouteBtn.Text = GetUuRouteButtonText(); } catch { /* ignore */ }
+        try { if (uuRouteMenuItem != null) uuRouteMenuItem.Text = GetUuRouteMenuText(); } catch { /* ignore */ }
+    }
+
+    void EnsureUuRouteWatchdogStarted() {
+        try {
+            if (uuRouteWatchdogTimer != null) return;
+            uuRouteWatchdogTimer = new System.Windows.Forms.Timer();
+            uuRouteWatchdogTimer.Interval = UU_ROUTE_WATCHDOG_INTERVAL_MS;
+            uuRouteWatchdogTimer.Tick += delegate {
+                ThreadPool.QueueUserWorkItem(_ => RunUuRouteWatchdog());
+            };
+            uuRouteWatchdogTimer.Start();
+        } catch { /* ignore */ }
+    }
+
+    void RunUuRouteWatchdog() {
+        if (Interlocked.CompareExchange(ref _uuRouteWatchdogBusy, 1, 0) != 0) return;
+        try {
+            bool taskPresent = IsUuRouteTaskEnabled();
+            UuRouteWatcherRuntimeState st = GetUuRouteWatcherRuntimeState();
+            string exePath = "";
+            try { exePath = Application.ExecutablePath; } catch { exePath = ""; }
+
+            if (taskPresent && !st.RunningHealthy) {
+                StartUuRouteWatcherNow(exePath);
+
+                DateTime now = DateTime.Now;
+                if (lastUuRouteSelfHealLogAt == DateTime.MinValue || (now - lastUuRouteSelfHealLogAt).TotalSeconds >= UU_ROUTE_SELF_HEAL_LOG_THROTTLE_SECONDS) {
+                    Log("UU 联动 watcher 未运行，已尝试自愈拉起");
+                    lastUuRouteSelfHealLogAt = now;
+                }
+            }
+
+            try {
+                if (this.IsHandleCreated) {
+                    this.BeginInvoke((Action)(() => RefreshUuRouteUiTextSafe()));
+                }
+            } catch { /* ignore */ }
+        } finally {
+            Interlocked.Exchange(ref _uuRouteWatchdogBusy, 0);
+        }
     }
 
     bool TryCreateUuRouteTask(string exePath, string runLevel) {
@@ -735,15 +874,217 @@ public partial class ClashGuardian
         } catch { /* ignore */ }
     }
 
-    void StartUuRouteWatcherNow(string exePath) {
-        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return;
+    bool IsCurrentProcessAdmin() {
+        try {
+            WindowsPrincipal wp = new WindowsPrincipal(WindowsIdentity.GetCurrent());
+            return wp.IsInRole(WindowsBuiltInRole.Administrator);
+        } catch { return false; }
+    }
+
+    enum ElevationLaunchResult {
+        Success,
+        UserCancelled,
+        Failed
+    }
+
+    ElevationLaunchResult StartElevatedCommand(string fileName, string arguments, int timeoutMs, out int exitCode, out string error) {
+        exitCode = -1;
+        error = "";
+        if (timeoutMs <= 0) timeoutMs = 30000;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo(fileName, arguments);
+            psi.UseShellExecute = true;
+            psi.Verb = "runas";
+            try {
+                string wd = Path.GetDirectoryName(Application.ExecutablePath);
+                if (!string.IsNullOrEmpty(wd)) psi.WorkingDirectory = wd;
+            } catch { /* ignore */ }
+            Process p = Process.Start(psi);
+            if (p == null) {
+                error = "提权进程启动失败";
+                return ElevationLaunchResult.Failed;
+            }
+            using (p) {
+                try { p.WaitForExit(timeoutMs); } catch { /* ignore */ }
+                try { if (!p.HasExited) p.Kill(); } catch { /* ignore */ }
+                if (!p.HasExited) {
+                    error = "提权安装超时";
+                    return ElevationLaunchResult.Failed;
+                }
+                exitCode = p.ExitCode;
+            }
+            return ElevationLaunchResult.Success;
+        } catch (System.ComponentModel.Win32Exception ex) {
+            if (ex.NativeErrorCode == 1223) {
+                error = "你取消了管理员授权";
+                return ElevationLaunchResult.UserCancelled;
+            }
+            error = ex.Message;
+            return ElevationLaunchResult.Failed;
+        } catch (Exception ex) {
+            error = ex.Message;
+            return ElevationLaunchResult.Failed;
+        }
+    }
+
+    ElevationLaunchResult StartElevatedInstaller(string exePath, string arguments, out int exitCode, out string error) {
+        exitCode = -1;
+        error = "";
+        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) {
+            error = "程序路径无效";
+            return ElevationLaunchResult.Failed;
+        }
+        ElevationLaunchResult r = StartElevatedCommand(exePath, arguments, 30000, out exitCode, out error);
+        if (r != ElevationLaunchResult.Success) return r;
+        if (exitCode == UU_ROUTE_INSTALL_EXIT_OK) return ElevationLaunchResult.Success;
+        error = "提权安装退出码: " + exitCode;
+        return ElevationLaunchResult.Failed;
+    }
+
+    void ShowUuRouteHint(string text, MessageBoxIcon icon) {
+        if (string.IsNullOrEmpty(text)) return;
+        try {
+            if (!this.IsHandleCreated) return;
+            this.BeginInvoke((Action)(() => {
+                try { MessageBox.Show(this, text, "UU 联动", MessageBoxButtons.OK, icon); } catch { /* ignore */ }
+            }));
+        } catch { /* ignore */ }
+    }
+
+    bool EnsureUuRouteTaskStrictAdmin(string exePath, bool tryElevate, bool userTriggered, out string error) {
+        error = "";
+        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) {
+            error = "找不到 ClashGuardian 可执行文件";
+            return false;
+        }
+
+        try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+
+        if (IsUuRouteTaskEnabled()) return true;
+
+        bool isAdmin = IsCurrentProcessAdmin();
+        if (isAdmin) {
+            bool created = TryCreateUuRouteTask(exePath, "HIGHEST");
+            if (!created) {
+                error = "创建管理员计划任务失败";
+                return false;
+            }
+            if (!IsUuRouteTaskEnabled()) {
+                error = "任务创建后校验失败";
+                return false;
+            }
+            try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+            return true;
+        }
+
+        if (!tryElevate) {
+            error = "需要管理员权限";
+            return false;
+        }
+
+        int installExit;
+        string installError;
+        ElevationLaunchResult result = StartElevatedInstaller(exePath, "--install-uu-route-task", out installExit, out installError);
+        if (result == ElevationLaunchResult.Success) {
+            Thread.Sleep(500);
+            if (IsUuRouteTaskEnabled()) {
+                try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+                return true;
+            }
+            error = "提权安装已执行，但未检测到计划任务";
+            return false;
+        }
+
+        if (result == ElevationLaunchResult.UserCancelled) {
+            error = "已取消管理员授权，UU 联动未启用";
+            if (userTriggered) ShowUuRouteHint(error, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        if (installExit == UU_ROUTE_INSTALL_EXIT_NOT_ADMIN) error = "提权安装未获得管理员权限";
+        else if (installExit == UU_ROUTE_INSTALL_EXIT_TASK_CREATE_FAILED) error = "提权安装失败：计划任务创建失败";
+        else if (installExit == UU_ROUTE_INSTALL_EXIT_TASK_VERIFY_FAILED) error = "提权安装失败：任务校验失败";
+        else if (string.IsNullOrEmpty(error)) error = string.IsNullOrEmpty(installError) ? "提权安装失败" : installError;
+        if (userTriggered) ShowUuRouteHint(error, MessageBoxIcon.Error);
+        return false;
+    }
+
+    bool WaitUuRouteTasksAbsent(int waitMs) {
+        if (waitMs <= 0) waitMs = UU_ROUTE_TASK_DELETE_VERIFY_WAIT_MS;
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < waitMs) {
+            if (!IsScheduledTaskPresent(UU_ROUTE_TASK_NAME) && !IsScheduledTaskPresent(UU_ROUTE_LEGACY_TASK_NAME)) return true;
+            Thread.Sleep(200);
+        }
+        return !IsScheduledTaskPresent(UU_ROUTE_TASK_NAME) && !IsScheduledTaskPresent(UU_ROUTE_LEGACY_TASK_NAME);
+    }
+
+    bool DisableUuRouteTaskStrictAdmin(bool tryElevate, bool userTriggered, out string error) {
+        error = "";
+
+        if (IsCurrentProcessAdmin()) {
+            try { RunProcessHidden("schtasks.exe", "/Delete /F /TN \"" + UU_ROUTE_TASK_NAME + "\""); } catch { /* ignore */ }
+            try { RunProcessHidden("schtasks.exe", "/Delete /F /TN \"" + UU_ROUTE_LEGACY_TASK_NAME + "\""); } catch { /* ignore */ }
+        } else {
+            if (!tryElevate) {
+                error = "需要管理员权限";
+                return false;
+            }
+
+            int exitCode;
+            string elevateError;
+            string cmdArgs =
+                "/c " +
+                "schtasks /Delete /F /TN \"" + UU_ROUTE_TASK_NAME + "\" >nul 2>&1 & " +
+                "schtasks /Delete /F /TN \"" + UU_ROUTE_LEGACY_TASK_NAME + "\" >nul 2>&1 & " +
+                "exit /b 0";
+            ElevationLaunchResult result = StartElevatedCommand("cmd.exe", cmdArgs, 30000, out exitCode, out elevateError);
+            if (result == ElevationLaunchResult.UserCancelled) {
+                error = "已取消管理员授权，UU 联动未关闭";
+                if (userTriggered) ShowUuRouteHint(error, MessageBoxIcon.Warning);
+                return false;
+            }
+            if (result != ElevationLaunchResult.Success) {
+                error = string.IsNullOrEmpty(elevateError) ? "提权关闭失败" : elevateError;
+                if (userTriggered) ShowUuRouteHint(error, MessageBoxIcon.Error);
+                return false;
+            }
+        }
+
+        bool absent = WaitUuRouteTasksAbsent(UU_ROUTE_TASK_DELETE_VERIFY_WAIT_MS);
+        if (!absent) {
+            error = "计划任务删除失败或校验未通过";
+            if (userTriggered) ShowUuRouteHint(error, MessageBoxIcon.Error);
+            return false;
+        }
+
+        try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches(UU_ROUTE_LEGACY_RUN_VALUE, ""); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches("ClashGuardian.UUWatcher", ""); } catch { /* ignore */ }
+        try { RemoveRunKeyValueIfMatches("ClashGuardianUUWatcher", ""); } catch { /* ignore */ }
+        return true;
+    }
+
+    bool StartUuRouteWatcherNow(string exePath) {
+        if (IsUuRouteTaskEnabled()) {
+            try {
+                int code = RunProcessHidden("schtasks.exe", "/Run /TN \"" + UU_ROUTE_TASK_NAME + "\"");
+                if (code == 0) return true;
+            } catch { /* ignore */ }
+        }
+
+        // 严格模式下，非管理员进程不直接拉起 watcher，避免再次进入 non-admin 循环。
+        if (!IsCurrentProcessAdmin()) return false;
+        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return false;
         try {
             ProcessStartInfo psi = new ProcessStartInfo(exePath, "--watch-uu-route");
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             try { psi.WorkingDirectory = Path.GetDirectoryName(exePath); } catch { /* ignore */ }
-            Process.Start(psi);
-        } catch { /* ignore */ }
+            Process p = Process.Start(psi);
+            return p != null;
+        } catch { return false; }
     }
 
     void ToggleUuRouteWatcher() {
@@ -752,41 +1093,38 @@ public partial class ClashGuardian
 
         bool enabled = IsUuRouteWatcherEnabled();
         if (enabled) {
-            try { RunProcessHidden("schtasks.exe", "/Delete /F /TN \"" + UU_ROUTE_TASK_NAME + "\""); } catch { /* ignore */ }
-            try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
-            try { SignalUuRouteWatcherStop(); } catch { /* ignore */ }
-            try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
-            Log("已关闭 UU 联动");
-        } else {
-            bool created = false;
-            created = TryCreateUuRouteTask(exePath, "HIGHEST");
-            if (!created) created = TryCreateUuRouteTask(exePath, "LIMITED");
-
-            if (created) {
-                try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
-                Log("已启用 UU 联动 (计划任务)");
+            string disableError;
+            bool ok = DisableUuRouteTaskStrictAdmin(true, true, out disableError);
+            if (ok) {
+                try { SignalUuRouteWatcherStop(); } catch { /* ignore */ }
+                try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
+                Log("已关闭 UU 联动");
             } else {
-                try {
-                    using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true)) {
-                        if (rk != null) rk.SetValue(UU_ROUTE_RUN_VALUE, "\"" + exePath + "\" --watch-uu-route");
-                    }
-                    Log("已启用 UU 联动 (注册表自启)");
-                } catch (Exception ex) {
-                    Log("UU 联动设置失败: " + ex.Message);
-                }
+                if (string.IsNullOrEmpty(disableError)) disableError = "未知错误";
+                Log("UU 联动关闭失败: " + disableError);
             }
-
-            try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
-            try { StartUuRouteWatcherNow(exePath); } catch { /* ignore */ }
+        } else {
+            string setupError;
+            bool ok = EnsureUuRouteTaskStrictAdmin(exePath, true, true, out setupError);
+            if (ok) {
+                try { CleanLegacyUuWatcherArtifacts(exePath); } catch { /* ignore */ }
+                try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
+                try { StartUuRouteWatcherNow(exePath); } catch { /* ignore */ }
+                Log("已启用 UU 联动 (管理员计划任务)");
+            } else {
+                if (string.IsNullOrEmpty(setupError)) setupError = "未知错误";
+                Log("UU 联动设置失败: " + setupError);
+            }
         }
 
         try {
             if (!this.IsHandleCreated) return;
             this.BeginInvoke((Action)(() => {
-                try { if (uuRouteBtn != null) uuRouteBtn.Text = GetUuRouteButtonText(); } catch { /* ignore */ }
-                try { if (uuRouteMenuItem != null) uuRouteMenuItem.Text = GetUuRouteMenuText(); } catch { /* ignore */ }
+                RefreshUuRouteUiTextSafe();
             }));
         } catch { /* ignore */ }
+
+        ThreadPool.QueueUserWorkItem(_ => RunUuRouteWatchdog());
     }
 
     bool IsRunKeyPresent(string valueName) {

@@ -104,6 +104,252 @@ public partial class ClashGuardian
     long autoRestartSuppressUntilTicks = 0;
     long lastAutoSwitchSuppressLogTicks = 0;
     long lastAutoRestartSuppressLogTicks = 0;
+    const int POST_MATCH_GUARD_SUPPRESS_LOG_THROTTLE_SECONDS = 10;
+    const int POST_MATCH_TRANSITION_UDP_BASELINE_MIN = 2;
+    const int POST_MATCH_TRANSITION_TCP_ESTABLISHED_MIN = 2;
+    volatile bool postMatchGuardActive = false;
+    long postMatchGuardUntilTicks = 0;
+    long postMatchGuardEnterTicks = 0;
+    long postMatchLastSuppressLogTicks = 0;
+    bool postMatchPrevSampleValid = false;
+    int postMatchPrevUdpCount = 0;
+    int postMatchPrevTcpEstablished = 0;
+    int postMatchTransitionStreak = 0;
+    volatile string postMatchPinnedNode = "";
+    volatile string postMatchPinnedGroup = "";
+    volatile bool postMatchCompensationDone = false;
+
+    struct PostMatchSignalSnapshot {
+        public bool UuRunning;
+        public bool TslRunning;
+        public int TslUdpEndpoints;
+        public int TslTcpEstablished;
+        public int TslTcpSynSent;
+        public int TslLoopback1111Established;
+        public int TslLoopback7897Established;
+    }
+
+    bool IsPostMatchGuardActiveNow() {
+        if (!postMatchGuardActive) return false;
+        long until = Interlocked.Read(ref postMatchGuardUntilTicks);
+        if (until <= 0) return false;
+        return DateTime.Now.Ticks < until;
+    }
+
+    bool ShouldSuppressAutoActionInPostMatchGuard(string action, string reason) {
+        if (!matchFreezeAutoActions) return false;
+        if (!IsPostMatchGuardActiveNow()) return false;
+        long nowTicks = DateTime.Now.Ticks;
+        long last = Interlocked.Read(ref postMatchLastSuppressLogTicks);
+        bool canLog = false;
+        try {
+            if (last <= 0 || (new TimeSpan(nowTicks - last)).TotalSeconds >= POST_MATCH_GUARD_SUPPRESS_LOG_THROTTLE_SECONDS) canLog = true;
+        } catch { canLog = true; }
+        if (canLog) {
+            Interlocked.Exchange(ref postMatchLastSuppressLogTicks, nowTicks);
+            Log("POST_MATCH_GUARD_SUPPRESS_AUTO_ACTION action=" + (action ?? "") + " reason=" + (reason ?? "") + " pinnedNode=" + SafeNodeName(postMatchPinnedNode));
+        }
+        return true;
+    }
+
+    bool ShouldBlockAutoSwitchByPostMatchGuard(string reason) {
+        if (!matchPinNodeEnabled) return false;
+        if (!IsPostMatchGuardActiveNow()) return false;
+        long nowTicks = DateTime.Now.Ticks;
+        long last = Interlocked.Read(ref postMatchLastSuppressLogTicks);
+        bool canLog = false;
+        try {
+            if (last <= 0 || (new TimeSpan(nowTicks - last)).TotalSeconds >= POST_MATCH_GUARD_SUPPRESS_LOG_THROTTLE_SECONDS) canLog = true;
+        } catch { canLog = true; }
+        if (canLog) {
+            Interlocked.Exchange(ref postMatchLastSuppressLogTicks, nowTicks);
+            Log("POST_MATCH_GUARD_SUPPRESS_AUTO_ACTION action=switch reason=" + (reason ?? "") + " pinnedNode=" + SafeNodeName(postMatchPinnedNode));
+        }
+        return true;
+    }
+
+    static bool IsLoopbackEndpointPort(string endpoint, int port) {
+        if (string.IsNullOrEmpty(endpoint)) return false;
+        string ep = endpoint.Trim().ToLowerInvariant();
+        string suffix = ":" + port.ToString();
+        if (!ep.EndsWith(suffix, StringComparison.Ordinal)) return false;
+        return ep.StartsWith("127.0.0.1:", StringComparison.Ordinal);
+    }
+
+    PostMatchSignalSnapshot CollectPostMatchSignalSnapshot() {
+        PostMatchSignalSnapshot s = new PostMatchSignalSnapshot();
+        try {
+            Process[] uuProcs = Process.GetProcessesByName("uu");
+            if (uuProcs != null) {
+                s.UuRunning = uuProcs.Length > 0;
+                for (int i = 0; i < uuProcs.Length; i++) {
+                    try { uuProcs[i].Dispose(); } catch { /* ignore */ }
+                }
+            }
+        } catch {
+            s.UuRunning = false;
+        }
+
+        Dictionary<int, string> tslPidMap = GetTargetProcessPidMapStatic(new string[] { "tslgame.exe" });
+        if (tslPidMap.Count == 0) {
+            s.TslRunning = false;
+            return s;
+        }
+        s.TslRunning = true;
+
+        int code;
+        string stdout;
+        string stderr;
+        if (RunProcessCaptureStatic("netstat.exe", "-ano -p tcp", 5000, out code, out stdout, out stderr) && code == 0 && !string.IsNullOrEmpty(stdout)) {
+            string[] lines = stdout.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < lines.Length; i++) {
+                string line = lines[i];
+                if (string.IsNullOrEmpty(line)) continue;
+                line = line.Trim();
+                if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                string[] parts = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5) continue;
+
+                int pid;
+                if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
+                if (!tslPidMap.ContainsKey(pid)) continue;
+
+                string local = parts[1];
+                string remote = parts[2];
+                string state = parts[3];
+                if (string.Equals(state, "ESTABLISHED", StringComparison.OrdinalIgnoreCase)) {
+                    s.TslTcpEstablished++;
+                    if (IsLoopbackEndpointPort(remote, 1111)) s.TslLoopback1111Established++;
+                    if (IsLoopbackEndpointPort(remote, 7897)) s.TslLoopback7897Established++;
+                } else if (string.Equals(state, "SYN_SENT", StringComparison.OrdinalIgnoreCase)) {
+                    s.TslTcpSynSent++;
+                }
+                // local endpoint fallback for loopback proxy chain
+                if (string.Equals(state, "ESTABLISHED", StringComparison.OrdinalIgnoreCase) && IsLoopbackEndpointPort(local, 7897)) {
+                    s.TslLoopback7897Established++;
+                }
+            }
+        }
+
+        if (RunProcessCaptureStatic("netstat.exe", "-ano -p udp", 5000, out code, out stdout, out stderr) && code == 0 && !string.IsNullOrEmpty(stdout)) {
+            string[] lines = stdout.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < lines.Length; i++) {
+                string line = lines[i];
+                if (string.IsNullOrEmpty(line)) continue;
+                line = line.Trim();
+                if (!line.StartsWith("UDP", StringComparison.OrdinalIgnoreCase)) continue;
+                string[] parts = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 4) continue;
+
+                int pid;
+                if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
+                if (!tslPidMap.ContainsKey(pid)) continue;
+                s.TslUdpEndpoints++;
+            }
+        }
+
+        return s;
+    }
+
+    bool IsPostMatchTransitionCandidate(PostMatchSignalSnapshot s) {
+        if (!postMatchPrevSampleValid) return false;
+        if (postMatchPrevUdpCount < POST_MATCH_TRANSITION_UDP_BASELINE_MIN) return false;
+
+        int prevUdp = postMatchPrevUdpCount;
+        int prevTcp = postMatchPrevTcpEstablished;
+        bool udpDropped = s.TslUdpEndpoints <= Math.Max(1, prevUdp / 2);
+        bool tcpRisen = s.TslTcpEstablished >= Math.Max(POST_MATCH_TRANSITION_TCP_ESTABLISHED_MIN, prevTcp + 1);
+        return udpDropped && tcpRisen;
+    }
+
+    void EnterPostMatchGuard(PostMatchSignalSnapshot s) {
+        int guardSeconds = ClampInt(postMatchGuardSeconds, 15, 300);
+        DateTime now = DateTime.Now;
+        Interlocked.Exchange(ref postMatchGuardEnterTicks, now.Ticks);
+        Interlocked.Exchange(ref postMatchGuardUntilTicks, now.AddSeconds(guardSeconds).Ticks);
+        postMatchGuardActive = true;
+        postMatchCompensationDone = false;
+        postMatchTransitionStreak = 0;
+        string pinnedGroup;
+        string pinnedNode;
+        CaptureCurrentNodeSnapshotForPin(out pinnedGroup, out pinnedNode);
+        postMatchPinnedNode = pinnedNode;
+        postMatchPinnedGroup = pinnedGroup;
+        Log("POST_MATCH_GUARD_ENTER windowSec=" + guardSeconds + " udpNow=" + s.TslUdpEndpoints + " tcpNow=" + s.TslTcpEstablished + " uuRunning=" + (s.UuRunning ? 1 : 0));
+
+        if (matchPinNodeEnabled) {
+            Log("POST_MATCH_GUARD_PINNED_NODE group=" + SafeNodeName(postMatchPinnedGroup) + " node=" + SafeNodeName(postMatchPinnedNode));
+        }
+
+        try {
+            ApiPut("/proxies/" + Uri.EscapeDataString(UU_WATCHER_ROUTE_GROUP), "{\"name\":\"DIRECT\"}");
+        } catch { /* ignore */ }
+
+        if (steamTakeoverCompensateOnPostMatch && !postMatchCompensationDone) {
+            postMatchCompensationDone = true;
+            RunSteamTakeoverCompensationOnPostMatch("post_match_guard");
+        }
+    }
+
+    void ExitPostMatchGuard(string reason) {
+        if (!postMatchGuardActive && !IsPostMatchGuardActiveNow()) return;
+        long enterTicks = Interlocked.Read(ref postMatchGuardEnterTicks);
+        int durationSec = 0;
+        try {
+            if (enterTicks > 0) durationSec = (int)(DateTime.Now - new DateTime(enterTicks)).TotalSeconds;
+        } catch { durationSec = 0; }
+        postMatchGuardActive = false;
+        Interlocked.Exchange(ref postMatchGuardUntilTicks, 0);
+        Interlocked.Exchange(ref postMatchGuardEnterTicks, 0);
+        postMatchPinnedNode = "";
+        postMatchPinnedGroup = "";
+        postMatchCompensationDone = false;
+        postMatchTransitionStreak = 0;
+        postMatchPrevSampleValid = false;
+        postMatchPrevUdpCount = 0;
+        postMatchPrevTcpEstablished = 0;
+        Log("POST_MATCH_GUARD_EXIT reason=" + (string.IsNullOrEmpty(reason) ? "unknown" : reason) + " durationSec=" + durationSec);
+    }
+
+    void UpdatePostMatchGuardWindow(PostMatchSignalSnapshot s) {
+        if (IsPostMatchGuardActiveNow()) {
+            if (matchPinNodeEnabled && !string.IsNullOrEmpty(postMatchPinnedNode)) {
+                currentNode = postMatchPinnedNode;
+                if (!string.IsNullOrEmpty(postMatchPinnedGroup)) nodeGroup = postMatchPinnedGroup;
+            }
+        } else if (postMatchGuardActive) {
+            ExitPostMatchGuard("timeout");
+        }
+
+        if (!postMatchGuardEnabled) {
+            if (postMatchGuardActive) ExitPostMatchGuard("disabled");
+            return;
+        }
+
+        if (!s.UuRunning || !s.TslRunning) {
+            if (postMatchGuardActive) ExitPostMatchGuard(!s.UuRunning ? "uu_off" : "tslgame_not_running");
+            postMatchPrevSampleValid = false;
+            postMatchPrevUdpCount = 0;
+            postMatchPrevTcpEstablished = 0;
+            postMatchTransitionStreak = 0;
+            return;
+        }
+
+        if (!IsPostMatchGuardActiveNow()) {
+            if (IsPostMatchTransitionCandidate(s)) {
+                postMatchTransitionStreak++;
+                if (postMatchTransitionStreak >= 1) {
+                    EnterPostMatchGuard(s);
+                }
+            } else {
+                postMatchTransitionStreak = 0;
+            }
+        }
+
+        postMatchPrevSampleValid = true;
+        postMatchPrevUdpCount = s.TslUdpEndpoints;
+        postMatchPrevTcpEstablished = s.TslTcpEstablished;
+    }
 
     void CleanOldLogs() {
         try {
@@ -901,6 +1147,8 @@ public partial class ClashGuardian
     }
 
     void QueueRestartAction(string reason, bool forceRestartClient, string eventName) {
+        bool isManual = string.Equals(eventName, "Manual", StringComparison.OrdinalIgnoreCase);
+        if (!isManual && ShouldSuppressAutoActionInPostMatchGuard("restart", eventName)) return;
         if (Interlocked.CompareExchange(ref _isRestartQueued, 1, 0) != 0) return;
         ThreadPool.QueueUserWorkItem(_ => {
             try {
@@ -1110,6 +1358,7 @@ public partial class ClashGuardian
         if (manualClientInterventionRequired) return;
 
         // 客户端不在时不干涉（避免误判导致启动/重启 Clash）
+        if (ShouldSuppressAutoActionInPostMatchGuard("emergency", trigger)) return;
         bool clientRunning = IsClientRunningSafe();
         if (!clientRunning) return;
 
@@ -1310,6 +1559,7 @@ public partial class ClashGuardian
         }
 
         DateTime now = DateTime.Now;
+        PostMatchSignalSnapshot postMatchSignal = CollectPostMatchSignalSnapshot();
 
         int[] tcp = lastTcpStats;
         int coreCloseWait = lastCoreCloseWait;
@@ -1326,13 +1576,14 @@ public partial class ClashGuardian
         }
 
         int nodeRefreshMs = (!running || !proxyOK || (delay > highDelayThreshold)) ? 1000 : 5000;
-        if ((now - lastNodeRefreshAt).TotalMilliseconds >= nodeRefreshMs) { GetCurrentNode(API_TIMEOUT_FAST); lastNodeRefreshAt = now; }
+        bool skipNodeRefreshForPin = matchPinNodeEnabled && IsPostMatchGuardActiveNow();
+        if (!skipNodeRefreshForPin && (now - lastNodeRefreshAt).TotalMilliseconds >= nodeRefreshMs) { GetCurrentNode(API_TIMEOUT_FAST); lastNodeRefreshAt = now; }
 
         if ((now - lastDelayTestAt).TotalMinutes >= DELAY_TEST_REFRESH_MINUTES) { TriggerDelayTest(); lastDelayTestAt = now; }
 
         try {
             if (this.IsHandleCreated) {
-                this.BeginInvoke((Action)(() => UpdateUI(running, mem, handles, proxyOK, delay, tcp, coreCloseWait, coreCloseWaitKnown)));
+                this.BeginInvoke((Action)(() => UpdateUI(running, mem, handles, proxyOK, delay, tcp, coreCloseWait, coreCloseWaitKnown, postMatchSignal)));
             }
         } catch { /* ignore */ }
         LogPerf("DoCheckInBackground", sw.ElapsedMilliseconds);
@@ -1467,6 +1718,7 @@ public partial class ClashGuardian
 
     void ScheduleAutoActions(bool running, bool proxyOK, bool networkBadForSubSwitch, StatusDecision decision) {
         if (manualClientInterventionRequired) return;
+        if (ShouldSuppressAutoActionInPostMatchGuard("decision", decision.Event)) return;
 
         // 订阅健康探测：若确认当前订阅整体不可用，则尽早切换订阅（或提示更换节点提供商）以缩短链路耗时。
         if (running && !proxyOK) {
@@ -1505,8 +1757,9 @@ public partial class ClashGuardian
         }
     }
 
-    void UpdateUI(bool running, double mem, int handles, bool proxyOK, int delay, int[] tcp, int coreCloseWait, bool coreCloseWaitKnown) {
+    void UpdateUI(bool running, double mem, int handles, bool proxyOK, int delay, int[] tcp, int coreCloseWait, bool coreCloseWaitKnown, PostMatchSignalSnapshot postMatchSignal) {
         if (_isDetectionPaused) return;
+        UpdatePostMatchGuardWindow(postMatchSignal);
         int tw = tcp[0], est = tcp[1], cw = tcp[2];
         int dl = delay;
 
@@ -1559,6 +1812,7 @@ public partial class ClashGuardian
 
         // 自动切换：节流 + 防并发，避免 1s/2s 级切换风暴刷屏
         if (isAuto) {
+            if (ShouldBlockAutoSwitchByPostMatchGuard(autoReason)) return;
             long nowTicks = DateTime.Now.Ticks;
             long lastTicks = Interlocked.Read(ref lastAutoSwitchTicks);
             try {
@@ -1605,6 +1859,7 @@ public partial class ClashGuardian
     bool TryHandleSubscriptionProbeDown(string fallbackReasonEvent) {
         if (manualClientInterventionRequired) return false;
         if (_isRestarting) return false;
+        if (ShouldSuppressAutoActionInPostMatchGuard("subscription_probe", fallbackReasonEvent)) return false;
 
         try {
             bool clientRunning = IsAnyClientProcessRunning();
@@ -1745,6 +2000,7 @@ public partial class ClashGuardian
     void RecoverFromNoGoodNode(NodeSwitchReport r) {
         if (_isRestarting) return;
         if (manualClientInterventionRequired) return;
+        if (ShouldSuppressAutoActionInPostMatchGuard("recover_no_good_node", r.Outcome.ToString())) return;
 
         // 客户端不在时不干涉（避免误判导致启动/重启 Clash）
         bool clientRunning = IsClientRunningSafe();
@@ -1767,6 +2023,7 @@ public partial class ClashGuardian
     }
 
     void SwitchSubscriptionAndRestart(string reasonEvent, int switches) {
+        if (ShouldSuppressAutoActionInPostMatchGuard("subscription_switch", reasonEvent)) return;
         lock (subscriptionLock) {
             if (_isSwitchingSubscription) return;
             if (_isRestarting) return;

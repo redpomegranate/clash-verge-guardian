@@ -60,6 +60,11 @@ public partial class ClashGuardian
                 safeDefaults["connectivitySlowThresholdMs"] = connectivitySlowThresholdMs.ToString();
                 safeDefaults["connectivityProbeMinIntervalSeconds"] = connectivityProbeMinIntervalSeconds.ToString();
                 safeDefaults["connectivityResultMaxAgeSeconds"] = connectivityResultMaxAgeSeconds.ToString();
+                safeDefaults["postMatchGuardEnabled"] = postMatchGuardEnabled ? "true" : "false";
+                safeDefaults["postMatchGuardSeconds"] = postMatchGuardSeconds.ToString();
+                safeDefaults["matchFreezeAutoActions"] = matchFreezeAutoActions ? "true" : "false";
+                safeDefaults["matchPinNodeEnabled"] = matchPinNodeEnabled ? "true" : "false";
+                safeDefaults["steamTakeoverCompensateOnPostMatch"] = steamTakeoverCompensateOnPostMatch ? "true" : "false";
 
                 foreach (KeyValuePair<string, string> kv in safeDefaults)
                 {
