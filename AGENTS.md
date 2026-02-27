@@ -322,3 +322,10 @@ Get-Process | Where-Object {$_.ProcessName -like "*ClashGuardian*"} | Stop-Proce
 
 1. After every code change, check whether ClashGuardian.exe is running before build.
 2. If running, terminate all ClashGuardian* processes first, then compile.
+
+## 文档编码编写规则（防乱码）
+
+1. 所有 .md/.cs/.ps1/.json 文件统一使用 UTF-8；Windows 环境建议使用 UTF-8 with BOM，避免被旧工具误判为 ANSI/GBK。
+2. 禁止用 ANSI/GBK 打开后直接保存 UTF-8 文件；出现 澶/锛/æ/� 这类乱码特征时，必须先从 Git 恢复再编辑。
+3. 终端查阅中文内容时先切换 UTF-8 输出（chcp 65001 或 PowerShell 7+），优先区分“显示乱码”和“文件乱码”。
+4. 文档提交前执行编码自检：Get-Content README.md -Encoding UTF8 -TotalCount 5 与 Get-Content AGENTS.md -Encoding UTF8 -TotalCount 5。
