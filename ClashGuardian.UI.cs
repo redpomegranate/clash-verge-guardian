@@ -19,6 +19,7 @@ public partial class ClashGuardian
     ToolStripMenuItem preferredNodesMenu;
     ToolStripMenuItem pauseDetectionMenuItem;
     ToolStripMenuItem uuRouteMenuItem;
+    ToolStripMenuItem uuMonitorPanelMenuItem;
 
     ToolStripDropDown disabledNodesDropDown;
     ToolStripDropDown preferredNodesDropDown;
@@ -42,10 +43,37 @@ public partial class ClashGuardian
     const int UU_ROUTE_WATCHDOG_INTERVAL_MS = 15000;
     const int UU_ROUTE_SELF_HEAL_LOG_THROTTLE_SECONDS = 30;
     const int UU_ROUTE_TASK_DELETE_VERIFY_WAIT_MS = 3000;
+    const int UU_MONITOR_REFRESH_INTERVAL_MS = 2000;
+    const int UU_MONITOR_HEADER_HEIGHT = 30;
+    const int UU_MONITOR_CONTENT_HEIGHT = 220;
+    const int UU_MONITOR_FAULT_ALERT_WINDOW_SECONDS = 600;
+    const int UU_MONITOR_LOG_TAIL_LINES = 200;
+    const int UU_MONITOR_LABEL_MIN_HEIGHT = 20;
+    const int UU_MONITOR_LABEL_GAP = 6;
     DateTime lastDisabledNodesMenuRefresh = DateTime.MinValue;
     DateTime lastUuRouteSelfHealLogAt = DateTime.MinValue;
     System.Windows.Forms.Timer uuRouteWatchdogTimer;
+    System.Windows.Forms.Timer uuMonitorTimer;
     int _uuRouteWatchdogBusy = 0;
+    int _uuMonitorRefreshBusy = 0;
+    bool _uuMonitorExpanded = false;
+    int _mainWindowCollapsedHeight = 0;
+    int _mainWindowExpandedHeight = 0;
+    int _mainWindowFixedOuterWidth = 0;
+    int _mainWindowChromeHeight = 0;
+    bool _mainWindowSizingLock = false;
+    Panel uuMonitorPanel;
+    Button uuMonitorToggleBtn;
+    Label uuMonitorSummaryLabel;
+    Label uuMonitorHealthLabel;
+    Label uuMonitorStateLabel;
+    Label uuMonitorRollbackLabel;
+    Label uuMonitorRouteLabel;
+    Label uuFaultAdminLabel;
+    Label uuFaultIsolationLabel;
+    Label uuFaultLocal7897Label;
+    Label uuFaultProxyLeakLabel;
+    Label uuFaultSteamTakeoverLabel;
 
     Icon AppIcon {
         get {
@@ -61,7 +89,7 @@ public partial class ClashGuardian
         this.Text = "Clash Guardian Pro v" + APP_VERSION;
         this.ClientSize = new Size(MAIN_PADDING * 2 + MAIN_CONTENT_WIDTH, 320);
         this.StartPosition = FormStartPosition.CenterScreen;
-        this.FormBorderStyle = FormBorderStyle.FixedSingle;
+        this.FormBorderStyle = FormBorderStyle.Sizable;
         this.MaximizeBox = false;
         this.Icon = AppIcon;
         this.Font = new Font("Microsoft YaHei UI", 9);
@@ -125,7 +153,48 @@ public partial class ClashGuardian
             () => ThreadPool.QueueUserWorkItem(_ => ToggleUuRouteWatcher()));
 
         int contentBottom = y + btnHeight;
-        this.ClientSize = new Size(padding * 2 + contentWidth, contentBottom + MAIN_BOTTOM_PADDING);
+        int monitorHeaderY = contentBottom + 8;
+        int monitorPanelY = monitorHeaderY + UU_MONITOR_HEADER_HEIGHT + 6;
+
+        uuMonitorToggleBtn = CreateButton("UU监控: 展开", padding, monitorHeaderY, contentWidth, UU_MONITOR_HEADER_HEIGHT,
+            () => ToggleUuMonitorPanel(!_uuMonitorExpanded));
+
+        uuMonitorPanel = new Panel();
+        uuMonitorPanel.Location = new Point(padding, monitorPanelY);
+        uuMonitorPanel.Size = new Size(contentWidth, UU_MONITOR_CONTENT_HEIGHT);
+        uuMonitorPanel.BorderStyle = BorderStyle.FixedSingle;
+        uuMonitorPanel.BackColor = Color.FromArgb(250, 250, 250);
+        uuMonitorPanel.AutoScroll = true;
+        uuMonitorPanel.Visible = false;
+        uuMonitorPanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+        uuMonitorToggleBtn.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+
+        int my = 8;
+        uuMonitorSummaryLabel = CreateUuMonitorLabel("联动状态: --", my, COLOR_TEXT); my += 21;
+        uuMonitorHealthLabel = CreateUuMonitorLabel("运行健康: --", my, COLOR_TEXT); my += 21;
+        uuMonitorStateLabel = CreateUuMonitorLabel("状态机: --", my, COLOR_TEXT); my += 21;
+        uuMonitorRollbackLabel = CreateUuMonitorLabel("回滚链路: --", my, COLOR_TEXT); my += 21;
+        uuMonitorRouteLabel = CreateUuMonitorLabel("实时路由: --", my, COLOR_TEXT); my += 25;
+        uuFaultAdminLabel = CreateUuMonitorLabel("● ADMIN_REQUIRED_FOR_UU: --", my, COLOR_OK); my += 19;
+        uuFaultIsolationLabel = CreateUuMonitorLabel("● HARD_ISOLATION_APPLY_FAIL: --", my, COLOR_OK); my += 19;
+        uuFaultLocal7897Label = CreateUuMonitorLabel("● LOCAL_7897_FAULT_SIGNAL: --", my, COLOR_OK); my += 19;
+        uuFaultProxyLeakLabel = CreateUuMonitorLabel("● PROXY_CHAIN_LEAK_DETECTED: --", my, COLOR_OK); my += 19;
+        uuFaultSteamTakeoverLabel = CreateUuMonitorLabel("● STEAM_UU_TAKEOVER_NOT_COMPLETE: --", my, COLOR_OK);
+
+        uuMonitorPanel.Controls.Add(uuMonitorSummaryLabel);
+        uuMonitorPanel.Controls.Add(uuMonitorHealthLabel);
+        uuMonitorPanel.Controls.Add(uuMonitorStateLabel);
+        uuMonitorPanel.Controls.Add(uuMonitorRollbackLabel);
+        uuMonitorPanel.Controls.Add(uuMonitorRouteLabel);
+        uuMonitorPanel.Controls.Add(uuFaultAdminLabel);
+        uuMonitorPanel.Controls.Add(uuFaultIsolationLabel);
+        uuMonitorPanel.Controls.Add(uuFaultLocal7897Label);
+        uuMonitorPanel.Controls.Add(uuFaultProxyLeakLabel);
+        uuMonitorPanel.Controls.Add(uuFaultSteamTakeoverLabel);
+
+        _mainWindowCollapsedHeight = monitorHeaderY + UU_MONITOR_HEADER_HEIGHT + MAIN_BOTTOM_PADDING;
+        _mainWindowExpandedHeight = monitorPanelY + UU_MONITOR_CONTENT_HEIGHT + MAIN_BOTTOM_PADDING;
+        this.ClientSize = new Size(padding * 2 + contentWidth, _mainWindowCollapsedHeight);
 
         this.Controls.Add(statusLabel);
         this.Controls.Add(line1);
@@ -141,6 +210,11 @@ public partial class ClashGuardian
         this.Controls.Add(switchBtn);
         this.Controls.Add(followBtn);
         this.Controls.Add(uuRouteBtn);
+        this.Controls.Add(uuMonitorToggleBtn);
+        this.Controls.Add(uuMonitorPanel);
+        LayoutUuMonitorLabels();
+        ConfigureMainWindowResizeBounds();
+        this.SizeChanged += delegate { OnMainWindowSizeChanged(); };
 
         ThreadPool.QueueUserWorkItem(_ => {
             try { CleanLegacyUuWatcherArtifacts(Application.ExecutablePath); } catch { /* ignore */ }
@@ -168,6 +242,143 @@ public partial class ClashGuardian
         lbl.Size = new Size(MAIN_CONTENT_WIDTH, MAIN_INFO_HEIGHT);
         lbl.ForeColor = color;
         return lbl;
+    }
+
+    Label CreateUuMonitorLabel(string text, int y, Color color) {
+        Label lbl = new Label();
+        lbl.Text = text;
+        lbl.Location = new Point(8, y);
+        lbl.Size = new Size(MAIN_CONTENT_WIDTH - 16, 20);
+        lbl.ForeColor = color;
+        PrepareUuMonitorLabelForWrap(lbl);
+        return lbl;
+    }
+
+    void PrepareUuMonitorLabelForWrap(Label lbl) {
+        if (lbl == null) return;
+        lbl.AutoSize = false;
+        lbl.TextAlign = ContentAlignment.TopLeft;
+        lbl.Margin = Padding.Empty;
+        int width = MAIN_CONTENT_WIDTH - 16;
+        try {
+            if (uuMonitorPanel != null) width = Math.Max(80, uuMonitorPanel.ClientSize.Width - 16);
+        } catch { /* ignore */ }
+        lbl.MaximumSize = new Size(width, 0);
+    }
+
+    int MeasureUuMonitorLabelHeight(Label lbl, int width) {
+        if (lbl == null) return UU_MONITOR_LABEL_MIN_HEIGHT;
+        if (width < 80) width = 80;
+        string text = string.IsNullOrEmpty(lbl.Text) ? " " : lbl.Text;
+        try {
+            Size sz = TextRenderer.MeasureText(text, lbl.Font, new Size(width, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.Left | TextFormatFlags.NoPadding);
+            int h = sz.Height + 2;
+            if (h < UU_MONITOR_LABEL_MIN_HEIGHT) h = UU_MONITOR_LABEL_MIN_HEIGHT;
+            return h;
+        } catch {
+            return UU_MONITOR_LABEL_MIN_HEIGHT;
+        }
+    }
+
+    int GetUuMonitorContentRequiredHeight() {
+        if (uuMonitorPanel == null) return UU_MONITOR_CONTENT_HEIGHT;
+        int panelWidth = Math.Max(80, uuMonitorPanel.ClientSize.Width - 16);
+        Label[] labels = new Label[] {
+            uuMonitorSummaryLabel,
+            uuMonitorHealthLabel,
+            uuMonitorStateLabel,
+            uuMonitorRollbackLabel,
+            uuMonitorRouteLabel,
+            uuFaultAdminLabel,
+            uuFaultIsolationLabel,
+            uuFaultLocal7897Label,
+            uuFaultProxyLeakLabel,
+            uuFaultSteamTakeoverLabel
+        };
+        int y = 8;
+        for (int i = 0; i < labels.Length; i++) {
+            Label lbl = labels[i];
+            if (lbl == null) continue;
+            y += MeasureUuMonitorLabelHeight(lbl, panelWidth);
+            if (i < labels.Length - 1) y += UU_MONITOR_LABEL_GAP;
+        }
+        y += 8;
+        return y;
+    }
+
+    void LayoutUuMonitorLabels() {
+        if (uuMonitorPanel == null) return;
+        int panelWidth = Math.Max(80, uuMonitorPanel.ClientSize.Width - 16);
+        Label[] labels = new Label[] {
+            uuMonitorSummaryLabel,
+            uuMonitorHealthLabel,
+            uuMonitorStateLabel,
+            uuMonitorRollbackLabel,
+            uuMonitorRouteLabel,
+            uuFaultAdminLabel,
+            uuFaultIsolationLabel,
+            uuFaultLocal7897Label,
+            uuFaultProxyLeakLabel,
+            uuFaultSteamTakeoverLabel
+        };
+
+        int y = 8;
+        for (int i = 0; i < labels.Length; i++) {
+            Label lbl = labels[i];
+            if (lbl == null) continue;
+            PrepareUuMonitorLabelForWrap(lbl);
+            int h = MeasureUuMonitorLabelHeight(lbl, panelWidth);
+            lbl.Location = new Point(8, y);
+            lbl.Size = new Size(panelWidth, h);
+            y += h;
+            if (i < labels.Length - 1) y += UU_MONITOR_LABEL_GAP;
+        }
+        y += 8;
+        try { uuMonitorPanel.AutoScrollMinSize = new Size(0, y); } catch { /* ignore */ }
+    }
+
+    void ConfigureMainWindowResizeBounds() {
+        try {
+            _mainWindowChromeHeight = this.Height - this.ClientSize.Height;
+            _mainWindowFixedOuterWidth = this.Width;
+            int minOuterHeight = _mainWindowChromeHeight + _mainWindowCollapsedHeight;
+            int maxOuterHeight;
+            try {
+                maxOuterHeight = Screen.FromControl(this).WorkingArea.Height;
+            } catch {
+                maxOuterHeight = minOuterHeight + 600;
+            }
+            if (maxOuterHeight < minOuterHeight + 80) maxOuterHeight = minOuterHeight + 80;
+            this.MinimumSize = new Size(_mainWindowFixedOuterWidth, minOuterHeight);
+            this.MaximumSize = new Size(_mainWindowFixedOuterWidth, maxOuterHeight);
+        } catch { /* ignore */ }
+    }
+
+    void OnMainWindowSizeChanged() {
+        if (_mainWindowSizingLock) return;
+        _mainWindowSizingLock = true;
+        try {
+            // lock width while allowing vertical resize by user
+            if (_mainWindowFixedOuterWidth > 0 && this.Width != _mainWindowFixedOuterWidth) {
+                this.Size = new Size(_mainWindowFixedOuterWidth, this.Height);
+            }
+
+            if (_uuMonitorExpanded && uuMonitorPanel != null) {
+                int desired = this.ClientSize.Height - (uuMonitorPanel.Top + MAIN_BOTTOM_PADDING);
+                int minNeeded = GetUuMonitorContentRequiredHeight();
+                if (desired > UU_MONITOR_CONTENT_HEIGHT) {
+                    uuMonitorPanel.Height = desired;
+                } else {
+                    uuMonitorPanel.Height = UU_MONITOR_CONTENT_HEIGHT;
+                }
+                if (minNeeded > uuMonitorPanel.Height) {
+                    try { uuMonitorPanel.AutoScroll = true; } catch { /* ignore */ }
+                }
+            }
+
+            LayoutUuMonitorLabels();
+        } catch { /* ignore */ }
+        _mainWindowSizingLock = false;
     }
 
     Label CreateSeparator(int x, int y) {
@@ -224,6 +435,7 @@ public partial class ClashGuardian
                     followBtn.Text = GetFollowClashButtonText();
                 }
                 RefreshUuRouteUiTextSafe();
+                RefreshUuMonitorMenuTextSafe();
                 if ((DateTime.Now - lastDisabledNodesMenuRefresh).TotalSeconds > 60) {
                     RefreshDisabledNodesMenuAsync(false);
                 }
@@ -238,6 +450,10 @@ public partial class ClashGuardian
         uuRouteMenuItem = new ToolStripMenuItem(GetUuRouteMenuText());
         uuRouteMenuItem.Click += delegate { ThreadPool.QueueUserWorkItem(_ => ToggleUuRouteWatcher()); };
         menu.Items.Add(uuRouteMenuItem);
+
+        uuMonitorPanelMenuItem = new ToolStripMenuItem(GetUuMonitorPanelMenuText());
+        uuMonitorPanelMenuItem.Click += delegate { ToggleUuMonitorPanel(!_uuMonitorExpanded); };
+        menu.Items.Add(uuMonitorPanelMenuItem);
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -332,6 +548,8 @@ public partial class ClashGuardian
 
         EnsureUuRouteWatchdogStarted();
         ThreadPool.QueueUserWorkItem(_ => RunUuRouteWatchdog());
+        EnsureUuMonitorTimerStarted();
+        ThreadPool.QueueUserWorkItem(_ => RunUuMonitorRefresh());
 
         // 启动后异步拉取一次节点列表，生成“禁用名单”子菜单
         RefreshDisabledNodesMenuAsync(true);
@@ -710,9 +928,7 @@ public partial class ClashGuardian
     string GetUuRouteButtonText() {
         UuRouteWatcherRuntimeState st = GetUuRouteWatcherRuntimeState();
         if (!st.Enabled) return "开启UU联动";
-        if (st.RequireAdmin) return "开-需管理员";
-        if (st.RunningHealthy) return "开-运行中";
-        return "开-未运行";
+        return "关闭UU联动";
     }
 
     string GetUuRouteMenuText() {
@@ -745,6 +961,338 @@ public partial class ClashGuardian
         public bool RequireAdmin = false;
         public string Mode = "";
         public string DesiredMode = "";
+    }
+
+    class UuFaultSignalStatus {
+        public string EventName = "";
+        public bool Seen = false;
+        public bool Active = false;
+        public DateTime LastSeen = DateTime.MinValue;
+
+        public UuFaultSignalStatus(string eventName) {
+            EventName = eventName ?? "";
+        }
+    }
+
+    class UuMonitorSnapshot {
+        public bool Enabled = false;
+        public bool RunningHealthy = false;
+        public string Mode = "";
+        public string DesiredMode = "";
+        public bool RequireAdmin = false;
+        public bool HardIsolationUnavailable = false;
+        public bool RollbackPending = false;
+        public int RetryCount = 0;
+        public string NextRetryAt = "";
+        public string SwitchId = "";
+        public string LastSwitchAt = "";
+        public string RouteNow = "";
+        public string HeartbeatLastSeen = "";
+        public int HeartbeatAgeSec = -1;
+        public int WatcherPid = 0;
+        public bool WatcherPidRunning = false;
+        public bool UuRunning = false;
+        public UuFaultSignalStatus AdminRequired = new UuFaultSignalStatus("ADMIN_REQUIRED_FOR_UU");
+        public UuFaultSignalStatus HardIsolationFail = new UuFaultSignalStatus("HARD_ISOLATION_APPLY_FAIL");
+        public UuFaultSignalStatus Local7897Fault = new UuFaultSignalStatus("LOCAL_7897_FAULT_SIGNAL");
+        public UuFaultSignalStatus ProxyChainLeak = new UuFaultSignalStatus("PROXY_CHAIN_LEAK_DETECTED");
+        public UuFaultSignalStatus SteamTakeoverResidual = new UuFaultSignalStatus("STEAM_UU_TAKEOVER_NOT_COMPLETE");
+    }
+
+    string GetUuMonitorPanelMenuText() {
+        return _uuMonitorExpanded ? "UU监控面板: 收起" : "UU监控面板: 展开";
+    }
+
+    void RefreshUuMonitorMenuTextSafe() {
+        try {
+            if (uuMonitorPanelMenuItem != null) uuMonitorPanelMenuItem.Text = GetUuMonitorPanelMenuText();
+        } catch { /* ignore */ }
+    }
+
+    void ToggleUuMonitorPanel(bool expand) {
+        try {
+            if (this.InvokeRequired) {
+                this.BeginInvoke((Action)(() => ToggleUuMonitorPanel(expand)));
+                return;
+            }
+
+            _uuMonitorExpanded = expand;
+            try { if (uuMonitorPanel != null) uuMonitorPanel.Visible = _uuMonitorExpanded; } catch { /* ignore */ }
+            try { if (uuMonitorToggleBtn != null) uuMonitorToggleBtn.Text = _uuMonitorExpanded ? "UU监控: 收起" : "UU监控: 展开"; } catch { /* ignore */ }
+            RefreshUuMonitorMenuTextSafe();
+
+            int targetMinHeight = _uuMonitorExpanded ? _mainWindowExpandedHeight : _mainWindowCollapsedHeight;
+            if (targetMinHeight > 0 && this.ClientSize.Height < targetMinHeight) {
+                this.ClientSize = new Size(this.ClientSize.Width, targetMinHeight);
+            }
+
+            if (_uuMonitorExpanded && uuMonitorPanel != null) {
+                int desired = this.ClientSize.Height - (uuMonitorPanel.Top + MAIN_BOTTOM_PADDING);
+                if (desired > UU_MONITOR_CONTENT_HEIGHT) uuMonitorPanel.Height = desired;
+                else uuMonitorPanel.Height = UU_MONITOR_CONTENT_HEIGHT;
+            }
+
+            LayoutUuMonitorLabels();
+            if (_uuMonitorExpanded) ThreadPool.QueueUserWorkItem(_ => RunUuMonitorRefresh());
+        } catch { /* ignore */ }
+    }
+
+    void EnsureUuMonitorTimerStarted() {
+        try {
+            if (uuMonitorTimer != null) return;
+            uuMonitorTimer = new System.Windows.Forms.Timer();
+            uuMonitorTimer.Interval = UU_MONITOR_REFRESH_INTERVAL_MS;
+            uuMonitorTimer.Tick += delegate {
+                ThreadPool.QueueUserWorkItem(_ => RunUuMonitorRefresh());
+            };
+            uuMonitorTimer.Start();
+        } catch { /* ignore */ }
+    }
+
+    void RunUuMonitorRefresh() {
+        if (Interlocked.CompareExchange(ref _uuMonitorRefreshBusy, 1, 0) != 0) return;
+        try {
+            UuMonitorSnapshot snapshot = CollectUuMonitorSnapshot();
+            try {
+                if (this.IsHandleCreated) {
+                    this.BeginInvoke((Action)(() => {
+                        RenderUuMonitorSnapshot(snapshot);
+                        RefreshUuMonitorMenuTextSafe();
+                    }));
+                }
+            } catch { /* ignore */ }
+        } finally {
+            Interlocked.Exchange(ref _uuMonitorRefreshBusy, 0);
+        }
+    }
+
+    UuMonitorSnapshot CollectUuMonitorSnapshot() {
+        UuMonitorSnapshot s = new UuMonitorSnapshot();
+        UuRouteWatcherRuntimeState st = GetUuRouteWatcherRuntimeState();
+        s.Enabled = st.Enabled;
+        s.RunningHealthy = st.RunningHealthy;
+        s.Mode = st.Mode;
+        s.DesiredMode = st.DesiredMode;
+        s.RequireAdmin = st.RequireAdmin;
+        s.HardIsolationUnavailable = st.HardIsolationUnavailable;
+
+        string root = GetUuWatcherRootDir();
+        if (!string.IsNullOrEmpty(root)) {
+            try {
+                string statePath = Path.Combine(root, "state.json");
+                if (File.Exists(statePath)) {
+                    string raw = File.ReadAllText(statePath, Encoding.UTF8);
+                    if (!string.IsNullOrEmpty(raw)) {
+                        s.RollbackPending = GetJsonBoolValueStatic(raw, "rollbackPending", false);
+                        s.RetryCount = GetJsonIntValueStatic(raw, "retryCount", 0);
+                        s.NextRetryAt = GetJsonStringValueStatic(raw, "nextRetryAt", "");
+                        s.SwitchId = GetJsonStringValueStatic(raw, "switchId", "");
+                        s.LastSwitchAt = GetJsonStringValueStatic(raw, "lastSwitchAt", "");
+                    }
+                }
+            } catch { /* ignore */ }
+
+            try {
+                string hbPath = Path.Combine(root, "heartbeat.json");
+                if (File.Exists(hbPath)) {
+                    string hb = File.ReadAllText(hbPath, Encoding.UTF8);
+                    if (!string.IsNullOrEmpty(hb)) {
+                        s.HeartbeatLastSeen = GetJsonStringValueStatic(hb, "lastSeen", "");
+                        DateTime seen = ParseUuWatcherTime(s.HeartbeatLastSeen);
+                        if (seen != DateTime.MinValue) {
+                            try { s.HeartbeatAgeSec = (int)(DateTime.Now - seen).TotalSeconds; } catch { s.HeartbeatAgeSec = -1; }
+                        }
+                        s.WatcherPid = GetJsonIntValueStatic(hb, "pid", 0);
+                    }
+                }
+            } catch { /* ignore */ }
+
+            try {
+                string logPath = Path.Combine(root, "watcher.log");
+                PopulateUuFaultSignals(logPath, s);
+            } catch { /* ignore */ }
+        }
+
+        s.RouteNow = GetUuRouteNowForMonitor();
+        s.WatcherPidRunning = IsProcessAliveSafe(s.WatcherPid);
+        s.UuRunning = IsNamedProcessRunningSafe("uu");
+        return s;
+    }
+
+    bool IsProcessAliveSafe(int pid) {
+        if (pid <= 0) return false;
+        try {
+            using (Process p = Process.GetProcessById(pid)) {
+                return p != null && !p.HasExited;
+            }
+        } catch {
+            return false;
+        }
+    }
+
+    bool IsNamedProcessRunningSafe(string processName) {
+        if (string.IsNullOrEmpty(processName)) return false;
+        try {
+            Process[] procs = Process.GetProcessesByName(processName);
+            bool running = procs != null && procs.Length > 0;
+            if (procs != null) {
+                for (int i = 0; i < procs.Length; i++) {
+                    try { procs[i].Dispose(); } catch { /* ignore */ }
+                }
+            }
+            return running;
+        } catch {
+            return false;
+        }
+    }
+
+    string GetUuRouteNowForMonitor() {
+        try {
+            string json = ApiRequest("/proxies", API_TIMEOUT_FAST);
+            if (string.IsNullOrEmpty(json)) return "--";
+            string now = FindProxyNow(json, UU_WATCHER_ROUTE_GROUP);
+            if (string.IsNullOrEmpty(now)) return "--";
+            return now;
+        } catch {
+            return "--";
+        }
+    }
+
+    Queue<string> ReadTailLinesSafe(string path, int maxLines) {
+        Queue<string> q = new Queue<string>();
+        if (string.IsNullOrEmpty(path) || maxLines <= 0) return q;
+        try {
+            using (StreamReader sr = new StreamReader(path, Encoding.UTF8, true)) {
+                string line;
+                while ((line = sr.ReadLine()) != null) {
+                    q.Enqueue(line);
+                    while (q.Count > maxLines) q.Dequeue();
+                }
+            }
+        } catch { /* ignore */ }
+        return q;
+    }
+
+    DateTime ParseWatcherLogLineTime(string line) {
+        if (string.IsNullOrEmpty(line) || line.Length < 19) return DateTime.MinValue;
+        DateTime ts;
+        if (DateTime.TryParse(line.Substring(0, 19), out ts)) return ts;
+        return DateTime.MinValue;
+    }
+
+    void TouchFaultSignal(UuFaultSignalStatus status, DateTime when) {
+        if (status == null) return;
+        status.Seen = true;
+        if (when != DateTime.MinValue && (status.LastSeen == DateTime.MinValue || when > status.LastSeen)) {
+            status.LastSeen = when;
+        }
+    }
+
+    void FinalizeFaultSignal(UuFaultSignalStatus status, DateTime now) {
+        if (status == null) return;
+        status.Active = false;
+        if (status.LastSeen == DateTime.MinValue) return;
+        try {
+            status.Active = (now - status.LastSeen).TotalSeconds <= UU_MONITOR_FAULT_ALERT_WINDOW_SECONDS;
+        } catch {
+            status.Active = false;
+        }
+    }
+
+    void PopulateUuFaultSignals(string logPath, UuMonitorSnapshot s) {
+        if (s == null || string.IsNullOrEmpty(logPath) || !File.Exists(logPath)) return;
+        Queue<string> lines = ReadTailLinesSafe(logPath, UU_MONITOR_LOG_TAIL_LINES);
+        foreach (string line in lines) {
+            if (string.IsNullOrEmpty(line)) continue;
+            DateTime ts = ParseWatcherLogLineTime(line);
+            if (line.IndexOf(s.AdminRequired.EventName, StringComparison.OrdinalIgnoreCase) >= 0) TouchFaultSignal(s.AdminRequired, ts);
+            if (line.IndexOf(s.HardIsolationFail.EventName, StringComparison.OrdinalIgnoreCase) >= 0) TouchFaultSignal(s.HardIsolationFail, ts);
+            if (line.IndexOf(s.Local7897Fault.EventName, StringComparison.OrdinalIgnoreCase) >= 0) TouchFaultSignal(s.Local7897Fault, ts);
+            if (line.IndexOf(s.ProxyChainLeak.EventName, StringComparison.OrdinalIgnoreCase) >= 0) TouchFaultSignal(s.ProxyChainLeak, ts);
+            if (line.IndexOf(s.SteamTakeoverResidual.EventName, StringComparison.OrdinalIgnoreCase) >= 0) TouchFaultSignal(s.SteamTakeoverResidual, ts);
+        }
+        DateTime now = DateTime.Now;
+        FinalizeFaultSignal(s.AdminRequired, now);
+        FinalizeFaultSignal(s.HardIsolationFail, now);
+        FinalizeFaultSignal(s.Local7897Fault, now);
+        FinalizeFaultSignal(s.ProxyChainLeak, now);
+        FinalizeFaultSignal(s.SteamTakeoverResidual, now);
+    }
+
+    string FormatMonitorTimeForUi(string value) {
+        if (string.IsNullOrEmpty(value)) return "--";
+        DateTime dt = ParseUuWatcherTime(value);
+        if (dt == DateTime.MinValue) return "--";
+        return dt.ToString("MM-dd HH:mm:ss");
+    }
+
+    string FormatFaultRecentForUi(UuFaultSignalStatus status) {
+        if (status == null) return "--";
+        if (status.LastSeen == DateTime.MinValue) {
+            if (status.Seen) return "已发生(时间未知)";
+            return "--";
+        }
+        return status.LastSeen.ToString("MM-dd HH:mm:ss");
+    }
+
+    void ApplyFaultLabelUi(Label lbl, UuFaultSignalStatus status) {
+        if (lbl == null || status == null) return;
+        lbl.Text = "● " + status.EventName + ": " + (status.Active ? "告警" : "正常") + " | 最近: " + FormatFaultRecentForUi(status);
+        lbl.ForeColor = status.Active ? COLOR_ERROR : COLOR_OK;
+    }
+
+    void RenderUuMonitorSnapshot(UuMonitorSnapshot s) {
+        if (s == null) return;
+        try {
+            if (uuMonitorSummaryLabel != null) {
+                if (!s.Enabled) {
+                    uuMonitorSummaryLabel.Text = "联动状态: 未启用（任务不存在）";
+                    uuMonitorSummaryLabel.ForeColor = COLOR_WARNING;
+                } else {
+                    uuMonitorSummaryLabel.Text = "联动状态: 已启用 | 健康: " + (s.RunningHealthy ? "运行中" : "未运行(自愈中)");
+                    uuMonitorSummaryLabel.ForeColor = s.RunningHealthy ? COLOR_OK : COLOR_WARNING;
+                }
+            }
+
+            if (uuMonitorHealthLabel != null) {
+                string age = s.HeartbeatAgeSec >= 0 ? s.HeartbeatAgeSec + "s" : "--";
+                string pid = s.WatcherPid > 0 ? (s.WatcherPid.ToString() + (s.WatcherPidRunning ? "(存活)" : "(失活)")) : "--";
+                string hb = FormatMonitorTimeForUi(s.HeartbeatLastSeen);
+                uuMonitorHealthLabel.Text = "运行健康: 心跳=" + (s.RunningHealthy ? "正常" : "异常")
+                    + " | lastSeen=" + hb + " | age=" + age + " | pid=" + pid + " | uu.exe=" + (s.UuRunning ? "运行中" : "未运行");
+            }
+
+            if (uuMonitorStateLabel != null) {
+                string mode = string.IsNullOrEmpty(s.Mode) ? "--" : s.Mode;
+                string desired = string.IsNullOrEmpty(s.DesiredMode) ? "--" : s.DesiredMode;
+                uuMonitorStateLabel.Text = "状态机: mode=" + mode + " | desired=" + desired
+                    + " | 需管理员=" + (s.RequireAdmin ? "是" : "否")
+                    + " | 隔离不可用=" + (s.HardIsolationUnavailable ? "是" : "否");
+            }
+
+            if (uuMonitorRollbackLabel != null) {
+                string next = FormatMonitorTimeForUi(s.NextRetryAt);
+                string lastSwitch = FormatMonitorTimeForUi(s.LastSwitchAt);
+                string sid = string.IsNullOrEmpty(s.SwitchId) ? "--" : s.SwitchId;
+                uuMonitorRollbackLabel.Text = "回滚链路: pending=" + (s.RollbackPending ? "1" : "0")
+                    + " | retry=" + s.RetryCount
+                    + " | next=" + next
+                    + " | switchId=" + sid
+                    + " | lastSwitch=" + lastSwitch;
+            }
+
+            if (uuMonitorRouteLabel != null) {
+                string routeNow = string.IsNullOrEmpty(s.RouteNow) ? "--" : s.RouteNow;
+                uuMonitorRouteLabel.Text = "实时路由: GAME_STEAM_ROUTE=" + routeNow + " | 刷新=" + DateTime.Now.ToString("HH:mm:ss");
+            }
+
+            ApplyFaultLabelUi(uuFaultAdminLabel, s.AdminRequired);
+            ApplyFaultLabelUi(uuFaultIsolationLabel, s.HardIsolationFail);
+            ApplyFaultLabelUi(uuFaultLocal7897Label, s.Local7897Fault);
+            ApplyFaultLabelUi(uuFaultProxyLeakLabel, s.ProxyChainLeak);
+            ApplyFaultLabelUi(uuFaultSteamTakeoverLabel, s.SteamTakeoverResidual);
+            LayoutUuMonitorLabels();
+        } catch { /* ignore */ }
     }
 
     string GetUuWatcherRootDir() {
@@ -809,6 +1357,7 @@ public partial class ClashGuardian
     void RefreshUuRouteUiTextSafe() {
         try { if (uuRouteBtn != null) uuRouteBtn.Text = GetUuRouteButtonText(); } catch { /* ignore */ }
         try { if (uuRouteMenuItem != null) uuRouteMenuItem.Text = GetUuRouteMenuText(); } catch { /* ignore */ }
+        RefreshUuMonitorMenuTextSafe();
     }
 
     void EnsureUuRouteWatchdogStarted() {
@@ -1092,6 +1641,7 @@ public partial class ClashGuardian
         try { exePath = Application.ExecutablePath; } catch { exePath = ""; }
 
         bool enabled = IsUuRouteWatcherEnabled();
+        bool enableSucceeded = false;
         if (enabled) {
             string disableError;
             bool ok = DisableUuRouteTaskStrictAdmin(true, true, out disableError);
@@ -1111,6 +1661,7 @@ public partial class ClashGuardian
                 try { RemoveRunKeyValueIfMatches(UU_ROUTE_RUN_VALUE, ""); } catch { /* ignore */ }
                 try { StartUuRouteWatcherNow(exePath); } catch { /* ignore */ }
                 Log("已启用 UU 联动 (管理员计划任务)");
+                enableSucceeded = true;
             } else {
                 if (string.IsNullOrEmpty(setupError)) setupError = "未知错误";
                 Log("UU 联动设置失败: " + setupError);
@@ -1118,13 +1669,16 @@ public partial class ClashGuardian
         }
 
         try {
-            if (!this.IsHandleCreated) return;
-            this.BeginInvoke((Action)(() => {
-                RefreshUuRouteUiTextSafe();
-            }));
+            if (this.IsHandleCreated) {
+                this.BeginInvoke((Action)(() => {
+                    if (enableSucceeded) ToggleUuMonitorPanel(true);
+                    RefreshUuRouteUiTextSafe();
+                }));
+            }
         } catch { /* ignore */ }
 
         ThreadPool.QueueUserWorkItem(_ => RunUuRouteWatchdog());
+        ThreadPool.QueueUserWorkItem(_ => RunUuMonitorRefresh());
     }
 
     bool IsRunKeyPresent(string valueName) {

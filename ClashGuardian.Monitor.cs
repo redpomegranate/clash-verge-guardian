@@ -406,6 +406,8 @@ public partial class ClashGuardian
             Directory.CreateDirectory(root);
             string dir = Path.Combine(root, "diagnostics_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
             Directory.CreateDirectory(dir);
+            string uuWatcherRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClashGuardian", "uu-watcher");
+            List<string> uuWatcherCopyStatus = new List<string>();
 
             // 1) 导出 config（脱敏）
             bool maskOk = false;
@@ -421,7 +423,32 @@ public partial class ClashGuardian
 
             // 2) 复制日志
             if (File.Exists(logFile)) {
-                try { File.Copy(logFile, Path.Combine(dir, Path.GetFileName(logFile)), true); } catch { /* 文件占用可忽略 */ }
+                try { File.Copy(logFile, Path.Combine(dir, Path.GetFileName(logFile)), true); } catch { /* file in use: ignore */ }
+            }
+
+            try {
+                string[] uuFiles = new string[] { "state.json", "heartbeat.json", "watcher.log" };
+                for (int i = 0; i < uuFiles.Length; i++) {
+                    string name = uuFiles[i];
+                    string src = Path.Combine(uuWatcherRoot, name);
+                    string dst = Path.Combine(dir, "uu-watcher." + name);
+                    if (!File.Exists(src)) {
+                        uuWatcherCopyStatus.Add(name + "=MISSING");
+                        continue;
+                    }
+                    try {
+                        File.Copy(src, dst, true);
+                        uuWatcherCopyStatus.Add(name + "=OK");
+                    } catch (Exception ex) {
+                        string msg = (ex.Message ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
+                        if (msg.Length > 120) msg = msg.Substring(0, 120) + "...";
+                        uuWatcherCopyStatus.Add(name + "=COPY_FAILED(" + msg + ")");
+                    }
+                }
+            } catch (Exception ex) {
+                string msg = (ex.Message ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
+                if (msg.Length > 120) msg = msg.Substring(0, 120) + "...";
+                uuWatcherCopyStatus.Add("root_scan_failed(" + msg + ")");
             }
 
             // 3) 复制最近 2 份监控数据
@@ -522,6 +549,17 @@ public partial class ClashGuardian
                 sb.AppendLine("connectivityAgeSec=0");
                 sb.AppendLine("connectivitySuccess=0");
                 sb.AppendLine("connectivityAttempts=0");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[UUWatcher]");
+            sb.AppendLine("uuWatcherRoot=" + uuWatcherRoot);
+            if (uuWatcherCopyStatus.Count == 0) {
+                sb.AppendLine("uuWatcherFiles=NONE");
+            } else {
+                for (int i = 0; i < uuWatcherCopyStatus.Count; i++) {
+                    sb.AppendLine(uuWatcherCopyStatus[i]);
+                }
             }
 
             try { File.WriteAllText(Path.Combine(dir, "summary.txt"), sb.ToString(), Encoding.UTF8); }

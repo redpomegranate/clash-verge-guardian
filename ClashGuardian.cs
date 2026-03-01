@@ -745,7 +745,7 @@ public partial class ClashGuardian : Form
             int total;
             int closed = DrainMihomoTargetConnectionsStatic(
                 ctx,
-                UU_WATCHER_TARGET_PROCESS_NAMES,
+                UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES,
                 UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION,
                 false,
                 out total);
@@ -1657,6 +1657,7 @@ public partial class ClashGuardian : Form
     const int UU_WATCHER_POLICY_INTERVAL_SECONDS = 10;
     const int UU_WATCHER_LEAK_DRAIN_MIN_INTERVAL_SECONDS = 10;
     const int UU_WATCHER_LEAK_DRAIN_MAX_PER_ROUND = 5;
+    const int UU_WATCHER_TAKEOVER_RESIDUAL_DRAIN_MIN_INTERVAL_SECONDS = 5;
     const int UU_WATCHER_TAKEOVER_DRAIN_MAX_ON_ENTER = 30;
     const int UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION = 10;
     const int UU_WATCHER_TAKEOVER_RECHECK_DELAY_MS = 2000;
@@ -1669,6 +1670,7 @@ public partial class ClashGuardian : Form
     const int UU_WATCHER_PENDING_ALERT_SECONDS = 300;
     const int UU_WATCHER_HEARTBEAT_INTERVAL_SECONDS = 5;
     const int UU_WATCHER_HEARTBEAT_STALE_SECONDS = 20;
+    const int UU_WATCHER_HEALTH_LOG_INTERVAL_SECONDS = 30;
     const string UU_WATCHER_USER_ENV_KEY = @"Environment";
     const string UU_WATCHER_ENV_HTTP_PROXY = "HTTP_PROXY";
     const string UU_WATCHER_ENV_HTTPS_PROXY = "HTTPS_PROXY";
@@ -1693,6 +1695,12 @@ public partial class ClashGuardian : Form
 
     static readonly string[] UU_WATCHER_TARGET_PROCESS_NAMES = new string[] {
         "steam.exe", "steamwebhelper.exe", "tslgame.exe"
+    };
+    static readonly string[] UU_WATCHER_PUBG_PROCESS_NAMES = new string[] {
+        "tslgame.exe"
+    };
+    static readonly string[] UU_WATCHER_HARD_ISOLATION_PROCESS_NAMES = new string[] {
+        "tslgame.exe"
     };
     static readonly string[] UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES = new string[] {
         "tslgame.exe"
@@ -1782,6 +1790,28 @@ public partial class ClashGuardian : Form
         public int SynSent = 0;
     }
 
+    class UuWatcherHealthSnapshot {
+        public bool UuRaw = false;
+        public bool UuStable = false;
+        public bool UuDetected = false;
+        public int TargetProcessCount = 0;
+        public string TargetProcesses = "";
+        public string Mode = "NORMAL";
+        public string DesiredMode = "NORMAL";
+        public bool IsAdmin = false;
+        public bool RequireAdmin = false;
+        public string RouteNow = "";
+        public int Steam7897Hits = 0;
+        public int Tsl7897Hits = 0;
+        public int ProxyLeakCount = 0;
+        public bool HardIsolationUnavailable = false;
+        public bool RollbackPending = false;
+        public int RetryCount = 0;
+        public string NextRetryAt = "";
+        public bool Effective = false;
+        public string Verdict = "UU_NOT_DETECTED";
+    }
+
     class UuWatcherContext {
         public string RootDir = "";
         public string StateFile = "";
@@ -1801,10 +1831,14 @@ public partial class ClashGuardian : Form
         public DateTime LastHeartbeatAt = DateTime.MinValue;
         public DateTime LastAdminRequiredAlertAt = DateTime.MinValue;
         public DateTime LastLocal7897SignalAt = DateTime.MinValue;
+        public DateTime LastTakeoverResidualDrainAt = DateTime.MinValue;
         public DateTime LastProxyLeakSignalAt = DateTime.MinValue;
         public string LastFirewallSignature = "";
         public string LastTakeoverDrainSwitchId = "";
         public string LastTakeoverCompSwitchId = "";
+        public DateTime LastHealthLogAt = DateTime.MinValue;
+        public string LastHealthDigest = "";
+        public string LastHealthVerdict = "";
         public bool QuarantineActive = false;
         public EventWaitHandle StopEvent = null;
     }
@@ -2231,14 +2265,45 @@ public partial class ClashGuardian : Form
             psi.RedirectStandardError = true;
             using (Process p = Process.Start(psi)) {
                 if (p == null) return false;
-                try { p.WaitForExit(timeoutMs); } catch { /* ignore */ }
-                try {
-                    if (!p.HasExited) {
-                        try { p.Kill(); } catch { /* ignore */ }
+                StringBuilder outSb = new StringBuilder();
+                StringBuilder errSb = new StringBuilder();
+                object outLock = new object();
+                object errLock = new object();
+                using (ManualResetEvent outDone = new ManualResetEvent(false))
+                using (ManualResetEvent errDone = new ManualResetEvent(false)) {
+                    p.OutputDataReceived += delegate (object sender, DataReceivedEventArgs e) {
+                        if (e.Data == null) { outDone.Set(); return; }
+                        lock (outLock) { outSb.AppendLine(e.Data); }
+                    };
+                    p.ErrorDataReceived += delegate (object sender, DataReceivedEventArgs e) {
+                        if (e.Data == null) { errDone.Set(); return; }
+                        lock (errLock) { errSb.AppendLine(e.Data); }
+                    };
+
+                    try { p.BeginOutputReadLine(); } catch { outDone.Set(); }
+                    try { p.BeginErrorReadLine(); } catch { errDone.Set(); }
+
+                    bool timedOut = false;
+                    try {
+                        if (!p.WaitForExit(timeoutMs)) timedOut = true;
+                    } catch { timedOut = true; }
+
+                    if (timedOut) {
+                        try { if (!p.HasExited) p.Kill(); } catch { /* ignore */ }
                     }
-                } catch { /* ignore */ }
-                try { stdout = p.StandardOutput.ReadToEnd(); } catch { stdout = ""; }
-                try { stderr = p.StandardError.ReadToEnd(); } catch { stderr = ""; }
+
+                    try { p.WaitForExit(2000); } catch { /* ignore */ }
+                    try { WaitHandle.WaitAll(new WaitHandle[] { outDone, errDone }, 2000); }
+                    catch {
+                        try { outDone.WaitOne(1000); } catch { /* ignore */ }
+                        try { errDone.WaitOne(1000); } catch { /* ignore */ }
+                    }
+
+                    lock (outLock) { stdout = outSb.ToString(); }
+                    lock (errLock) { stderr = errSb.ToString(); }
+
+                    if (timedOut) return false;
+                }
                 if (!p.HasExited) return false;
                 exitCode = p.ExitCode;
                 return true;
@@ -2540,6 +2605,44 @@ public partial class ClashGuardian : Form
         return false;
     }
 
+    static bool ApplyEnvForUuActiveStatic(UuWatcherContext ctx, out string detail) {
+        detail = "";
+        bool ok = ApplyUserProxyEnvironmentStatic(
+            false, "",
+            false, "",
+            false, "",
+            out detail);
+        if (ok) {
+            WriteUuWatcherLog(ctx, "[INFO] ENV_APPLY_UU_ACTIVE mode=clear_proxy_env");
+            NotifyUserEnvironmentChangedStatic(ctx);
+        }
+        return ok;
+    }
+
+    static bool IsLoopback7897ProxyValueStatic(string value) {
+        string v = (value ?? "").Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(v)) return false;
+        if (v.IndexOf("127.0.0.1:7897", StringComparison.Ordinal) >= 0) return true;
+        if (v.IndexOf("localhost:7897", StringComparison.Ordinal) >= 0) return true;
+        return false;
+    }
+
+    static void EnsureEnvGuardForUuActiveStatic(UuWatcherContext ctx) {
+        bool httpExists; string httpValue;
+        bool httpsExists; string httpsValue;
+        GetUserEnvironmentValueStatic(UU_WATCHER_ENV_HTTP_PROXY, out httpExists, out httpValue);
+        GetUserEnvironmentValueStatic(UU_WATCHER_ENV_HTTPS_PROXY, out httpsExists, out httpsValue);
+
+        bool needsGuard = false;
+        if (httpExists && IsLoopback7897ProxyValueStatic(httpValue)) needsGuard = true;
+        if (httpsExists && IsLoopback7897ProxyValueStatic(httpsValue)) needsGuard = true;
+        if (!needsGuard) return;
+
+        string detail;
+        bool ok = ApplyEnvForUuActiveStatic(ctx, out detail);
+        if (!ok) WriteUuWatcherLog(ctx, "[WARN] ENV_GUARD_UU_ACTIVE_FAILED detail=" + detail);
+    }
+
     static bool IsInvalidProxyOverrideTokenStatic(string item) {
         if (string.IsNullOrEmpty(item)) return true;
         string k = item.Trim().ToLowerInvariant();
@@ -2584,10 +2687,177 @@ public partial class ClashGuardian : Form
         }
     }
 
-    static List<string> GetRunningTargetProgramPathsStatic() {
+    static void AddUniqueDirectoryIfExistsStatic(Dictionary<string, string> set, string path) {
+        if (set == null || string.IsNullOrEmpty(path)) return;
+        string p = (path ?? "").Trim().Trim('"').Replace('/', '\\');
+        if (string.IsNullOrEmpty(p)) return;
+        try { p = Path.GetFullPath(p); } catch { /* ignore */ }
+        if (!Directory.Exists(p)) return;
+        if (!set.ContainsKey(p)) set[p] = p;
+    }
+
+    static void AddUniqueFileIfExistsStatic(Dictionary<string, string> set, string path) {
+        if (set == null || string.IsNullOrEmpty(path)) return;
+        string p = (path ?? "").Trim().Trim('"').Replace('/', '\\');
+        if (string.IsNullOrEmpty(p)) return;
+        try { p = Path.GetFullPath(p); } catch { /* ignore */ }
+        if (!File.Exists(p)) return;
+        if (!set.ContainsKey(p)) set[p] = p;
+    }
+
+    static string TryExtractQuotedFieldValueStatic(string line, string key) {
+        if (string.IsNullOrEmpty(line) || string.IsNullOrEmpty(key)) return "";
+        string[] parts = line.Split('"');
+        for (int i = 1; i + 2 < parts.Length; i++) {
+            if (!string.Equals(parts[i], key, StringComparison.OrdinalIgnoreCase)) continue;
+            string v = parts[i + 2];
+            if (string.IsNullOrEmpty(v)) return "";
+            return v.Trim().Replace("\\\\", "\\");
+        }
+        return "";
+    }
+
+    static void AddSteamRootCandidatesStatic(Dictionary<string, string> roots) {
+        if (roots == null) return;
+
+        try {
+            Process[] procs = Process.GetProcessesByName("steam");
+            if (procs != null) {
+                for (int i = 0; i < procs.Length; i++) {
+                    Process p = procs[i];
+                    try {
+                        string exe = "";
+                        try { exe = p.MainModule.FileName; } catch { exe = ""; }
+                        if (!string.IsNullOrEmpty(exe)) {
+                            string dir = "";
+                            try { dir = Path.GetDirectoryName(exe); } catch { dir = ""; }
+                            AddUniqueDirectoryIfExistsStatic(roots, dir);
+                        }
+                    } finally { p.Dispose(); }
+                }
+            }
+        } catch { /* ignore */ }
+
+        try {
+            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam", false)) {
+                if (rk != null) {
+                    object v = rk.GetValue("SteamPath");
+                    if (v != null) AddUniqueDirectoryIfExistsStatic(roots, v.ToString());
+                }
+            }
+        } catch { /* ignore */ }
+    }
+
+    static void AddSteamLibraryDirsFromRootStatic(Dictionary<string, string> libraries, string steamRoot) {
+        if (libraries == null || string.IsNullOrEmpty(steamRoot)) return;
+        AddUniqueDirectoryIfExistsStatic(libraries, steamRoot);
+
+        string libraryFile = "";
+        try { libraryFile = Path.Combine(steamRoot, "steamapps", "libraryfolders.vdf"); } catch { libraryFile = ""; }
+        if (string.IsNullOrEmpty(libraryFile) || !File.Exists(libraryFile)) return;
+
+        try {
+            string[] lines = File.ReadAllLines(libraryFile, Encoding.UTF8);
+            for (int i = 0; i < lines.Length; i++) {
+                string one = lines[i] ?? "";
+                string pathValue = TryExtractQuotedFieldValueStatic(one, "path");
+                if (string.IsNullOrEmpty(pathValue)) continue;
+                AddUniqueDirectoryIfExistsStatic(libraries, pathValue);
+            }
+        } catch {
+            try {
+                string[] lines = File.ReadAllLines(libraryFile);
+                for (int i = 0; i < lines.Length; i++) {
+                    string one = lines[i] ?? "";
+                    string pathValue = TryExtractQuotedFieldValueStatic(one, "path");
+                    if (string.IsNullOrEmpty(pathValue)) continue;
+                    AddUniqueDirectoryIfExistsStatic(libraries, pathValue);
+                }
+            } catch { /* ignore */ }
+        }
+    }
+
+    static string ReadPubgInstallDirFromManifestStatic(string manifestPath) {
+        if (string.IsNullOrEmpty(manifestPath) || !File.Exists(manifestPath)) return "PUBG";
+        string installDir = "PUBG";
+        try {
+            string[] lines = File.ReadAllLines(manifestPath, Encoding.UTF8);
+            for (int i = 0; i < lines.Length; i++) {
+                string one = lines[i] ?? "";
+                string value = TryExtractQuotedFieldValueStatic(one, "installdir");
+                if (!string.IsNullOrEmpty(value)) {
+                    installDir = value;
+                    break;
+                }
+            }
+        } catch {
+            try {
+                string[] lines = File.ReadAllLines(manifestPath);
+                for (int i = 0; i < lines.Length; i++) {
+                    string one = lines[i] ?? "";
+                    string value = TryExtractQuotedFieldValueStatic(one, "installdir");
+                    if (!string.IsNullOrEmpty(value)) {
+                        installDir = value;
+                        break;
+                    }
+                }
+            } catch { /* ignore */ }
+        }
+        return string.IsNullOrEmpty(installDir) ? "PUBG" : installDir;
+    }
+
+    static bool ContainsProcessNameStatic(string[] processNames, string expected) {
+        if (processNames == null || processNames.Length == 0 || string.IsNullOrEmpty(expected)) return false;
+        for (int i = 0; i < processNames.Length; i++) {
+            string one = processNames[i];
+            if (string.IsNullOrEmpty(one)) continue;
+            if (string.Equals(one, expected, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
+    static void AddKnownFallbackTargetProgramPathsStatic(Dictionary<string, string> set, string[] processNames) {
+        if (set == null) return;
+        bool needSteam = ContainsProcessNameStatic(processNames, "steam.exe");
+        bool needSteamWebHelper = ContainsProcessNameStatic(processNames, "steamwebhelper.exe");
+        bool needTslGame = ContainsProcessNameStatic(processNames, "tslgame.exe");
+        if (!needSteam && !needSteamWebHelper && !needTslGame) return;
+
+        Dictionary<string, string> steamRoots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        AddSteamRootCandidatesStatic(steamRoots);
+        if (steamRoots.Count == 0) return;
+
+        Dictionary<string, string> libraries = needTslGame
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : null;
+        foreach (KeyValuePair<string, string> kv in steamRoots) {
+            string root = kv.Value;
+            if (string.IsNullOrEmpty(root)) continue;
+            if (needTslGame) AddSteamLibraryDirsFromRootStatic(libraries, root);
+            if (needSteam) AddUniqueFileIfExistsStatic(set, Path.Combine(root, "steam.exe"));
+            if (needSteamWebHelper) {
+                AddUniqueFileIfExistsStatic(set, Path.Combine(root, "bin", "cef", "cef.win7x64", "steamwebhelper.exe"));
+                AddUniqueFileIfExistsStatic(set, Path.Combine(root, "bin", "cef", "cef.win7", "steamwebhelper.exe"));
+            }
+        }
+
+        if (!needTslGame || libraries == null) return;
+        foreach (KeyValuePair<string, string> kv in libraries) {
+            string lib = kv.Value;
+            if (string.IsNullOrEmpty(lib)) continue;
+            string manifest = "";
+            try { manifest = Path.Combine(lib, "steamapps", "appmanifest_578080.acf"); } catch { manifest = ""; }
+            string installDir = ReadPubgInstallDirFromManifestStatic(manifest);
+            AddUniqueFileIfExistsStatic(set, Path.Combine(lib, "steamapps", "common", installDir, "TslGame", "Binaries", "Win64", "TslGame.exe"));
+            AddUniqueFileIfExistsStatic(set, Path.Combine(lib, "steamapps", "common", "PUBG", "TslGame", "Binaries", "Win64", "TslGame.exe"));
+        }
+    }
+
+    static List<string> GetRunningTargetProgramPathsStatic(string[] processNames) {
         Dictionary<string, string> set = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        for (int i = 0; i < UU_WATCHER_TARGET_PROCESS_NAMES.Length; i++) {
-            string procName = UU_WATCHER_TARGET_PROCESS_NAMES[i];
+        if (processNames != null) for (int i = 0; i < processNames.Length; i++) {
+            string procName = processNames[i];
+            if (string.IsNullOrEmpty(procName)) continue;
             string baseName = procName;
             if (baseName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) baseName = baseName.Substring(0, baseName.Length - 4);
             try {
@@ -2596,11 +2866,12 @@ public partial class ClashGuardian : Form
                     try {
                         string path = "";
                         try { path = p.MainModule.FileName; } catch { path = ""; }
-                        if (!string.IsNullOrEmpty(path) && !set.ContainsKey(path)) set[path] = path;
+                        AddUniqueFileIfExistsStatic(set, path);
                     } finally { p.Dispose(); }
                 }
             } catch { /* ignore */ }
         }
+        AddKnownFallbackTargetProgramPathsStatic(set, processNames);
         List<string> result = new List<string>();
         foreach (var kv in set) result.Add(kv.Value);
         return result;
@@ -2608,7 +2879,7 @@ public partial class ClashGuardian : Form
 
     static List<UuWatcherFirewallRuleDef> BuildDynamicIsolationRuleDefinitionsStatic() {
         List<UuWatcherFirewallRuleDef> defs = new List<UuWatcherFirewallRuleDef>();
-        List<string> paths = GetRunningTargetProgramPathsStatic();
+        List<string> paths = GetRunningTargetProgramPathsStatic(UU_WATCHER_HARD_ISOLATION_PROCESS_NAMES);
         for (int p = 0; p < paths.Count; p++) {
             string path = paths[p];
             string file = "";
@@ -2659,7 +2930,39 @@ public partial class ClashGuardian : Form
             + " stderr=\"" + CompactCommandOutputForLogStatic(stderr, 240) + "\"";
     }
 
+    static string EscapePowerShellSingleQuotedStringStatic(string value) {
+        if (value == null) return "";
+        return value.Replace("'", "''");
+    }
+
+    static bool TryDeleteWatcherFirewallRulesByPrefixWithDiagStatic(out string failDiag) {
+        failDiag = "";
+        string prefixPattern = EscapePowerShellSingleQuotedStringStatic(UU_WATCHER_FIREWALL_RULE_PREFIX + ".*");
+        string script = "$ErrorActionPreference='Stop';" +
+                        "$rules=Get-NetFirewallRule -DisplayName '" + prefixPattern + "' -ErrorAction SilentlyContinue;" +
+                        "if($rules){$rules | Remove-NetFirewallRule -ErrorAction Stop | Out-Null}";
+        string encoded = "";
+        try {
+            encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+        } catch (Exception ex) {
+            failDiag = "encode_failed: " + ex.Message;
+            return false;
+        }
+
+        string args = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded;
+        int code;
+        string stdout;
+        string stderr;
+        bool launched = RunProcessCaptureStatic("powershell.exe", args, 12000, out code, out stdout, out stderr);
+        if (launched && code == 0) return true;
+        failDiag = BuildCommandDiagForLogStatic("powershell.exe", "-NoProfile -ExecutionPolicy Bypass -EncodedCommand <redacted>", code, stdout, stderr, launched);
+        return false;
+    }
+
     static bool DeleteWatcherFirewallRuleGroupStatic() {
+        string prefixDiag;
+        if (TryDeleteWatcherFirewallRulesByPrefixWithDiagStatic(out prefixDiag)) return true;
+
         int code;
         bool launched = RunProcessHiddenStatic("netsh.exe", "advfirewall firewall delete rule name=all group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"", 10000, out code);
         if (!launched) return false;
@@ -2675,8 +2978,7 @@ public partial class ClashGuardian : Form
                       "program=\"" + def.Program + "\" " +
                       "protocol=" + def.Protocol + " " +
                       "remoteip=" + UU_WATCHER_LOCAL_PROXY_ADDRESS + " " +
-                      "remoteport=" + UU_WATCHER_LOCAL_PROXY_PORT + " " +
-                      "group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"";
+                      "remoteport=" + UU_WATCHER_LOCAL_PROXY_PORT;
         int code;
         bool launched = RunProcessHiddenStatic("netsh.exe", args, 10000, out code);
         if (!launched) return false;
@@ -2695,14 +2997,18 @@ public partial class ClashGuardian : Form
     static bool TryResetWatcherFirewallRulesWithDiagStatic(List<UuWatcherFirewallRuleDef> defs, out string failDiag) {
         failDiag = "";
 
-        string deleteArgs = "advfirewall firewall delete rule name=all group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"";
-        int deleteCode;
-        string deleteOut;
-        string deleteErr;
-        bool deleteLaunched = RunProcessCaptureStatic("netsh.exe", deleteArgs, 10000, out deleteCode, out deleteOut, out deleteErr);
-        if (!deleteLaunched || (deleteCode != 0 && deleteCode != 1)) {
-            failDiag = BuildCommandDiagForLogStatic("netsh.exe", deleteArgs, deleteCode, deleteOut, deleteErr, deleteLaunched);
-            return false;
+        string prefixDeleteDiag;
+        bool deletedByPrefix = TryDeleteWatcherFirewallRulesByPrefixWithDiagStatic(out prefixDeleteDiag);
+        if (!deletedByPrefix) {
+            string deleteArgs = "advfirewall firewall delete rule name=all group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"";
+            int deleteCode;
+            string deleteOut;
+            string deleteErr;
+            bool deleteLaunched = RunProcessCaptureStatic("netsh.exe", deleteArgs, 10000, out deleteCode, out deleteOut, out deleteErr);
+            if (!deleteLaunched || (deleteCode != 0 && deleteCode != 1)) {
+                failDiag = "prefixDelete=" + prefixDeleteDiag + " ; " + BuildCommandDiagForLogStatic("netsh.exe", deleteArgs, deleteCode, deleteOut, deleteErr, deleteLaunched);
+                return false;
+            }
         }
 
         if (defs == null || defs.Count == 0) return true;
@@ -2716,8 +3022,7 @@ public partial class ClashGuardian : Form
                              "program=\"" + def.Program + "\" " +
                              "protocol=" + def.Protocol + " " +
                              "remoteip=" + UU_WATCHER_LOCAL_PROXY_ADDRESS + " " +
-                             "remoteport=" + UU_WATCHER_LOCAL_PROXY_PORT + " " +
-                             "group=\"" + UU_WATCHER_FIREWALL_RULE_GROUP + "\"";
+                             "remoteport=" + UU_WATCHER_LOCAL_PROXY_PORT;
 
             int addCode;
             string addOut;
@@ -2820,7 +3125,7 @@ public partial class ClashGuardian : Form
 
         int code;
         string stdout, stderr;
-        if (!RunProcessCaptureStatic("netstat.exe", "-ano -p tcp", 5000, out code, out stdout, out stderr)) return result;
+        if (!RunProcessCaptureStatic("netstat.exe", "-ano -p tcp", 10000, out code, out stdout, out stderr)) return result;
         if (code != 0 || string.IsNullOrEmpty(stdout)) return result;
 
         Dictionary<string, UuWatcherLocalProxySignal> agg = new Dictionary<string, UuWatcherLocalProxySignal>(StringComparer.OrdinalIgnoreCase);
@@ -2861,7 +3166,7 @@ public partial class ClashGuardian : Form
     }
 
     static void EmitLocalProxyFaultSignalsStatic(UuWatcherContext ctx) {
-        List<UuWatcherLocalProxySignal> hits = GetLocalProxyFaultSignalsStatic(ctx, UU_WATCHER_TARGET_PROCESS_NAMES);
+        List<UuWatcherLocalProxySignal> hits = GetLocalProxyFaultSignalsStatic(ctx, UU_WATCHER_PUBG_PROCESS_NAMES);
         if (hits.Count == 0) return;
 
         DateTime now = DateTime.Now;
@@ -2923,7 +3228,7 @@ public partial class ClashGuardian : Form
     }
 
     static void EmitProxyChainLeakSignalsStatic(UuWatcherContext ctx) {
-        List<UuWatcherLeakConn> leaks = GetMihomoProxyLeakConnectionsStatic(ctx, UU_WATCHER_TARGET_PROCESS_NAMES);
+        List<UuWatcherLeakConn> leaks = GetMihomoProxyLeakConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES);
         if (leaks.Count == 0) return;
 
         DateTime now = DateTime.Now;
@@ -2983,6 +3288,29 @@ public partial class ClashGuardian : Form
         }
     }
 
+    static void DrainUuTakeoverResidualConnectionsStatic(UuWatcherContext ctx, UuWatcherState state, bool force) {
+        if (ctx == null) return;
+        DateTime now = DateTime.Now;
+        if (!force && (now - ctx.LastTakeoverResidualDrainAt).TotalSeconds < UU_WATCHER_TAKEOVER_RESIDUAL_DRAIN_MIN_INTERVAL_SECONDS) return;
+
+        List<UuWatcherLocalProxySignal> hits = GetLocalProxyFaultSignalsStatic(ctx, UU_WATCHER_TARGET_PROCESS_NAMES);
+        int steam7897 = CountLocalProxyFaultForProcessesStatic(hits, "steam.exe", "steamwebhelper.exe");
+        int tsl7897 = CountLocalProxyFaultForProcessesStatic(hits, "tslgame.exe");
+        if (tsl7897 <= 0) return;
+
+        int total;
+        int closed = DrainMihomoTargetConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES, UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION, false, out total);
+        ctx.LastTakeoverResidualDrainAt = now;
+        WriteUuWatcherLog(ctx, "[WARN] UU_TAKEOVER_RESIDUAL_DRAIN switchId=" + (state == null ? "" : state.SwitchId)
+            + " steam7897Before=" + steam7897
+            + " tsl7897Before=" + tsl7897
+            + " closed=" + closed
+            + " total=" + total
+            + " limit=" + UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION
+            + " force=" + (force ? "1" : "0")
+            + " scope=tslgame.exe");
+    }
+
     static int CountLocalProxyFaultForProcessesStatic(List<UuWatcherLocalProxySignal> hits, params string[] processes) {
         if (hits == null || hits.Count == 0 || processes == null || processes.Length == 0) return 0;
         int total = 0;
@@ -3002,13 +3330,153 @@ public partial class ClashGuardian : Form
         return total;
     }
 
+    static string BuildTargetProcessesSummaryStatic(Dictionary<int, string> pidMap, out int processCount) {
+        processCount = 0;
+        if (pidMap == null || pidMap.Count == 0) return "-";
+
+        processCount = pidMap.Count;
+        Dictionary<string, int> byName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (KeyValuePair<int, string> kv in pidMap) {
+            string proc = kv.Value ?? "";
+            if (string.IsNullOrEmpty(proc)) proc = "unknown";
+            int n;
+            if (!byName.TryGetValue(proc, out n)) n = 0;
+            byName[proc] = n + 1;
+        }
+
+        List<string> names = new List<string>(byName.Keys);
+        names.Sort(StringComparer.OrdinalIgnoreCase);
+        List<string> parts = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            string name = names[i];
+            parts.Add(name + ":" + byName[name]);
+        }
+        return parts.Count > 0 ? string.Join(",", parts.ToArray()) : "-";
+    }
+
+    static string EvaluateUuEffectVerdictStatic(UuWatcherHealthSnapshot s) {
+        if (s == null) return "UU_NOT_DETECTED";
+        if (s.UuStable && !s.IsAdmin) return "ADMIN_REQUIRED";
+        if (!s.UuStable) return "UU_NOT_DETECTED";
+        if (s.TargetProcessCount <= 0) return "NO_TARGET_PROCESS";
+        if (!string.Equals(s.Mode, "UU_ACTIVE", StringComparison.OrdinalIgnoreCase)) return "MODE_NOT_UU_ACTIVE";
+        if (!string.Equals(s.RouteNow, "DIRECT", StringComparison.OrdinalIgnoreCase)) return "ROUTE_NOT_DIRECT";
+        if (s.Tsl7897Hits > 0) return "LOCAL_7897_RESIDUAL";
+        if (s.ProxyLeakCount > 0) return "PROXY_CHAIN_LEAK";
+        return "EFFECTIVE";
+    }
+
+    static UuWatcherHealthSnapshot CollectUuHealthSnapshotStatic(UuWatcherContext ctx, UuWatcherState state, bool uuRaw, bool uuStable) {
+        UuWatcherHealthSnapshot s = new UuWatcherHealthSnapshot();
+        s.UuRaw = uuRaw;
+        s.UuStable = uuStable;
+        s.UuDetected = uuStable;
+        if (state != null) {
+            s.Mode = state.Mode ?? "NORMAL";
+            s.DesiredMode = state.DesiredMode ?? "NORMAL";
+            s.HardIsolationUnavailable = state.HardIsolationUnavailable;
+            s.RollbackPending = state.RollbackPending;
+            s.RetryCount = state.RetryCount;
+            s.NextRetryAt = state.NextRetryAt ?? "";
+        }
+        if (ctx != null) s.IsAdmin = ctx.IsAdmin;
+        s.RequireAdmin = s.UuStable && !s.IsAdmin;
+
+        Dictionary<int, string> pidMap = GetTargetProcessPidMapStatic(UU_WATCHER_PUBG_PROCESS_NAMES);
+        s.TargetProcesses = BuildTargetProcessesSummaryStatic(pidMap, out s.TargetProcessCount);
+
+        if (ctx != null) {
+            string routeNow = UuGetRouteNow(ctx);
+            s.RouteNow = string.IsNullOrEmpty(routeNow) ? "--" : routeNow;
+            List<UuWatcherLocalProxySignal> hits = GetLocalProxyFaultSignalsStatic(ctx, UU_WATCHER_TARGET_PROCESS_NAMES);
+            s.Steam7897Hits = CountLocalProxyFaultForProcessesStatic(hits, "steam.exe", "steamwebhelper.exe");
+            s.Tsl7897Hits = CountLocalProxyFaultForProcessesStatic(hits, "tslgame.exe");
+            List<UuWatcherLeakConn> proxyLeaks = GetMihomoProxyLeakConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES);
+            s.ProxyLeakCount = proxyLeaks == null ? 0 : proxyLeaks.Count;
+        } else {
+            s.RouteNow = "--";
+        }
+
+        s.Verdict = EvaluateUuEffectVerdictStatic(s);
+        s.Effective = string.Equals(s.Verdict, "EFFECTIVE", StringComparison.OrdinalIgnoreCase);
+        return s;
+    }
+
+    static string BuildUuHealthDigestStatic(UuWatcherHealthSnapshot s) {
+        if (s == null) return "";
+        return (s.Verdict ?? "") + "|"
+            + (s.Effective ? "1" : "0") + "|"
+            + (s.UuDetected ? "1" : "0") + "|"
+            + (s.UuRaw ? "1" : "0") + "|"
+            + (s.UuStable ? "1" : "0") + "|"
+            + s.TargetProcessCount + "|"
+            + (s.TargetProcesses ?? "") + "|"
+            + (s.Mode ?? "") + "|"
+            + (s.DesiredMode ?? "") + "|"
+            + (s.RouteNow ?? "") + "|"
+            + s.Steam7897Hits + "|"
+            + s.Tsl7897Hits + "|"
+            + s.ProxyLeakCount + "|"
+            + (s.IsAdmin ? "1" : "0") + "|"
+            + (s.RequireAdmin ? "1" : "0") + "|"
+            + (s.HardIsolationUnavailable ? "1" : "0") + "|"
+            + (s.RollbackPending ? "1" : "0") + "|"
+            + s.RetryCount + "|"
+            + (s.NextRetryAt ?? "");
+    }
+
+    static void EmitUuHealthLogStatic(UuWatcherContext ctx, UuWatcherHealthSnapshot s, string reason, bool force) {
+        if (ctx == null || s == null) return;
+        if (string.IsNullOrEmpty(reason)) reason = "loop";
+        string digest = BuildUuHealthDigestStatic(s);
+        DateTime now = DateTime.Now;
+        bool verdictChanged = !string.Equals(ctx.LastHealthVerdict ?? "", s.Verdict ?? "", StringComparison.Ordinal);
+        bool digestChanged = !string.Equals(ctx.LastHealthDigest ?? "", digest, StringComparison.Ordinal);
+        bool intervalDue = ctx.LastHealthLogAt == DateTime.MinValue
+            || (now - ctx.LastHealthLogAt).TotalSeconds >= UU_WATCHER_HEALTH_LOG_INTERVAL_SECONDS;
+
+        if (!force && !verdictChanged && !digestChanged && !intervalDue) return;
+
+        string targets = string.IsNullOrEmpty(s.TargetProcesses) ? "-" : s.TargetProcesses;
+        string routeNow = string.IsNullOrEmpty(s.RouteNow) ? "--" : s.RouteNow;
+        string nextRetryAt = string.IsNullOrEmpty(s.NextRetryAt) ? "--" : s.NextRetryAt;
+        string mode = string.IsNullOrEmpty(s.Mode) ? "--" : s.Mode;
+        string desiredMode = string.IsNullOrEmpty(s.DesiredMode) ? "--" : s.DesiredMode;
+        string verdict = string.IsNullOrEmpty(s.Verdict) ? "UU_NOT_DETECTED" : s.Verdict;
+        WriteUuWatcherLog(ctx, "[HEALTH] UU_MONITOR_HEALTH"
+            + " reason=" + reason
+            + " verdict=" + verdict
+            + " effective=" + (s.Effective ? "1" : "0")
+            + " detected=" + (s.UuDetected ? "1" : "0")
+            + " uuRaw=" + (s.UuRaw ? "1" : "0")
+            + " uuStable=" + (s.UuStable ? "1" : "0")
+            + " targetCount=" + s.TargetProcessCount
+            + " targets=" + targets
+            + " mode=" + mode
+            + " desired=" + desiredMode
+            + " routeNow=" + routeNow
+            + " steam7897=" + s.Steam7897Hits
+            + " tsl7897=" + s.Tsl7897Hits
+            + " proxyLeak=" + s.ProxyLeakCount
+            + " admin=" + (s.IsAdmin ? "1" : "0")
+            + " requireAdmin=" + (s.RequireAdmin ? "1" : "0")
+            + " hardIsolationUnavailable=" + (s.HardIsolationUnavailable ? "1" : "0")
+            + " rollbackPending=" + (s.RollbackPending ? "1" : "0")
+            + " retryCount=" + s.RetryCount
+            + " nextRetryAt=" + nextRetryAt);
+
+        ctx.LastHealthLogAt = now;
+        ctx.LastHealthDigest = digest;
+        ctx.LastHealthVerdict = verdict;
+    }
+
     static void RunUuTakeoverOneShotDrainStatic(UuWatcherContext ctx, UuWatcherState state) {
         string switchId = state.SwitchId ?? "";
         if (string.IsNullOrEmpty(switchId)) return;
 
         if (!string.Equals(ctx.LastTakeoverDrainSwitchId, switchId, StringComparison.Ordinal)) {
             int oneShotTotal;
-            int oneShotClosed = DrainMihomoTargetConnectionsStatic(ctx, UU_WATCHER_TARGET_PROCESS_NAMES, UU_WATCHER_TAKEOVER_DRAIN_MAX_ON_ENTER, false, out oneShotTotal);
+            int oneShotClosed = DrainMihomoTargetConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES, UU_WATCHER_TAKEOVER_DRAIN_MAX_ON_ENTER, false, out oneShotTotal);
             ctx.LastTakeoverDrainSwitchId = switchId;
             WriteUuWatcherLog(ctx, "[INFO] UU_TAKEOVER_ONE_SHOT_DRAIN switchId=" + switchId + " phase=initial closed=" + oneShotClosed + " total=" + oneShotTotal + " limit=" + UU_WATCHER_TAKEOVER_DRAIN_MAX_ON_ENTER + " proxyOnly=false");
             Thread.Sleep(UU_WATCHER_TAKEOVER_RECHECK_DELAY_MS);
@@ -3018,9 +3486,9 @@ public partial class ClashGuardian : Form
         int steam7897 = CountLocalProxyFaultForProcessesStatic(hits, "steam.exe", "steamwebhelper.exe");
         int tsl7897 = CountLocalProxyFaultForProcessesStatic(hits, "tslgame.exe");
 
-        if (steam7897 > 0 && !string.Equals(ctx.LastTakeoverCompSwitchId, switchId, StringComparison.Ordinal)) {
+        if (tsl7897 > 0 && !string.Equals(ctx.LastTakeoverCompSwitchId, switchId, StringComparison.Ordinal)) {
             int compTotal;
-            int compClosed = DrainMihomoTargetConnectionsStatic(ctx, UU_WATCHER_TARGET_PROCESS_NAMES, UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION, false, out compTotal);
+            int compClosed = DrainMihomoTargetConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES, UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION, false, out compTotal);
             ctx.LastTakeoverCompSwitchId = switchId;
             WriteUuWatcherLog(ctx, "[INFO] UU_TAKEOVER_ONE_SHOT_DRAIN switchId=" + switchId + " phase=compensation closed=" + compClosed + " total=" + compTotal + " limit=" + UU_WATCHER_TAKEOVER_DRAIN_MAX_COMPENSATION + " steam7897Before=" + steam7897 + " tsl7897Before=" + tsl7897 + " proxyOnly=false");
             Thread.Sleep(UU_WATCHER_TAKEOVER_RECHECK_DELAY_MS);
@@ -3030,7 +3498,7 @@ public partial class ClashGuardian : Form
             tsl7897 = CountLocalProxyFaultForProcessesStatic(hits, "tslgame.exe");
         }
 
-        if (steam7897 > 0) {
+        if (tsl7897 > 0) {
             string routeNow = UuGetRouteNow(ctx);
             WriteUuWatcherLog(ctx, "[ALERT] STEAM_UU_TAKEOVER_NOT_COMPLETE switchId=" + switchId
                 + " steam7897Count=" + steam7897
@@ -3150,6 +3618,11 @@ public partial class ClashGuardian : Form
         WriteUuWatcherLog(ctx, "[INFO] ENTER_BEGIN switchId=" + switchId);
 
         EnsureEnterSnapshotStatic(ctx, state);
+        string envApplyDetail;
+        bool envApplyOk = ApplyEnvForUuActiveStatic(ctx, out envApplyDetail);
+        if (!envApplyOk) {
+            WriteUuWatcherLog(ctx, "[WARN] ENV_APPLY_UU_ACTIVE_FAILED detail=" + envApplyDetail);
+        }
         bool routeOk = UuSetRouteNow(ctx, "DIRECT");
         int proxyEnable; string proxyServer; string proxyOverride;
         GetProxySettingsStatic(out proxyEnable, out proxyServer, out proxyOverride);
@@ -3165,7 +3638,7 @@ public partial class ClashGuardian : Form
         state.RetryCount = 0;
         state.NextRetryAt = "";
         SaveUuWatcherState(ctx, state);
-        WriteUuWatcherLog(ctx, "[INFO] ENTER_DONE switchId=" + switchId + " routeOk=" + routeOk + " overrideOk=" + overrideOk + " hardIsolationOk=" + hardOk);
+        WriteUuWatcherLog(ctx, "[INFO] ENTER_DONE switchId=" + switchId + " routeOk=" + routeOk + " overrideOk=" + overrideOk + " hardIsolationOk=" + hardOk + " envApplyOk=" + envApplyOk);
     }
 
     static bool TryCompleteExitRollbackStatic(UuWatcherContext ctx, UuWatcherState state, string source) {
@@ -3313,6 +3786,8 @@ public partial class ClashGuardian : Form
         if (!force && (now - ctx.LastPolicyEnforceAt).TotalSeconds < UU_WATCHER_POLICY_INTERVAL_SECONDS) return;
         ctx.LastPolicyEnforceAt = now;
 
+        EnsureEnvGuardForUuActiveStatic(ctx);
+
         string routeNow = UuGetRouteNow(ctx);
         if (!string.IsNullOrEmpty(routeNow) && !string.Equals(routeNow, "DIRECT", StringComparison.OrdinalIgnoreCase)) {
             WriteUuWatcherLog(ctx, "[WARN] policy correction route " + routeNow + " -> DIRECT");
@@ -3330,6 +3805,7 @@ public partial class ClashGuardian : Form
         EnsureHardIsolationRulesForRunningTargetsStatic(ctx, state);
         EmitLocalProxyFaultSignalsStatic(ctx);
         EmitProxyChainLeakSignalsStatic(ctx);
+        DrainUuTakeoverResidualConnectionsStatic(ctx, state, false);
         DrainMihomoProxyLeakConnectionsStatic(ctx, UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES, false);
     }
 
@@ -3470,6 +3946,12 @@ public partial class ClashGuardian : Form
             DateTime uuRawChangedAt = DateTime.Now;
             bool uuStable = uuRaw;
             InvokeUuReconcileStatic(ctx, state, uuStable, "startup", true);
+            try {
+                UuWatcherHealthSnapshot startupHealth = CollectUuHealthSnapshotStatic(ctx, state, uuRaw, uuStable);
+                EmitUuHealthLogStatic(ctx, startupHealth, "startup", true);
+            } catch (Exception ex) {
+                WriteUuWatcherLog(ctx, "[WARN] health snapshot failed reason=startup detail=" + ex.Message);
+            }
 
             DateTime lastLoopAt = DateTime.Now;
             bool stopRequested = false;
@@ -3484,6 +3966,7 @@ public partial class ClashGuardian : Form
                     }
                     lastLoopAt = now;
 
+                    bool stableChanged = false;
                     bool currentRaw = TestUuRunningStatic();
                     if (currentRaw != uuRaw) {
                         uuRaw = currentRaw;
@@ -3493,6 +3976,7 @@ public partial class ClashGuardian : Form
                     if (uuStable != uuRaw) {
                         if ((DateTime.Now - uuRawChangedAt).TotalSeconds >= UU_WATCHER_DEBOUNCE_SECONDS) {
                             uuStable = uuRaw;
+                            stableChanged = true;
                             WriteUuWatcherLog(ctx, "[INFO] uu stable status changed running=" + uuStable);
                         }
                     }
@@ -3538,6 +4022,13 @@ public partial class ClashGuardian : Form
                             EmitUuHealthAlertsStatic(ctx, state);
                         }
                     }
+
+                    try {
+                        UuWatcherHealthSnapshot health = CollectUuHealthSnapshotStatic(ctx, state, uuRaw, uuStable);
+                        EmitUuHealthLogStatic(ctx, health, stableChanged ? "uu_stable_changed" : "loop", false);
+                    } catch (Exception ex) {
+                        WriteUuWatcherLog(ctx, "[WARN] health snapshot failed reason=loop detail=" + ex.Message);
+                    }
                 } catch (Exception ex) {
                     WriteUuWatcherLog(ctx, "[ERROR] loop exception: " + ex.Message);
                 }
@@ -3559,6 +4050,13 @@ public partial class ClashGuardian : Form
             if (stopRequested) {
                 try { ForceExitOnStopStatic(ctx, state); }
                 catch (Exception ex) { WriteUuWatcherLog(ctx, "[ERROR] STOP_FORCE_EXIT_FAILED detail=" + ex.Message); }
+                try {
+                    bool finalRaw = TestUuRunningStatic();
+                    UuWatcherHealthSnapshot stopHealth = CollectUuHealthSnapshotStatic(ctx, state, finalRaw, finalRaw);
+                    EmitUuHealthLogStatic(ctx, stopHealth, "stop_force_exit", true);
+                } catch (Exception ex) {
+                    WriteUuWatcherLog(ctx, "[WARN] health snapshot failed reason=stop_force_exit detail=" + ex.Message);
+                }
             }
         }
     }

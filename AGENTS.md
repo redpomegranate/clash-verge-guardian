@@ -322,3 +322,76 @@ Get-Process | Where-Object {$_.ProcessName -like "*ClashGuardian*"} | Stop-Proce
 
 1. After every code change, check whether ClashGuardian.exe is running before build.
 2. If running, terminate all ClashGuardian* processes first, then compile.
+
+## UI Toggle Note (2026-02-28)
+
+1. `GetUuRouteButtonText` must use action semantics.
+2. When UU watcher is disabled, show the enable action label; when enabled, show the disable action label.
+3. Detailed runtime health text stays in `GetUuRouteMenuText`.
+
+## Build Lock Recovery Rule (2026-02-28)
+
+1. If `Stop-Process -Force` or `taskkill /F /T` returns `Access is denied` for `ClashGuardian.exe`, use WMI/CIM terminate as fallback.
+2. Suggested commands:
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='ClashGuardian.exe'" | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine
+Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter "ProcessId=<PID>") -MethodName Terminate
+```
+3. Re-check no `ClashGuardian*` process is running, then run standard build:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+## UU Monitor Panel Rule (2026-02-28)
+
+1. Keep the main button grid as `2x3`; UU monitoring must be embedded as a bottom collapsible section in the same main window.
+2. Panel default is collapsed; provide both main-window toggle and tray-menu toggle (`UU????: ??/??`).
+3. After successful UU enable, auto-expand panel once; after UU disable, keep panel available and render disabled state.
+4. Refresh every `2s` with background collection + `BeginInvoke` UI rendering.
+5. Monitor must include: enable/health, heartbeat(lastSeen/age/pid), mode/desiredMode, admin/isolation, rollback chain, and realtime `GAME_STEAM_ROUTE`.
+6. Fault indicators must parse `watcher.log` tail (last 200 lines) and use a 10-minute active window for:
+   `ADMIN_REQUIRED_FOR_UU`, `HARD_ISOLATION_APPLY_FAIL`, `LOCAL_7897_FAULT_SIGNAL`, `PROXY_CHAIN_LEAK_DETECTED`, `STEAM_UU_TAKEOVER_NOT_COMPLETE`.
+7. Do not add new config keys, CLI args, or extra architecture files for this feature.
+8. Expand/collapse toggles are required in both main-window and tray-menu entries regardless of localized label text.
+9. UU monitor labels must use wrapped dynamic layout (`LayoutUuMonitorLabels`) to prevent overlap/clipping.
+10. Main window resize policy: vertical resize allowed, width fixed by min/max width lock.
+11. UU monitor panel should enable scroll when content exceeds visible area.
+12. Expand/collapse must enforce only minimum required height and must not reset user-resized height.
+
+## UU Health Snapshot Log Rule (2026-02-28)
+
+1. Keep UU health observability in `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\watcher.log` only; do not add new config keys or CLI flags.
+2. Emit structured `[HEALTH] UU_MONITOR_HEALTH` logs with strict verdict order:
+   `ADMIN_REQUIRED -> UU_NOT_DETECTED -> NO_TARGET_PROCESS -> MODE_NOT_UU_ACTIVE -> ROUTE_NOT_DIRECT -> LOCAL_7897_RESIDUAL -> PROXY_CHAIN_LEAK -> EFFECTIVE`.
+3. Health sampling cadence is `30s`, with immediate emit on state/verdict change, one forced emit after startup reconcile, and one forced emit after stop-force-exit converge.
+4. Health log fields must include detection, mode/desired, route, local7897 residual, proxy-leak count, admin/isolation, and rollback chain data.
+5. `ExportDiagnostics` must include UU watcher runtime evidence (`state.json`, `heartbeat.json`, `watcher.log`) and write copy status into `summary.txt`.
+## UU Hard-Isolation Compatibility Rule (2026-02-28)
+
+1. Do not rely solely on netsh add-rule group parameters for UU hard isolation, because some environments reject group in add-rule syntax.
+2. Firewall cleanup must prioritize display-name prefix cleanup (ClashGuardian.UUWatcher.Block7897.*) and keep legacy group deletion only as fallback.
+3. Any takeover compensation trigger must treat steam7897 and tsl7897 symmetrically for drain entry (steam7897 > 0 || tsl7897 > 0).
+
+## UU PUBG Takeover Hardening Rule (2026-03-01)
+
+1. LOCAL_7897 detection must avoid command-output truncation; process capture for netstat-like scans must be non-blocking and timeout-safe.
+2. Hard isolation for PUBG must not depend only on runtime MainModule readability; include Steam-library fallback path discovery for app 578080.
+3. In UU_ACTIVE, if local 7897 residual is still detected, run bounded periodic residual drain and emit UU_TAKEOVER_RESIDUAL_DRAIN for diagnosis.
+4. Any hard-isolation refresh must keep PUBG coverage stable and avoid regressions where tslgame rules disappear intermittently.
+## UU Active Env Guard Rule (2026-03-01)
+
+1. On ENTER_UU, watcher must apply temporary user-env proxy guard by clearing HTTP_PROXY/HTTPS_PROXY/NO_PROXY.
+2. On EXIT_UU (or stop-force-exit), watcher must continue restoring env via snapshot/fallback pipeline.
+3. Do not skip WM_SETTINGCHANGE(Environment) broadcast after env writes.
+4. Treat ENV_APPLY_UU_ACTIVE failures as warning-only diagnostics; they must not block state machine progress.
+## UU Active Env Guard Addendum (2026-03-01)
+
+1. In UU_ACTIVE, policy enforcement must periodically verify whether HTTP_PROXY/HTTPS_PROXY still points to 127.0.0.1:7897 (or localhost:7897).
+2. If stale loopback proxy env is detected during UU_ACTIVE, watcher must re-apply env guard automatically.
+3. Re-apply failures must be logged as warning (`ENV_GUARD_UU_ACTIVE_FAILED`) and must not block policy/state-machine flow.
+## UU External-Validation Compatibility Addendum (2026-03-01)
+
+1. To avoid Steam external-provider authentication disruption, UU hard-isolation rule scope must follow UU_WATCHER_HARD_ISOLATION_PROCESS_NAMES (default tslgame.exe only) and must not auto-include Steam binaries via fallback path materialization.
+2. Takeover one-shot drain and residual drain must follow UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES (default tslgame.exe only); Steam residuals remain diagnostic signals and must not trigger forced drain by default.
+3. LOCAL_7897_RESIDUAL verdict gating in health evaluation must use PUBG residual (tsl7897) as the strict blocker for game acceleration effectiveness; steam7897 remains required in logs for observability but is non-gating.
+4. Health snapshot targetCount/targets used for verdicting must align to PUBG acceleration target scope to keep NO_TARGET_PROCESS semantics game-centric.

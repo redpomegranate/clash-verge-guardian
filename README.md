@@ -627,3 +627,125 @@ flowchart TD
 ## License
 
 MIT License
+
+## UI Toggle Note (2026-02-28)
+
+- Main-window UU button now uses action text:
+  - Disabled: `开启UU联动`
+  - Enabled: `关闭UU联动`
+- Detailed health status (`开-运行中 / 开-未运行(自愈中) / 开-需管理员`) remains on the tray menu entry `UU 联动（Steam/PUBG）`.
+
+## UU Monitor Panel (2026-02-28)
+
+- Added an embedded UU monitor panel in the main window (bottom collapsible section).
+- The panel is collapsed by default and can be toggled by:
+  - Main window button: `UU监控: 展开/收起`
+  - Tray menu entry: `UU监控面板: 展开/收起`
+- After `开启UU联动` succeeds, the panel auto-expands once.
+- After `关闭UU联动` succeeds, the panel remains available and shows disabled state (`未启用（任务不存在）`).
+- Refresh interval is `2s` (background collection + UI thread rendering).
+- Operational metrics include:
+  - Enable/health state
+  - Heartbeat lastSeen/age/pid
+  - State machine (`mode/desiredMode`)
+  - Admin/isolation state
+  - Rollback chain (`rollbackPending/retryCount/nextRetryAt/switchId/lastSwitchAt`)
+  - Real-time route (`GAME_STEAM_ROUTE`)
+- Fault signal indicators (10-minute active window, tail-read `watcher.log` last 200 lines):
+  - `ADMIN_REQUIRED_FOR_UU`
+  - `HARD_ISOLATION_APPLY_FAIL`
+  - `LOCAL_7897_FAULT_SIGNAL`
+  - `PROXY_CHAIN_LEAK_DETECTED`
+  - `STEAM_UU_TAKEOVER_NOT_COMPLETE`
+- Long monitor text now uses wrapped layout with dynamic row height to avoid overlapping/clipping.
+- The monitor panel supports scroll when content exceeds available height.
+- Main window is now vertically resizable (height only), while width stays fixed.
+- Expand/collapse no longer force-resets user-adjusted height; only minimum required height is enforced.
+
+## UU Health Snapshot Log (2026-02-28)
+
+- `uu-watcher/watcher.log` now includes structured health lines:
+  - `[HEALTH] UU_MONITOR_HEALTH ...`
+- This log is used to continuously answer:
+  - whether `uu.exe` is stably detected;
+  - whether UU takeover is effectively applied to Steam/PUBG.
+- Strict verdict priority is:
+  - `ADMIN_REQUIRED`
+  - `UU_NOT_DETECTED`
+  - `NO_TARGET_PROCESS`
+  - `MODE_NOT_UU_ACTIVE`
+  - `ROUTE_NOT_DIRECT`
+  - `LOCAL_7897_RESIDUAL`
+  - `PROXY_CHAIN_LEAK`
+  - `EFFECTIVE`
+- Emission policy:
+  - force emit once after startup reconcile;
+  - emit immediately when state/verdict changes;
+  - otherwise emit every `30s`;
+  - force emit once after stop-force-exit converge.
+- Field set includes:
+  - `reason/verdict/effective/detected/uuRaw/uuStable`
+  - `targetCount/targets/mode/desired/routeNow`
+  - `steam7897/tsl7897/proxyLeak`
+  - `admin/requireAdmin/hardIsolationUnavailable`
+  - `rollbackPending/retryCount/nextRetryAt`
+- `ExportDiagnostics` now also attempts to package:
+  - `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\state.json`
+  - `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\heartbeat.json`
+  - `%LOCALAPPDATA%\\ClashGuardian\\uu-watcher\\watcher.log`
+  and writes copy status into `summary.txt` (`[UUWatcher]` section).
+
+## UU Takeover Hard-Isolation Compatibility Patch (2026-02-28)
+
+- Fixed hard-isolation rule apply compatibility on systems where `netsh advfirewall ... add rule` rejects `group=...`.
+- Rule cleanup now prioritizes PowerShell prefix cleanup by display name:
+  - `ClashGuardian.UUWatcher.Block7897.*`
+  and falls back to legacy `netsh` group cleanup.
+- Rule add path no longer depends on the `group` parameter, avoiding false `HARD_ISOLATION_APPLY_FAIL` due parameter incompatibility.
+- One-shot compensation drain trigger now covers both Steam and PUBG residuals:
+  - compensation runs when either `steam7897 > 0` or `tsl7897 > 0`.
+
+## UU PUBG Takeover Hardening Patch (2026-03-01)
+
+- Hardened watcher process capture to avoid stdout/stderr buffer deadlock and timeout truncation during high-connection snapshots.
+  - This improves `LOCAL_7897` detection stability under heavy TCP table load.
+- Added Steam-library fallback discovery for PUBG executable path:
+  - Detect Steam roots from running process and registry.
+  - Parse `steamapps/libraryfolders.vdf` and `appmanifest_578080.acf`.
+  - Fallback include `...\\TslGame\\Binaries\\Win64\\TslGame.exe` for firewall rule materialization.
+- Added periodic takeover residual drain while `UU_ACTIVE`:
+  - If `steam/steamwebhelper/tslgame -> 127.0.0.1:7897` is still detected, watcher executes bounded residual drain (`limit=10`, interval>=5s) and logs:
+    - `UU_TAKEOVER_RESIDUAL_DRAIN`
+- `netstat` snapshot timeout for local-7897 signal collection was increased (`5s -> 10s`) to reduce false negatives.
+
+## UU Active Env Guard Patch (2026-03-01)
+
+- On `ENTER_UU`, watcher now applies a temporary user-env proxy guard:
+  - clear `HTTP_PROXY`
+  - clear `HTTPS_PROXY`
+  - clear `NO_PROXY`
+- Rationale:
+  - prevents target process stacks from inheriting stale `127.0.0.1:7897` env proxy during `UU_ACTIVE`;
+  - reduces oscillation where PUBG repeatedly reconnects to Clash local inbound.
+- Exit behavior remains unchanged:
+  - on `UU_ACTIVE -> NORMAL`, env is restored via existing snapshot/fallback pipeline.
+- New watcher events:
+  - `ENV_APPLY_UU_ACTIVE`
+  - `ENV_APPLY_UU_ACTIVE_FAILED`
+  - `ENV_GUARD_UU_ACTIVE_FAILED`
+- Additional safeguard:
+  - while already in `UU_ACTIVE`, policy enforcement periodically checks env proxy values;
+  - if `HTTP_PROXY/HTTPS_PROXY` still points to `127.0.0.1:7897` or `localhost:7897`, watcher reapplies env guard automatically.
+
+## UU External-Validation Compatibility Patch (2026-03-01)
+
+- To reduce Steam-side authentication disruption during PUBG launch/login, UU hard-isolation and takeover drain scopes are now PUBG-only by default:
+  - hard isolation/firewall dynamic scope: `tslgame.exe`
+  - takeover residual drain scope: `tslgame.exe`
+  - proxy-leak drain/signal scope: `tslgame.exe`
+- Dynamic fallback path discovery now respects the selected scope and no longer auto-adds `steam.exe` / `steamwebhelper.exe` when only PUBG isolation is intended.
+- Health verdict `LOCAL_7897_RESIDUAL` now follows gameplay effectiveness semantics:
+  - verdict trigger uses `tsl7897` (PUBG) only
+  - `steam7897` remains logged for observability/review, but no longer blocks `EFFECTIVE` by itself.
+- Health snapshot process-count semantics are aligned to PUBG acceleration check:
+  - `targetCount/targets` now track PUBG target process scope for verdicting (`NO_TARGET_PROCESS` reflects PUBG presence).
