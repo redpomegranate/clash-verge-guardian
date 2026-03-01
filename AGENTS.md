@@ -395,3 +395,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 2. Takeover one-shot drain and residual drain must follow UU_WATCHER_LEAK_DRAIN_PROCESS_NAMES (default tslgame.exe only); Steam residuals remain diagnostic signals and must not trigger forced drain by default.
 3. LOCAL_7897_RESIDUAL verdict gating in health evaluation must use PUBG residual (tsl7897) as the strict blocker for game acceleration effectiveness; steam7897 remains required in logs for observability but is non-gating.
 4. Health snapshot targetCount/targets used for verdicting must align to PUBG acceleration target scope to keep NO_TARGET_PROCESS semantics game-centric.
+
+## 文档编码编写规则（防乱码�?
+
+1. 所�?.md/.cs/.ps1/.json 文件统一使用 UTF-8；Windows 环境建议使用 UTF-8 with BOM，避免被旧工具误判为 ANSI/GBK�?
+2. 禁止�?ANSI/GBK 打开后直接保�?UTF-8 文件；出�?�?�?æ/�?这类乱码特征时，必须先从 Git 恢复再编辑�?
+3. 终端查阅中文内容时先切换 UTF-8 输出（chcp 65001 �?PowerShell 7+），优先区分“显示乱码”和“文件乱码”�?
+4. 文档提交前执行编码自检：Get-Content README.md -Encoding UTF8 -TotalCount 5 �?Get-Content AGENTS.md -Encoding UTF8 -TotalCount 5�?

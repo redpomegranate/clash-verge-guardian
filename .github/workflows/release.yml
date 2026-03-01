@@ -38,9 +38,9 @@ jobs:
           $out = @()
           $out += "# Clash Guardian Pro $tag"
           $out += ""
-          $out += "更新日志：请查看 README.md 中的 ### $tag 段落。"
+          $out += "Changelog: see section '### $tag' in README.md."
           $out += ""
-          $out += "## 校验"
+          $out += "## Checksum"
           $out += ""
           $out += '```text'
           $out += "$hash  ClashGuardian.exe"
